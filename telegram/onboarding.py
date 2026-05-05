@@ -11,6 +11,7 @@ from telegram.sender import send_telegram_message
 from database.onboarding_state import save_onboarding_state, clear_onboarding_state
 from helpers import clean_name
 from database.students import create_student
+from content.subject_hooks import normalize_subject, get_magic_trick, get_subject_fallback
 
 
 # ──────────────────────────────────────────────
@@ -228,9 +229,6 @@ async def _step_student_goal(chat_id: int, state: dict, message: str):
 @register_step("terms_acceptance")
 async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
-    # FIX: default to False — safer. Only new students who explicitly chose
-    # "I'm new" have is_new_student set to True. Everyone else is treated
-    # as a returning user needing a WAX ID.
     is_new = state.get("is_new_student", False)
 
     if msg in ["yes", "y", "agree", "accept", "i agree", "i accept", "ok", "okay", "1"]:
@@ -276,7 +274,7 @@ async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
 
 
 # ──────────────────────────────────────────────
-# STEP: decline_reason (NEW)
+# STEP: decline_reason
 # ──────────────────────────────────────────────
 
 @register_step("decline_reason")
@@ -314,17 +312,62 @@ async def _step_name(chat_id: int, state: dict, message: str):
         return
 
     first = name.split()[0]
+    state["name"] = name
+    state["awaiting_response_for"] = "subject_selection"
+    await save_onboarding_state("telegram", str(chat_id), state)
+
     await send_telegram_message(
         chat_id,
         f"Nice to meet you, *{first}*!\n\n"
+        "Before we go further — which subject gives you the most trouble right now?\n\n"
+        "_(Just type the subject name — e.g. Physics, Maths, Chemistry, English)_"
+    )
+
+
+# ──────────────────────────────────────────────
+# STEP: subject_selection → fires Magic Trick instantly
+# ──────────────────────────────────────────────
+
+@register_step("subject_selection")
+async def _step_subject_selection(chat_id: int, state: dict, message: str):
+    raw_subject = message.strip()
+    normalized = normalize_subject(raw_subject)
+
+    # Handle "I don't know" or empty responses
+    dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
+    if raw_subject.lower() in dont_know:
+        normalized = "Mathematics"
+        await send_telegram_message(
+            chat_id,
+            "No wahala. Let's start with Mathematics — it's the foundation for most subjects."
+        )
+
+    # Save the subject
+    state["student_subject"] = normalized
+    state["awaiting_response_for"] = "class_level"
+    await save_onboarding_state("telegram", str(chat_id), state)
+
+    # Determine level for the Magic Trick (default SS3 since we don't know yet)
+    level = state.get("class_level", "SS3")
+    first = state.get("name", "Student").split()[0]
+
+    # Get the Magic Trick
+    trick = get_magic_trick(normalized, level)
+    if trick:
+        await send_telegram_message(chat_id, trick.render())
+    else:
+        fallback = get_subject_fallback(normalized)
+        await send_telegram_message(chat_id, fallback)
+
+    # Auto-advance to class level
+    await send_telegram_message(
+        chat_id,
+        f"Now let's get you set up, *{first}*.\n\n"
         "What class are you in?\n\n"
         "1 — JSS1\n2 — JSS2\n3 — JSS3\n"
         "4 — SS1\n5 — SS2\n6 — SS3\n\n"
         "_(Reply with the number)_"
     )
-    state["name"] = name
-    state["awaiting_response_for"] = "class_level"
-    await save_onboarding_state("telegram", str(chat_id), state)
 
 
 # ──────────────────────────────────────────────
@@ -400,7 +443,6 @@ async def _step_state(chat_id: int, state: dict, message: str):
     )
     state["student_state"] = student_state
     state["awaiting_response_for"] = "pin_setup"
-    # Reset PIN failure counter
     state["pin_failed_attempts"] = 0
     await save_onboarding_state("telegram", str(chat_id), state)
 
@@ -479,6 +521,8 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
     await clear_onboarding_state("telegram", str(chat_id))
 
     name_first = student["name"].split()[0]
+    student_subject = state.get("student_subject", "your subjects")
+
     await send_telegram_message(
         chat_id,
         f"Welcome to WaxPrep, *{name_first}*!\n\n"
@@ -486,6 +530,7 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
         f"WAX ID: *{student['wax_id']}*\n"
         f"Recovery Code: *{student['recovery_code']}*\n\n"
         f"*Full Access is now ACTIVE!*\n\n"
+        f"We'll tackle {student_subject} together. "
         f"You can ask me questions, take quizzes, and I'll remember "
         f"everything you've learned. What would you like to study first?"
     )
