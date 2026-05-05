@@ -3,12 +3,11 @@ WaxPrep v2 — Main Application Entry Point
 FastAPI server with Telegram + WhatsApp webhooks.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
-# (already has: from contextlib import asynccontextmanager, etc.)
-# No new imports needed — the telegram import is inside the function
 
 
 # ──────────────────────────────────────────────
@@ -60,6 +59,28 @@ async def health_check():
 
 
 # ──────────────────────────────────────────────
+# TEST ENDPOINT — runs onboarding test harness
+# ──────────────────────────────────────────────
+
+@app.get("/test-onboarding")
+async def test_onboarding():
+    """Run all onboarding scenarios and return results as JSON."""
+    try:
+        from tests.test_onboarding import run_all_scenarios
+        passed, failed = await run_all_scenarios()
+        total = passed + failed
+        return {
+            "status": "ok",
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "message": f"{passed}/{total} tests passed"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ──────────────────────────────────────────────
 # TELEGRAM WEBHOOK
 # ──────────────────────────────────────────────
 
@@ -83,6 +104,7 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print(f"Telegram webhook error: {e}")
         return JSONResponse({"status": "error"}, status_code=500)
+
 
 # ──────────────────────────────────────────────
 # WHATSAPP WEBHOOK
