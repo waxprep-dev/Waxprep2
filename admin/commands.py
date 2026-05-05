@@ -8,7 +8,7 @@ from telegram.sender import send_telegram_message
 
 
 # Your Telegram chat ID for admin access
-ADMIN_CHAT_IDS = {123456789}  # REPLACE with your actual chat ID
+ADMIN_CHAT_IDS = {8568663974}  # REPLACE with your actual chat ID
 
 
 async def handle_admin_command(chat_id: int, text: str) -> bool:
