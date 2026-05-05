@@ -29,16 +29,16 @@ async def get_onboarding_state(platform: str, user_id: str) -> dict:
     return {}
 
 
-async def save_onboarding_state(platform: str, user_id: str, state: dict):
+async def save_onboarding_state(platform: str, user_id: str, state: dict, ttl: int = 86400):
     """
     Save the current onboarding step. Called after every step.
-    The state includes at minimum: {'awaiting_response_for': 'step_name', ...}
+    State expires after ttl seconds (default: 24 hours).
     """
     key = f"onboarding:{platform}:{user_id}"
     try:
         redis_client.setex(
             key,
-            ONBOARDING_STATE_TTL,
+            ttl,
             json.dumps(state, default=str)
         )
     except Exception as e:
