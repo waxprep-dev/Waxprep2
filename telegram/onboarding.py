@@ -85,7 +85,7 @@ def _get_exam_retry():
     ])
 
 
-def _get_pin_retry(failed_attempts: int = 0):
+def _get_pin_retry(failed_attempts: int):
     """Escalates help after repeated PIN failures."""
     base = "Your PIN must be exactly 4 digits."
     if failed_attempts < 2:
@@ -96,11 +96,12 @@ def _get_pin_retry(failed_attempts: int = 0):
         ])
     elif failed_attempts < 4:
         return random.choice([
-            f"Still having trouble? {base} For example, if your birth year is 2007, try 2007. But pick something only you know.",
-            f"Let me help. {base} Think of a 4-digit number you won't forget — maybe part of your phone number (not the whole thing).",
+            f"Still having trouble? {base} Think of the last 4 digits of a phone number only you know.",
+            f"Let me help. {base} Pick 4 numbers from something around you — a receipt, a clock, or a page number.",
+            f"No wahala. {base} Try using 4 digits you won't forget — maybe from a number you see often but others don't.",
         ])
     else:
-        return f"I know this is frustrating. {base} Take a breath. If you have a 4-digit number in mind that you can remember easily, type it now. If you don't, try your birth year — just make sure nobody else knows it."
+        return f"I know this is frustrating. {base} Take a breath. Pick any 4 digits that are easy for YOU to remember but hard for others to guess. Type them now."
 
 
 # ──────────────────────────────────────────────
@@ -250,22 +251,23 @@ async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
                 "Welcome back!\n\nSend your WAX ID to log in.\n\n"
                 "It looks like: *WAX-A74892*"
             )
+            state["terms_accepted"] = True
+            state["terms_accepted_at"] = datetime.utcnow().isoformat()
             state["awaiting_response_for"] = "wax_id_entry"
             await save_onboarding_state("telegram", str(chat_id), state)
     elif msg in ["no", "n", "decline", "reject", "2"]:
-        # Capture decline reason
-        decline_reasons = [
-            "before we go — would you mind telling me why? It helps me improve.\n\n"
+        state["terms_declined"] = True
+        state["awaiting_response_for"] = "decline_reason"
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(
+            chat_id,
+            "No problem at all.\n\n"
+            "Before you go — would you mind telling me why? It helps me improve.\n\n"
             "*1* — I don't understand what this is\n"
             "*2* — I'm not comfortable with the terms\n"
             "*3* — I was just looking around\n"
             "*4* — I'll decide later"
-        ]
-        # Save that they declined
-        state["terms_declined"] = True
-        state["awaiting_response_for"] = "decline_reason"
-        await save_onboarding_state("telegram", str(chat_id), state)
-        await send_telegram_message(chat_id, f"No problem at all.\n\n{decline_reasons[0]}")
+        )
     else:
         await send_telegram_message(
             chat_id,
