@@ -36,28 +36,38 @@ class MagicTrick:
 SUBJECT_ALIASES = {
     # Physics
     "physic": "Physics", "phy": "Physics", "physics": "Physics",
+    "physcs": "Physics", "phyics": "Physics",
     # Mathematics
     "maths": "Mathematics", "math": "Mathematics", "mathematics": "Mathematics",
     "further maths": "Further Mathematics", "further math": "Further Mathematics",
     "further mathematics": "Further Mathematics",
+    "mathmatics": "Mathematics", "mathemtics": "Mathematics",
     # Chemistry
     "chem": "Chemistry", "chemistry": "Chemistry",
+    "chemstry": "Chemistry", "chemisty": "Chemistry",
     # Biology
     "bio": "Biology", "biology": "Biology",
+    "biolgy": "Biology", "bilogy": "Biology",
     # Economics
     "econ": "Economics", "economics": "Economics", "economic": "Economics",
+    "econmics": "Economics", "econmoics": "Economics",
     # Government
     "govt": "Government", "government": "Government", "gov": "Government",
+    "goverment": "Government",
     # English
     "eng": "English", "english": "English", "english language": "English",
+    "rnglish": "English", "engish": "English", "englsh": "English",
     # Literature
     "lit": "Literature", "literature": "Literature",
     "literature in english": "Literature", "lit-in-english": "Literature",
+    "litrature": "Literature", "literatue": "Literature",
     # Commerce
     "comm": "Commerce", "commerce": "Commerce",
+    "commrce": "Commerce", "comerce": "Commerce",
     # Accounting
     "account": "Accounting", "accounting": "Accounting",
     "fin account": "Accounting", "financial accounting": "Accounting",
+    "accouting": "Accounting", "acounting": "Accounting",
     # Agricultural Science
     "agric": "Agricultural Science", "agriculture": "Agricultural Science",
     "agricultural science": "Agricultural Science", "agri": "Agricultural Science",
@@ -227,15 +237,40 @@ FALLBACK_MESSAGE = (
 
 
 # ──────────────────────────────────────────────
-# LOOKUP FUNCTION
+# LOOKUP FUNCTIONS
 # ──────────────────────────────────────────────
+
+def _is_close_match(a: str, b: str, max_diff: int = 1) -> bool:
+    """Return True if strings differ by at most max_diff characters."""
+    if abs(len(a) - len(b)) > max_diff:
+        return False
+    diff = 0
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            diff += 1
+            if diff > max_diff:
+                return False
+    return True
+
 
 def normalize_subject(raw: str) -> str:
     """Convert user input to a standard subject name."""
     cleaned = raw.strip()
     lower = cleaned.lower()
+
+    # Direct alias match
     if lower in SUBJECT_ALIASES:
         return SUBJECT_ALIASES[lower]
+
+    # Fuzzy match: check if any alias key is close to the input
+    for alias_key, alias_value in SUBJECT_ALIASES.items():
+        # Check if the input is one character off from an alias
+        if _is_close_match(lower, alias_key):
+            return alias_value
+        # Check if alias key is inside the input or vice versa
+        if alias_key in lower or lower in alias_key:
+            return alias_value
+
     return cleaned
 
 
