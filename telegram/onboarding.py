@@ -64,6 +64,16 @@ def _get_pin_retry(failed_attempts: int):
     else:
         return f"I know this is frustrating. {base} Take a breath. Pick any 4 digits that are easy for YOU to remember but hard for others to guess. Type them now."
 
+# ── Nigerian states for validation ────────────
+NIGERIAN_STATES = {
+    "abia", "adamawa", "akwa ibom", "anambra", "bauchi", "bayelsa", "benue",
+    "borno", "cross river", "delta", "ebonyi", "edo", "ekiti", "enugu",
+    "gombe", "imo", "jigawa", "kaduna", "kano", "katsina", "kebbi",
+    "kogi", "kwara", "lagos", "nasarawa", "niger", "ogun", "ondo",
+    "osun", "oyo", "plateau", "rivers", "sokoto", "taraba", "yobe",
+    "zamfara", "abuja", "fct", "federal capital territory",
+}
+
 # ── dispatcher ────────────────────────────────
 async def handle_onboarding(chat_id: int, state: dict, message: str):
     step = state.get("awaiting_response_for", "new_or_existing")
@@ -130,7 +140,7 @@ async def _step_student_goal(chat_id: int, state: dict, message: str):
 async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
     is_new = state.get("is_new_student", False)
-    if msg in ["yes", "y", "agree", "accept", "i agree", "i accept", "ok", "okay", "1"]:
+    if msg in ["yes", "y", "yep", "yeah", "yup", "sure", "agree", "accept", "i agree", "i accept", "ok", "okay", "1"]:
         if is_new:
             state["terms_accepted"] = True
             state["terms_accepted_at"] = datetime.utcnow().isoformat()
@@ -242,7 +252,11 @@ async def _step_name(chat_id: int, state: dict, message: str):
     if len(name) < 3 or len(name.split()) < 2:
         await send_telegram_message(chat_id, "I need both names — your first and last, like *Chidera Emeka*. Try again?")
         return
-    first = name.split()[0]
+    parts = name.split()
+    if len(parts[0]) < 2 or len(parts[-1]) < 2:
+        await send_telegram_message(chat_id, "I need both your first and last name — and each should be at least 2 letters. Try again?")
+        return
+    first = parts[0]
     state["name"] = name
     state["awaiting_response_for"] = "class_level"
     await save_onboarding_state("telegram", str(chat_id), state)
@@ -273,17 +287,28 @@ async def _step_subject_selection(chat_id: int, state: dict, message: str):
         normalized = "Mathematics"
         await send_telegram_message(chat_id, "No wahala. Let's start with Mathematics — it's the foundation for most subjects.")
     state["student_subject"] = normalized
-    state["awaiting_response_for"] = "target_exam"
     await save_onboarding_state("telegram", str(chat_id), state)
     level = state.get("class_level", "SS")
     first = state.get("name", "Student").split()[0]
+
+    # Fire Magic Trick
     trick = get_magic_trick(normalized, level)
     if trick:
         await send_telegram_message(chat_id, trick.render())
     else:
         await send_telegram_message(chat_id, get_subject_fallback(normalized))
+
     await _breathe(0.6)
-    await send_telegram_message(chat_id, f"Now, {first} — which exam are you preparing for?\n\n1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO\n\n_(Reply with the number)_")
+
+    # JSS students skip exam question — they don't take JAMB/WAEC/NECO
+    if level.startswith("JSS"):
+        state["awaiting_response_for"] = "state"
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(chat_id, f"Now, {first} — which state are you in?\n\n_(e.g. Lagos, Abuja, Kano, Rivers)_")
+    else:
+        state["awaiting_response_for"] = "target_exam"
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(chat_id, f"Now, {first} — which exam are you preparing for?\n\n1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO\n\n_(Reply with the number)_")
 
 # ── target_exam ───────────────────────────────
 @register_step("target_exam")
@@ -302,7 +327,14 @@ async def _step_target_exam(chat_id: int, state: dict, message: str):
 # ── state ─────────────────────────────────────
 @register_step("state")
 async def _step_state(chat_id: int, state: dict, message: str):
-    student_state = message.strip().title()
+    raw = message.strip()
+    student_state = raw.title()
+
+    # Validate: if input is short or doesn't match any Nigerian state, ask again
+    if len(raw) <= 3 and raw.lower() not in NIGERIAN_STATES:
+        await send_telegram_message(chat_id, "That doesn't look like a state — try typing the full name, like *Kano* or *Lagos*.")
+        return
+
     state["student_state"] = student_state
     state["awaiting_response_for"] = "pin_setup"
     state["pin_failed_attempts"] = 0
