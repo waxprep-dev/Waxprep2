@@ -60,59 +60,21 @@ async def health_check():
 
 
 # ──────────────────────────────────────────────
-# TEST ENDPOINTS — run tests in background
+# TEST ENDPOINT — direct quick test (no timeout)
 # ──────────────────────────────────────────────
 
 @app.get("/test-onboarding")
 async def test_onboarding():
-    """Start onboarding tests in background. Results at /test-results."""
-    # Start tests in background
-    asyncio.create_task(_run_tests_background())
-
+    """Run quick onboarding tests and return results directly."""
+    from tests.test_onboarding import run_quick_tests
+    results = await run_quick_tests()
+    passed = sum(1 for r in results if r["ok"])
     return {
-        "status": "started",
-        "message": "Tests are running in background. Check /test-results in about 30 seconds.",
-        "timestamp": datetime.utcnow().isoformat()
+        "total": len(results),
+        "passed": passed,
+        "failed": len(results) - passed,
+        "results": results
     }
-
-
-async def _run_tests_background():
-    """Run all scenarios and save results to Redis."""
-    try:
-        from tests.test_onboarding import run_all_scenarios
-        from database.client import redis_client
-        import json
-
-        report = await run_all_scenarios()
-        redis_client.setex("test_results", 600, json.dumps(report, default=str))
-        print(f"Tests complete: {report.get('passed', 0)}/{report.get('total', 0)} passed")
-    except Exception as e:
-        from database.client import redis_client
-        import json
-        import traceback
-        error_report = {
-            "status": "error",
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-        redis_client.setex("test_results", 600, json.dumps(error_report))
-        print(f"Test run failed: {e}")
-
-
-@app.get("/test-results")
-async def test_results():
-    """View the latest test results."""
-    from database.client import redis_client
-    import json
-
-    raw = redis_client.get("test_results")
-    if not raw:
-        return {
-            "status": "pending",
-            "message": "Tests are still running or haven't been started. Visit /test-onboarding to start."
-        }
-
-    return json.loads(raw)
 
 
 # ──────────────────────────────────────────────
