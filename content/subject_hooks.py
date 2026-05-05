@@ -39,6 +39,7 @@ SUBJECT_ALIASES = {
     # Mathematics
     "maths": "Mathematics", "math": "Mathematics", "mathematics": "Mathematics",
     "further maths": "Further Mathematics", "further math": "Further Mathematics",
+    "further mathematics": "Further Mathematics",
     # Chemistry
     "chem": "Chemistry", "chemistry": "Chemistry",
     # Biology
@@ -71,6 +72,13 @@ SUBJECT_ALIASES = {
     "science": "Basic Science", "basic science": "Basic Science",
     "basic math": "Basic Mathematics", "basic maths": "Basic Mathematics",
     "basic mathematics": "Basic Mathematics",
+    # JSS subjects
+    "english studies": "English Studies",
+    "basic technology": "Basic Technology",
+    "social studies": "Social Studies",
+    "business studies": "Business Studies",
+    "home economics": "Home Economics",
+    "home ec": "Home Economics",
 }
 
 # Subjects we have full hooks for (SS level)
@@ -89,6 +97,8 @@ READY_JSS_SUBJECTS = {
 RECOGNIZED_SUBJECTS = {
     "Further Mathematics", "Agricultural Science", "Geography",
     "Civic Education", "Christian Religious Studies", "Islamic Religious Studies",
+    "English Studies", "Basic Technology", "Social Studies",
+    "Business Studies", "Home Economics",
 }
 
 
@@ -223,35 +233,53 @@ FALLBACK_MESSAGE = (
 def normalize_subject(raw: str) -> str:
     """Convert user input to a standard subject name."""
     cleaned = raw.strip()
-    # Try exact match first
-    if cleaned in SUBJECT_ALIASES:
-        return SUBJECT_ALIASES[cleaned]
-    # Try case-insensitive
     lower = cleaned.lower()
     if lower in SUBJECT_ALIASES:
         return SUBJECT_ALIASES[lower]
-    # Return as-is (might be an unrecognized subject)
     return cleaned
 
 
 def get_magic_trick(subject_name: str, level: str) -> Optional[MagicTrick]:
     """
     Get the Magic Trick for a subject and level.
-    Returns None if not found (use FALLBACK_MESSAGE).
+    For JSS students, redirect common SS subjects to their JSS equivalents.
+    Returns None if not found (use get_subject_fallback).
     """
-    # Try SS hooks
-    if level in ("SS1", "SS2", "SS3", "SS"):
-        if subject_name in SS_MAGIC_TRICKS:
-            return SS_MAGIC_TRICKS[subject_name]
-    # Try JSS hooks
-    elif level in ("JSS1", "JSS2", "JSS3", "JSS"):
+    # JSS level redirects
+    if level and level.startswith("JSS"):
+        if subject_name == "Mathematics":
+            subject_name = "Basic Mathematics"
+        elif subject_name in ("English", "English Language"):
+            subject_name = "English Studies"
+        # Try JSS hooks
         if subject_name in JSS_MAGIC_TRICKS:
             return JSS_MAGIC_TRICKS[subject_name]
+
+    # SS level
+    if level and (level.startswith("SS") or level == "SS"):
+        if subject_name in SS_MAGIC_TRICKS:
+            return SS_MAGIC_TRICKS[subject_name]
+
     return None
 
 
 def get_subject_fallback(subject_name: str) -> str:
     """Return a warm fallback message specific to this subject."""
+    # Mini-hooks for popular subjects we haven't fully built yet
+    if subject_name == "Further Mathematics":
+        return (
+            "Further Maths is regular Math with bigger ambitions. The same street sense "
+            "that helps you calculate change works here too — just with fancier names.\n\n"
+            "I'm building a complete trick for Further Maths soon. "
+            "Let's set up your profile and I'll help you with it now."
+        )
+    if subject_name == "Agricultural Science":
+        return (
+            "Ah, Agric! If you've ever watched your parents or neighbors buy produce at the market, "
+            "or seen crops grow behind someone's house — you've already started learning Agricultural Science.\n\n"
+            "I'm working on a full trick for Agric. Let's build your profile and I'll help you with it now."
+        )
+
     if subject_name in RECOGNIZED_SUBJECTS:
         return (
             f"Ah, {subject_name}! I don't have a special trick for it yet — "
