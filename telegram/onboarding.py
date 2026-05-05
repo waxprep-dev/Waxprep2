@@ -169,17 +169,71 @@ async def _step_wax_id_entry(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
     # Changed-mind bridge: returning user says they're actually new
     if any(k in msg for k in ["new", "1", "create", "register", "i'm new", "signup"]):
-        await send_telegram_message(chat_id, "Ah, so you're new after all? No wahala — let's start fresh.\n\nFirst, what do you need help with?\n\n*1* — My schoolwork\n*2* — Preparing for a test or exam\n*3* — I just want to learn something new\n\n_(Reply with the number, or just tell me in your own words)_")
+        await send_telegram_message(
+            chat_id,
+            "Ah, so you're new after all? No wahala — let's start fresh.\n\n"
+            "First, what do you need help with?\n\n"
+            "*1* — My schoolwork\n"
+            "*2* — Preparing for a test or exam\n"
+            "*3* — I just want to learn something new\n\n"
+            "_(Reply with the number, or just tell me in your own words)_"
+        )
         state["awaiting_response_for"] = "student_goal"
         state["is_new_student"] = True
         await save_onboarding_state("telegram", str(chat_id), state)
         return
-    # Actual WAX ID entry (placeholder for now)
+
+    # Valid WAX ID format: WAX-XXXXXX
     wax_id = message.strip().upper()
-    if wax_id.startswith("WAX-"):
-        await send_telegram_message(chat_id, f"WAX ID received: *{wax_id}*\n\nPIN login coming in a future update. For now, type *NEW* to create a fresh account.")
-    else:
-        await send_telegram_message(chat_id, "That doesn't look like a WAX ID. It should look like: *WAX-A74892*\n\nCheck and try again, or type *NEW* to create a fresh account.")
+    if wax_id.startswith("WAX-") and len(wax_id) == 10:
+        state["pending_wax_id"] = wax_id
+        state["is_new_student"] = False
+        state["awaiting_response_for"] = "pin_entry"
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(
+            chat_id,
+            f"WAX ID received: *{wax_id}*\n\n"
+            "Now enter your 4-digit PIN to log in.\n\n"
+            "_(If you've forgotten your PIN, type *NEW* to create a fresh account)_"
+        )
+        return
+
+    # Doesn't look like a WAX ID
+    await send_telegram_message(
+        chat_id,
+        "That doesn't look like a WAX ID. It should look like: *WAX-A74892*\n\n"
+        "Check and try again, or type *NEW* to create a fresh account."
+    )
+
+# ── pin_entry (for returning users) ───────────
+@register_step("pin_entry")
+async def _step_pin_entry(chat_id: int, state: dict, message: str):
+    msg = message.strip().lower()
+    # Changed-mind bridge: returning user says they're actually new
+    if any(k in msg for k in ["new", "create", "register", "i'm new", "signup"]):
+        await send_telegram_message(
+            chat_id,
+            "Ah, you'd rather start fresh? No wahala.\n\n"
+            "First, what do you need help with?\n\n"
+            "*1* — My schoolwork\n"
+            "*2* — Preparing for a test or exam\n"
+            "*3* — I just want to learn something new\n\n"
+            "_(Reply with the number, or just tell me in your own words)_"
+        )
+        state["awaiting_response_for"] = "student_goal"
+        state["is_new_student"] = True
+        state["pending_wax_id"] = None
+        await save_onboarding_state("telegram", str(chat_id), state)
+        return
+
+    # PIN login — placeholder until full login is built
+    wax_id = state.get("pending_wax_id", "Unknown")
+    await send_telegram_message(
+        chat_id,
+        f"PIN login is coming in a future update.\n\n"
+        f"For now, you can create a fresh account to start studying immediately. "
+        f"Type *NEW* to get started."
+    )
 
 # ── name ──────────────────────────────────────
 @register_step("name")
