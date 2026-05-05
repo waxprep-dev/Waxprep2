@@ -313,56 +313,12 @@ async def _step_name(chat_id: int, state: dict, message: str):
 
     first = name.split()[0]
     state["name"] = name
-    state["awaiting_response_for"] = "subject_selection"
+    state["awaiting_response_for"] = "class_level"
     await save_onboarding_state("telegram", str(chat_id), state)
 
     await send_telegram_message(
         chat_id,
         f"Nice to meet you, *{first}*!\n\n"
-        "Before we go further — which subject gives you the most trouble right now?\n\n"
-        "_(Just type the subject name — e.g. Physics, Maths, Chemistry, English)_"
-    )
-
-
-# ──────────────────────────────────────────────
-# STEP: subject_selection → fires Magic Trick instantly
-# ──────────────────────────────────────────────
-
-@register_step("subject_selection")
-async def _step_subject_selection(chat_id: int, state: dict, message: str):
-    raw_subject = message.strip()
-    normalized = normalize_subject(raw_subject)
-
-    # Handle "I don't know" or empty responses
-    dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
-    if raw_subject.lower() in dont_know:
-        normalized = "Mathematics"
-        await send_telegram_message(
-            chat_id,
-            "No wahala. Let's start with Mathematics — it's the foundation for most subjects."
-        )
-
-    # Save the subject
-    state["student_subject"] = normalized
-    state["awaiting_response_for"] = "class_level"
-    await save_onboarding_state("telegram", str(chat_id), state)
-
-    # Determine level for the Magic Trick (default SS3 since we don't know yet)
-    level = state.get("class_level", "SS3")
-    first = state.get("name", "Student").split()[0]
-
-    # Get the Magic Trick
-    trick = get_magic_trick(normalized, level)
-    if trick:
-        await send_telegram_message(chat_id, trick.render())
-    else:
-        fallback = get_subject_fallback(normalized)
-        await send_telegram_message(chat_id, fallback)
-
-    # Auto-advance to class level
-    await send_telegram_message(
-        chat_id,
-        f"Now let's get you set up, *{first}*.\n\n"
         "What class are you in?\n\n"
         "1 — JSS1\n2 — JSS2\n3 — JSS3\n"
         "4 — SS1\n5 — SS2\n6 — SS3\n\n"
@@ -388,16 +344,60 @@ async def _step_class_level(chat_id: int, state: dict, message: str):
         await send_telegram_message(chat_id, _get_class_level_retry())
         return
 
+    first = state.get("name", "Student").split()[0]
+    state["class_level"] = class_level
+    state["awaiting_response_for"] = "subject_selection"
+    await save_onboarding_state("telegram", str(chat_id), state)
+
     await send_telegram_message(
         chat_id,
-        f"{class_level}!\n\n"
-        "Which exam are you preparing for?\n\n"
+        f"{class_level}! Got it.\n\n"
+        f"Now, *{first}* — which subject gives you the most trouble right now?\n\n"
+        "_(Just type the subject name — e.g. Physics, Maths, Chemistry, English)_"
+    )
+
+
+# ──────────────────────────────────────────────
+# STEP: subject_selection → fires Magic Trick instantly
+# ──────────────────────────────────────────────
+
+@register_step("subject_selection")
+async def _step_subject_selection(chat_id: int, state: dict, message: str):
+    raw_subject = message.strip()
+    normalized = normalize_subject(raw_subject)
+
+    # Handle "I don't know" or empty responses
+    dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
+    if raw_subject.lower() in dont_know:
+        normalized = "Mathematics"
+        await send_telegram_message(
+            chat_id,
+            "No wahala. Let's start with Mathematics — it's the foundation for most subjects."
+        )
+
+    # Save the subject
+    state["student_subject"] = normalized
+    state["awaiting_response_for"] = "target_exam"
+    await save_onboarding_state("telegram", str(chat_id), state)
+
+    # Now we know the class level — get the right Magic Trick
+    level = state.get("class_level", "SS")
+    first = state.get("name", "Student").split()[0]
+
+    trick = get_magic_trick(normalized, level)
+    if trick:
+        await send_telegram_message(chat_id, trick.render())
+    else:
+        fallback = get_subject_fallback(normalized)
+        await send_telegram_message(chat_id, fallback)
+
+    # Auto-advance to exam
+    await send_telegram_message(
+        chat_id,
+        f"Now, *{first}* — which exam are you preparing for?\n\n"
         "1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO\n\n"
         "_(Reply with the number)_"
     )
-    state["class_level"] = class_level
-    state["awaiting_response_for"] = "target_exam"
-    await save_onboarding_state("telegram", str(chat_id), state)
 
 
 # ──────────────────────────────────────────────
