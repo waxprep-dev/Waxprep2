@@ -18,8 +18,14 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     if not text:
         return
 
+    # ── Admin commands ───────────────────────
+    from admin.commands import handle_admin_command
+    if await handle_admin_command(chat_id, text):
+        return
+
     # ── Check if registered student ──────────
     from database.students import get_student_by_platform_id
+
     student = await get_student_by_platform_id("telegram", str(chat_id))
 
     if student:
