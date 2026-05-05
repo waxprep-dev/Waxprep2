@@ -11,7 +11,7 @@ Example: onboarding:telegram:123456789
 import json
 from database.client import redis_client
 
-ONBOARDING_STATE_TTL = 3600  # 1 hour to complete onboarding
+ONBOARDING_STATE_TTL = 86400  # 24 hours to complete onboarding
 
 
 async def get_onboarding_state(platform: str, user_id: str) -> dict:
@@ -29,16 +29,16 @@ async def get_onboarding_state(platform: str, user_id: str) -> dict:
     return {}
 
 
-async def save_onboarding_state(platform: str, user_id: str, state: dict, ttl: int = 86400):
+async def save_onboarding_state(platform: str, user_id: str, state: dict):
     """
     Save the current onboarding step. Called after every step.
-    State expires after ttl seconds (default: 24 hours).
+    State expires after ONBOARDING_STATE_TTL seconds (24 hours).
     """
     key = f"onboarding:{platform}:{user_id}"
     try:
         redis_client.setex(
             key,
-            ttl,
+            ONBOARDING_STATE_TTL,
             json.dumps(state, default=str)
         )
     except Exception as e:
