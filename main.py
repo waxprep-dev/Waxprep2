@@ -64,20 +64,18 @@ async def health_check():
 
 @app.get("/test-onboarding")
 async def test_onboarding():
-    """Run all onboarding scenarios and return results as JSON."""
+    """Run all onboarding scenarios and return results."""
     try:
         from tests.test_onboarding import run_all_scenarios
-        passed, failed = await run_all_scenarios()
-        total = passed + failed
-        return {
-            "status": "ok",
-            "total": total,
-            "passed": passed,
-            "failed": failed,
-            "message": f"{passed}/{total} tests passed"
-        }
+        report = await run_all_scenarios()
+        return report
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        import traceback
+        return {
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 
 # ──────────────────────────────────────────────
