@@ -7,6 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
+# (already has: from contextlib import asynccontextmanager, etc.)
+# No new imports needed — the telegram import is inside the function
 
 
 # ──────────────────────────────────────────────
@@ -66,13 +68,21 @@ async def telegram_webhook(request: Request):
     """Receives updates from Telegram and processes them."""
     try:
         body = await request.json()
-        # TODO: Process Telegram update
-        print(f"Telegram update received")
+
+        # Extract message text and chat ID
+        message_data = body.get("message", {})
+        chat = message_data.get("chat", {})
+        chat_id = chat.get("id")
+        text = message_data.get("text", "")
+
+        if chat_id and text:
+            from telegram.handler import process_telegram_message
+            await process_telegram_message(chat_id, text)
+
         return JSONResponse({"status": "ok"})
     except Exception as e:
         print(f"Telegram webhook error: {e}")
         return JSONResponse({"status": "error"}, status_code=500)
-
 
 # ──────────────────────────────────────────────
 # WHATSAPP WEBHOOK
