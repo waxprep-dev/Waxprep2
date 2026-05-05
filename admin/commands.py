@@ -64,106 +64,104 @@ async def _run_quick_tests(chat_id: int):
     """Run 8 critical path tests and report results in Telegram."""
     await send_telegram_message(chat_id, "🧪 *Running quick tests...*")
 
-    # ---- Mock the sender ----
     import telegram.sender as sender_module
     original_sender = sender_module.send_telegram_message
 
-    captured = []
+    from telegram.onboarding import handle_onboarding
+    from database.onboarding_state import get_onboarding_state, clear_onboarding_state
 
-    class MockSender:
-        @staticmethod
-        async def send_telegram_message(cid, text):
-            captured.append(text)
+    tests = [
+        {
+            "name": "SS Physics JAMB Lagos",
+            "msgs": ["1","1","YES","David Emma","4","Physics","1","Lagos","5823","5823"],
+            "must_have": ["danfo", "WAX-"]
+        },
+        {
+            "name": "JSS2 Maths (skips exam)",
+            "msgs": ["1","1","YES","Mary John","2","Maths","Lagos","3434","3434"],
+            "must_have": ["biscuit", "WAX-"]
+        },
+        {
+            "name": "Typo rnglish",
+            "msgs": ["1","1","YES","Grace P","4","rnglish","1","Lagos","1113","1113"],
+            "must_have": ["Achebe"]
+        },
+        {
+            "name": "Number 1 defaults",
+            "msgs": ["1","1","YES","Blessing O","3","1","Lagos","1117","1117"],
+            "must_have": ["Mathematics"]
+        },
+        {
+            "name": "I dont know defaults",
+            "msgs": ["1","1","YES","Chioma N","3","i dont know","Lagos","1121","1121"],
+            "must_have": ["Mathematics"]
+        },
+        {
+            "name": "Short state Ka blocked",
+            "msgs": ["1","1","YES","Ngozi E","4","English","1","Ka","Kaduna","1126","1126"],
+            "must_have": ["Kaduna"]
+        },
+        {
+            "name": "Weak PIN 1234 rejected",
+            "msgs": ["1","1","YES","Joy Adamu","4","Physics","1","Lagos","1234","5824","5824"],
+            "must_have": ["too easy"]
+        },
+        {
+            "name": "Terms decline captured",
+            "msgs": ["1","1","no","3"],
+            "must_have": ["just looking"]
+        },
+    ]
 
-    sender_module.send_telegram_message = MockSender.send_telegram_message
+    report = ""
+    passed = 0
+    failed = 0
 
-    try:
-        from telegram.onboarding import handle_onboarding
-        from database.onboarding_state import get_onboarding_state, clear_onboarding_state
+    for i, test in enumerate(tests):
+        # Fresh captured list for each test
+        captured = []
 
-        tests = [
-            {
-                "name": "✅ SS Physics JAMB Lagos",
-                "msgs": ["1","1","YES","David Emma","4","Physics","1","Lagos","5823","5823"],
-                "checks": ["danfo", "WAX-", "Lagos"]
-            },
-            {
-                "name": "✅ JSS2 Maths (skips exam)",
-                "msgs": ["1","1","YES","Mary John","2","Maths","Lagos","3434","3434"],
-                "checks": ["biscuit", "WAX-", "Lagos", "JSS"]
-            },
-            {
-                "name": "✅ Typo 'rnglish' → English",
-                "msgs": ["1","1","YES","Grace P","4","rnglish","1","Lagos","1113","1113"],
-                "checks": ["Achebe", "English"]
-            },
-            {
-                "name": "✅ Number '1' → defaults Math",
-                "msgs": ["1","1","YES","Blessing O","3","1","Lagos","1117","1117"],
-                "checks": ["Mathematics", "sellers"]
-            },
-            {
-                "name": "✅ 'I dont know' → defaults Math",
-                "msgs": ["1","1","YES","Chioma N","3","i dont know","Lagos","1121","1121"],
-                "checks": ["No wahala", "Mathematics"]
-            },
-            {
-                "name": "✅ Short state 'Ka' blocked",
-                "msgs": ["1","1","YES","Ngozi E","4","English","1","Ka","Kaduna","1126","1126"],
-                "checks": ["doesn't look like", "Kaduna"]
-            },
-            {
-                "name": "✅ Weak PIN '1234' rejected",
-                "msgs": ["1","1","YES","Joy Adamu","4","Physics","1","Lagos","1234","5824","5824"],
-                "checks": ["too easy", "Got it"]
-            },
-            {
-                "name": "✅ Terms decline captured",
-                "msgs": ["1","1","no","3"],
-                "checks": ["No problem", "just looking", "Type HI"]
-            },
-        ]
+        class TestMockSender:
+            @staticmethod
+            async def send_telegram_message(cid, text):
+                captured.append(text)
 
-        report = ""
-        passed = 0
-        failed = 0
+        sender_module.send_telegram_message = TestMockSender.send_telegram_message
 
-        for i, test in enumerate(tests):
-            captured.clear()
-            cid = 60000 + i
-            await clear_onboarding_state("telegram", str(cid))
+        cid = 70000 + i
+        await clear_onboarding_state("telegram", str(cid))
 
+        try:
             for msg in test["msgs"]:
                 state = await get_onboarding_state("telegram", str(cid))
                 await handle_onboarding(cid, state, msg)
 
             full_text = " ".join(captured)
-            all_checks_passed = all(check.lower() in full_text.lower() for check in test["checks"])
+            all_ok = all(c.lower() in full_text.lower() for c in test["must_have"])
 
-            if all_checks_passed:
+            if all_ok:
                 passed += 1
-                report += f"  {test['name']}\n"
+                report += f"  ✅ {test['name']}\n"
             else:
                 failed += 1
-                missing = [c for c in test["checks"] if c.lower() not in full_text.lower()]
+                missing = [c for c in test["must_have"] if c.lower() not in full_text.lower()]
                 report += f"  ❌ {test['name']} — missing: {', '.join(missing)}\n"
+        except Exception as e:
+            failed += 1
+            report += f"  🔴 {test['name']} — crashed: {str(e)[:80]}\n"
 
-        total = passed + failed
-        summary = f"📊 *Results: {passed}/{total} passed*"
+    # Restore original sender BEFORE sending results
+    sender_module.send_telegram_message = original_sender
 
-        if failed == 0:
-            summary += "\n\n🎉 All tests passed!"
-        else:
-            summary += f"\n\n🔴 {failed} test(s) failed."
+    total = passed + failed
+    summary = f"📊 *Results: {passed}/{total} passed*"
 
-        # Send results in chunks if too long
-        await send_telegram_message(chat_id, summary + "\n\n" + report)
+    if failed == 0:
+        summary += "\n\n🎉 All tests passed!"
+    else:
+        summary += f"\n\n🔴 {failed} test(s) failed."
 
-    except Exception as e:
-        await send_telegram_message(chat_id, f"❌ Test error: {str(e)[:200]}")
-    finally:
-        # Restore original sender
-        sender_module.send_telegram_message = original_sender
+    await send_telegram_message(chat_id, summary + "\n\n" + report)
 
 
 async def _run_all_tests(chat_id: int):
@@ -173,85 +171,87 @@ async def _run_all_tests(chat_id: int):
     import telegram.sender as sender_module
     original_sender = sender_module.send_telegram_message
 
-    captured = []
+    from telegram.onboarding import handle_onboarding
+    from database.onboarding_state import get_onboarding_state, clear_onboarding_state
 
-    class MockSender:
-        @staticmethod
-        async def send_telegram_message(cid, text):
-            captured.append(text)
+    tests = [
+        # Happy paths (8)
+        {"name": "SS Physics JAMB", "msgs": ["1","1","YES","A One","4","Physics","1","Lagos","1001","1001"], "must_have": ["danfo","WAX-"]},
+        {"name": "SS Chemistry WAEC", "msgs": ["1","2","YES","B Two","5","Chemistry","2","Abuja","1002","1002"], "must_have": ["puff-puff","WAX-"]},
+        {"name": "SS Biology NECO", "msgs": ["1","1","YES","C Three","4","Biology","3","Rivers","1003","1003"], "must_have": ["egusi","WAX-"]},
+        {"name": "SS Economics JAMB", "msgs": ["1","3","YES","D Four","5","Economics","1","Kano","1004","1004"], "must_have": ["tomato","WAX-"]},
+        {"name": "JSS2 Maths", "msgs": ["1","1","YES","E Five","2","Maths","Lagos","1005","1005"], "must_have": ["biscuit","WAX-"]},
+        {"name": "JSS1 Science", "msgs": ["1","1","YES","F Six","1","science","Kano","1006","1006"], "must_have": ["spoon","Basic Science"]},
+        {"name": "SS Government", "msgs": ["1","2","YES","G Seven","5","Government","2","Oyo","1007","1007"], "must_have": ["INEC","WAX-"]},
+        {"name": "SS Literature", "msgs": ["1","1","YES","H Eight","4","Literature","1","Enugu","1008","1008"], "must_have": ["Achebe","WAX-"]},
 
-    sender_module.send_telegram_message = MockSender.send_telegram_message
+        # Typos (5)
+        {"name": "Typo physcs", "msgs": ["1","1","YES","I1","4","physcs","1","Lagos","2001","2001"], "must_have": ["danfo"]},
+        {"name": "Typo chemstry", "msgs": ["1","1","YES","I2","5","chemstry","2","Lagos","2002","2002"], "must_have": ["puff-puff"]},
+        {"name": "Typo biolgy", "msgs": ["1","1","YES","I3","4","biolgy","1","Lagos","2003","2003"], "must_have": ["egusi"]},
+        {"name": "Typo goverment", "msgs": ["1","1","YES","I4","5","goverment","2","Lagos","2004","2004"], "must_have": ["INEC"]},
+        {"name": "Typo econmics", "msgs": ["1","1","YES","I5","5","econmics","2","Lagos","2005","2005"], "must_have": ["tomato"]},
 
-    try:
-        from telegram.onboarding import handle_onboarding
-        from database.onboarding_state import get_onboarding_state, clear_onboarding_state
+        # Number confusion (3)
+        {"name": "Number 1 subj", "msgs": ["1","1","YES","J1","3","1","Lagos","3001","3001"], "must_have": ["Mathematics"]},
+        {"name": "Number 2 subj", "msgs": ["1","1","YES","J2","5","2","Lagos","3002","3002"], "must_have": ["Mathematics"]},
+        {"name": "Number 3 subj", "msgs": ["1","1","YES","J3","4","3","Lagos","3003","3003"], "must_have": ["Mathematics"]},
 
-        tests = [
-            # Happy paths (8)
-            {"name": "SS Physics JAMB", "msgs": ["1","1","YES","A One","4","Physics","1","Lagos","1001","1001"], "checks": ["danfo","WAX-"]},
-            {"name": "SS Chemistry WAEC", "msgs": ["1","2","YES","B Two","5","Chemistry","2","Abuja","1002","1002"], "checks": ["puff-puff","WAX-"]},
-            {"name": "SS Biology NECO", "msgs": ["1","1","YES","C Three","4","Biology","3","Rivers","1003","1003"], "checks": ["egusi","WAX-"]},
-            {"name": "SS Economics JAMB", "msgs": ["1","3","YES","D Four","5","Economics","1","Kano","1004","1004"], "checks": ["tomato","WAX-"]},
-            {"name": "JSS2 Maths", "msgs": ["1","1","YES","E Five","2","Maths","Lagos","1005","1005"], "checks": ["biscuit","WAX-"]},
-            {"name": "JSS1 Science", "msgs": ["1","1","YES","F Six","1","science","Kano","1006","1006"], "checks": ["spoon","Basic Science"]},
-            {"name": "SS Government", "msgs": ["1","2","YES","G Seven","5","Government","2","Oyo","1007","1007"], "checks": ["INEC","WAX-"]},
-            {"name": "SS Literature", "msgs": ["1","1","YES","H Eight","4","Literature","1","Enugu","1008","1008"], "checks": ["Achebe","WAX-"]},
+        # Edge cases (4)
+        {"name": "I dont know", "msgs": ["1","1","YES","K1","3","i dont know","Lagos","4001","4001"], "must_have": ["No wahala","Mathematics"]},
+        {"name": "Short state Ka", "msgs": ["1","1","YES","K2","4","English","1","Ka","Kaduna","4002","4002"], "must_have": ["doesn't look like"]},
+        {"name": "Weak PIN", "msgs": ["1","1","YES","K3","4","Physics","1","Lagos","1234","4003","4003"], "must_have": ["too easy"]},
+        {"name": "Decline terms", "msgs": ["1","1","no","3"], "must_have": ["No problem","just looking"]},
+    ]
 
-            # Typos (5)
-            {"name": "Typo physcs", "msgs": ["1","1","YES","I1","4","physcs","1","Lagos","2001","2001"], "checks": ["danfo"]},
-            {"name": "Typo chemstry", "msgs": ["1","1","YES","I2","5","chemstry","2","Lagos","2002","2002"], "checks": ["puff-puff"]},
-            {"name": "Typo biolgy", "msgs": ["1","1","YES","I3","4","biolgy","1","Lagos","2003","2003"], "checks": ["egusi"]},
-            {"name": "Typo goverment", "msgs": ["1","1","YES","I4","5","goverment","2","Lagos","2004","2004"], "checks": ["INEC"]},
-            {"name": "Typo econmics", "msgs": ["1","1","YES","I5","5","econmics","2","Lagos","2005","2005"], "checks": ["tomato"]},
+    report = ""
+    passed = 0
+    failed = 0
+    failures = []
 
-            # Number confusion (3)
-            {"name": "Number 1 subj", "msgs": ["1","1","YES","J1","3","1","Lagos","3001","3001"], "checks": ["Mathematics"]},
-            {"name": "Number 2 subj", "msgs": ["1","1","YES","J2","5","2","Lagos","3002","3002"], "checks": ["Mathematics"]},
-            {"name": "Number 3 subj", "msgs": ["1","1","YES","J3","4","3","Lagos","3003","3003"], "checks": ["Mathematics"]},
+    for i, test in enumerate(tests):
+        # Fresh captured list for each test
+        captured = []
 
-            # Edge cases (4)
-            {"name": "I dont know", "msgs": ["1","1","YES","K1","3","i dont know","Lagos","4001","4001"], "checks": ["No wahala","Mathematics"]},
-            {"name": "Short state Ka", "msgs": ["1","1","YES","K2","4","English","1","Ka","Kaduna","4002","4002"], "checks": ["doesn't look like"]},
-            {"name": "Weak PIN", "msgs": ["1","1","YES","K3","4","Physics","1","Lagos","1234","4003","4003"], "checks": ["too easy"]},
-            {"name": "Decline terms", "msgs": ["1","1","no","3"], "checks": ["No problem","just looking"]},
-        ]
+        class TestMockSender:
+            @staticmethod
+            async def send_telegram_message(cid, text):
+                captured.append(text)
 
-        report = ""
-        passed = 0
-        failed = 0
-        failures = []
+        sender_module.send_telegram_message = TestMockSender.send_telegram_message
 
-        for i, test in enumerate(tests):
-            captured.clear()
-            cid = 70000 + i
-            await clear_onboarding_state("telegram", str(cid))
+        cid = 80000 + i
+        await clear_onboarding_state("telegram", str(cid))
 
+        try:
             for msg in test["msgs"]:
                 state = await get_onboarding_state("telegram", str(cid))
                 await handle_onboarding(cid, state, msg)
 
             full_text = " ".join(captured)
-            all_ok = all(c.lower() in full_text.lower() for c in test["checks"])
+            all_ok = all(c.lower() in full_text.lower() for c in test["must_have"])
 
             if all_ok:
                 passed += 1
             else:
                 failed += 1
-                missing = [c for c in test["checks"] if c.lower() not in full_text.lower()]
+                missing = [c for c in test["must_have"] if c.lower() not in full_text.lower()]
                 failures.append(f"  ❌ {test['name']}: missing {missing}")
+        except Exception as e:
+            failed += 1
+            failures.append(f"  🔴 {test['name']}: crashed - {str(e)[:80]}")
 
-        total = passed + failed
-        summary = f"📊 *Full Results: {passed}/{total} passed*"
-        if failed == 0:
-            summary += "\n\n🎉 All 20 tests passed!"
-        else:
-            summary += f"\n\n🔴 {failed} failed:"
-            for f in failures[:5]:
-                summary += f"\n{f}"
+    # Restore original sender BEFORE sending results
+    sender_module.send_telegram_message = original_sender
 
-        await send_telegram_message(chat_id, summary)
+    total = passed + failed
+    summary = f"📊 *Full Results: {passed}/{total} passed*"
 
-    except Exception as e:
-        await send_telegram_message(chat_id, f"❌ Test error: {str(e)[:200]}")
-    finally:
-        sender_module.send_telegram_message = original_sender
+    if failed == 0:
+        summary += "\n\n🎉 All 20 tests passed!"
+    else:
+        summary += f"\n\n🔴 {failed} failed:"
+        for f in failures[:10]:
+            summary += f"\n{f}"
+
+    await send_telegram_message(chat_id, summary)
