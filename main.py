@@ -4,6 +4,7 @@ FastAPI server with Telegram + WhatsApp webhooks.
 """
 
 import asyncio
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -59,13 +60,59 @@ async def health_check():
 
 
 # ──────────────────────────────────────────────
-# TEST ENDPOINT — quick confirmation it works
+# TEST ENDPOINTS — run tests in background
 # ──────────────────────────────────────────────
 
 @app.get("/test-onboarding")
 async def test_onboarding():
-    """Quick test to confirm endpoint works."""
-    return {"status": "ok", "message": "Test endpoint is working", "count": 1}
+    """Start onboarding tests in background. Results at /test-results."""
+    # Start tests in background
+    asyncio.create_task(_run_tests_background())
+
+    return {
+        "status": "started",
+        "message": "Tests are running in background. Check /test-results in about 30 seconds.",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+async def _run_tests_background():
+    """Run all scenarios and save results to Redis."""
+    try:
+        from tests.test_onboarding import run_all_scenarios
+        from database.client import redis_client
+        import json
+
+        report = await run_all_scenarios()
+        redis_client.setex("test_results", 600, json.dumps(report, default=str))
+        print(f"Tests complete: {report.get('passed', 0)}/{report.get('total', 0)} passed")
+    except Exception as e:
+        from database.client import redis_client
+        import json
+        import traceback
+        error_report = {
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        redis_client.setex("test_results", 600, json.dumps(error_report))
+        print(f"Test run failed: {e}")
+
+
+@app.get("/test-results")
+async def test_results():
+    """View the latest test results."""
+    from database.client import redis_client
+    import json
+
+    raw = redis_client.get("test_results")
+    if not raw:
+        return {
+            "status": "pending",
+            "message": "Tests are still running or haven't been started. Visit /test-onboarding to start."
+        }
+
+    return json.loads(raw)
 
 
 # ──────────────────────────────────────────────
