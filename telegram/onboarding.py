@@ -4,8 +4,12 @@ Handles every step of onboarding for new students on Telegram.
 State is stored in Redis via database/onboarding_state.py — NOT in conversations.
 """
 
+import random
+
 from telegram.sender import send_telegram_message
 from database.onboarding_state import save_onboarding_state, clear_onboarding_state
+from helpers import clean_name
+from database.students import create_student
 
 
 # ──────────────────────────────────────────────
@@ -80,13 +84,29 @@ async def _start_new_or_existing(chat_id: int, state: dict, message: str):
         await save_onboarding_state("telegram", str(chat_id), state)
         return
 
-    # Unclear — ask again
-    await send_telegram_message(
-        chat_id,
+    # Unclear — ask again with a random variant
+    welcomes = [
         "Are you new to WaxPrep, or do you already have an account?\n\n"
         "*1* — I'm new\n"
-        "*2* — I have a WAX ID"
-    )
+        "*2* — I have a WAX ID",
+
+        "Quick one — have we met before?\n\n"
+        "*1* — No, I'm new here\n"
+        "*2* — Yes, I have a WAX ID",
+
+        "Welcome! Let me know where you stand:\n\n"
+        "*1* — I'm creating a new account\n"
+        "*2* — I already have an account",
+
+        "First time or returning? No wrong answer:\n\n"
+        "*1* — First time, let's go\n"
+        "*2* — I've been here before",
+
+        "Before we dive in — are you new or returning?\n\n"
+        "*1* — Brand new\n"
+        "*2* — I have a WAX ID",
+    ]
+    await send_telegram_message(chat_id, random.choice(welcomes))
 
 
 # ──────────────────────────────────────────────
@@ -177,8 +197,6 @@ async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
 
 @register_step("name")
 async def _step_name(chat_id: int, state: dict, message: str):
-    from helpers import clean_name
-
     name = clean_name(message)
 
     if len(name) < 3 or len(name.split()) < 2:
@@ -340,8 +358,6 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
         return
 
     # ── CREATE ACCOUNT ────────────────────────
-    from database.students import create_student
-
     student = await create_student(
         platform="telegram",
         platform_user_id=str(chat_id),
