@@ -5,7 +5,6 @@ registered users to the AI brain.
 """
 
 from telegram.sender import send_telegram_message
-from database.onboarding_state import get_onboarding_state
 
 
 async def process_telegram_message(chat_id: int, text: str) -> None:
@@ -18,7 +17,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     if not text:
         return
 
-    # ── Admin commands ───────────────────────
+    # ── Admin commands (MUST be first) ───────
     from admin.commands import handle_admin_command
     if await handle_admin_command(chat_id, text):
         return
@@ -39,6 +38,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
     # ── Unregistered user — onboarding ───────
     from telegram.onboarding import handle_onboarding
+    from database.onboarding_state import get_onboarding_state
 
     # Load their current onboarding state from Redis
     state = await get_onboarding_state("telegram", str(chat_id))
