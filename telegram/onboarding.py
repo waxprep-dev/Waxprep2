@@ -273,23 +273,49 @@ async def _step_class_level(chat_id: int, state: dict, message: str):
         return
     first = state.get("name", "Student").split()[0]
     state["class_level"] = class_level
+
+    # Level-appropriate subject examples
+    if class_level.startswith("JSS"):
+        examples = "Science, Maths, English, Social Studies"
+    else:
+        examples = "Physics, Maths, Chemistry, English"
+
     state["awaiting_response_for"] = "subject_selection"
     await save_onboarding_state("telegram", str(chat_id), state)
-    await send_telegram_message(chat_id, f"{_ack()} *{class_level}*!\n\nNow, {first} — which subject gives you the most trouble right now?\n\n_(Just type the subject name — e.g. Physics, Maths, Chemistry, English)_")
+    await send_telegram_message(
+        chat_id,
+        f"{_ack()} *{class_level}*!\n\n"
+        f"Now, {first} — which subject gives you the most trouble right now?\n\n"
+        f"_(Just type the subject name — e.g. {examples})_"
+    )
 
 # ── subject_selection + Magic Trick ───────────
 @register_step("subject_selection")
 async def _step_subject_selection(chat_id: int, state: dict, message: str):
     raw_subject = message.strip()
-    normalized = normalize_subject(raw_subject)
-    dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
-    if raw_subject.lower() in dont_know:
-        normalized = "Mathematics"
-        await send_telegram_message(chat_id, "No wahala. Let's start with Mathematics — it's the foundation for most subjects.")
-    state["student_subject"] = normalized
-    await save_onboarding_state("telegram", str(chat_id), state)
     level = state.get("class_level", "SS")
     first = state.get("name", "Student").split()[0]
+
+    # Level-appropriate subject examples
+    if level.startswith("JSS"):
+        examples = "Science, Maths, English, Social Studies"
+    else:
+        examples = "Physics, Maths, Chemistry, English"
+
+    # Catch numbers or "I don't know"
+    dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
+    if raw_subject.lower() in dont_know or (raw_subject.isdigit() and len(raw_subject) <= 2):
+        normalized = "Mathematics"
+        await send_telegram_message(
+            chat_id,
+            f"No wahala — I meant a subject name, like *{examples}*. "
+            "But no stress. Let's start with Mathematics — it's the foundation for most subjects."
+        )
+    else:
+        normalized = normalize_subject(raw_subject)
+
+    state["student_subject"] = normalized
+    await save_onboarding_state("telegram", str(chat_id), state)
 
     # Fire Magic Trick
     trick = get_magic_trick(normalized, level)
@@ -300,7 +326,7 @@ async def _step_subject_selection(chat_id: int, state: dict, message: str):
 
     await _breathe(0.6)
 
-    # JSS students skip exam question — they don't take JAMB/WAEC/NECO
+    # JSS students skip exam question
     if level.startswith("JSS"):
         state["awaiting_response_for"] = "state"
         await save_onboarding_state("telegram", str(chat_id), state)
