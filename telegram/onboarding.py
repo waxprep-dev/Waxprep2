@@ -5,6 +5,7 @@ State is stored in Redis via database/onboarding_state.py — NOT in conversatio
 """
 
 import random
+from datetime import datetime
 
 from telegram.sender import send_telegram_message
 from database.onboarding_state import save_onboarding_state, clear_onboarding_state
@@ -25,6 +26,81 @@ def register_step(step_name: str):
         STEP_HANDLERS[step_name] = func
         return func
     return wrapper
+
+
+# ──────────────────────────────────────────────
+# RETRY VARIANT GENERATORS — each step gets its own rotating prompts
+# ──────────────────────────────────────────────
+
+def _get_goal_retry():
+    return random.choice([
+        "Just pick one that's closest:\n\n"
+        "*1* — My schoolwork\n"
+        "*2* — Preparing for a test or exam\n"
+        "*3* — I just want to learn something new",
+
+        "No wahala — choose the one that fits best:\n\n"
+        "*1* — Schoolwork help\n"
+        "*2* — Exam preparation\n"
+        "*3* — General learning",
+
+        "I just need to know where to focus:\n\n"
+        "*1* — Schoolwork\n"
+        "*2* — Exam prep\n"
+        "*3* — I want to learn something",
+
+        "Pick one — you can always change later:\n\n"
+        "*1* — My schoolwork\n"
+        "*2* — Test or exam prep\n"
+        "*3* — Just curious to learn",
+    ])
+
+
+def _get_class_level_retry():
+    return random.choice([
+        "Please reply with a number from 1 to 6:\n\n"
+        "1 — JSS1\n2 — JSS2\n3 — JSS3\n"
+        "4 — SS1\n5 — SS2\n6 — SS3",
+
+        "Just type the number that matches your class:\n\n"
+        "1 = JSS1, 2 = JSS2, 3 = JSS3\n"
+        "4 = SS1, 5 = SS2, 6 = SS3",
+
+        "Which class? Reply with just the number:\n\n"
+        "1 — JSS1\n2 — JSS2\n3 — JSS3\n"
+        "4 — SS1\n5 — SS2\n6 — SS3",
+    ])
+
+
+def _get_exam_retry():
+    return random.choice([
+        "Please reply with 1, 2, or 3:\n\n"
+        "1 — JAMB\n2 — WAEC\n3 — NECO",
+
+        "Which exam? Just the number:\n\n"
+        "1 = JAMB, 2 = WAEC, 3 = NECO",
+
+        "Pick your exam — 1, 2, or 3:\n\n"
+        "1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO",
+    ])
+
+
+def _get_pin_retry(failed_attempts: int = 0):
+    """Escalates help after repeated PIN failures."""
+    base = "Your PIN must be exactly 4 digits."
+    if failed_attempts < 2:
+        return random.choice([
+            f"{base} Please try again.",
+            f"{base} Just type any 4 numbers.",
+            f"{base} Something like 5823 — but pick your own!",
+        ])
+    elif failed_attempts < 4:
+        return random.choice([
+            f"Still having trouble? {base} For example, if your birth year is 2007, try 2007. But pick something only you know.",
+            f"Let me help. {base} Think of a 4-digit number you won't forget — maybe part of your phone number (not the whole thing).",
+        ])
+    else:
+        return f"I know this is frustrating. {base} Take a breath. If you have a 4-digit number in mind that you can remember easily, type it now. If you don't, try your birth year — just make sure nobody else knows it."
 
 
 # ──────────────────────────────────────────────
@@ -129,13 +205,7 @@ async def _step_student_goal(chat_id: int, state: dict, message: str):
             break
 
     if not goal:
-        await send_telegram_message(
-            chat_id,
-            "Just pick one that's closest:\n\n"
-            "*1* — My schoolwork\n"
-            "*2* — Preparing for a test or exam\n"
-            "*3* — I just want to learn something new"
-        )
+        await send_telegram_message(chat_id, _get_goal_retry())
         return
 
     await send_telegram_message(
@@ -157,7 +227,10 @@ async def _step_student_goal(chat_id: int, state: dict, message: str):
 @register_step("terms_acceptance")
 async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
-    is_new = state.get("is_new_student", True)
+    # FIX: default to False — safer. Only new students who explicitly chose
+    # "I'm new" have is_new_student set to True. Everyone else is treated
+    # as a returning user needing a WAX ID.
+    is_new = state.get("is_new_student", False)
 
     if msg in ["yes", "y", "agree", "accept", "i agree", "i accept", "ok", "okay", "1"]:
         if is_new:
@@ -168,6 +241,7 @@ async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
                 "_(Type your first and last name)_"
             )
             state["terms_accepted"] = True
+            state["terms_accepted_at"] = datetime.utcnow().isoformat()
             state["awaiting_response_for"] = "name"
             await save_onboarding_state("telegram", str(chat_id), state)
         else:
@@ -179,16 +253,47 @@ async def _step_terms_acceptance(chat_id: int, state: dict, message: str):
             state["awaiting_response_for"] = "wax_id_entry"
             await save_onboarding_state("telegram", str(chat_id), state)
     elif msg in ["no", "n", "decline", "reject", "2"]:
-        await send_telegram_message(
-            chat_id,
-            "No problem. Come back anytime.\n\n"
-            "WaxPrep is here whenever you're ready."
-        )
+        # Capture decline reason
+        decline_reasons = [
+            "before we go — would you mind telling me why? It helps me improve.\n\n"
+            "*1* — I don't understand what this is\n"
+            "*2* — I'm not comfortable with the terms\n"
+            "*3* — I was just looking around\n"
+            "*4* — I'll decide later"
+        ]
+        # Save that they declined
+        state["terms_declined"] = True
+        state["awaiting_response_for"] = "decline_reason"
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(chat_id, f"No problem at all.\n\n{decline_reasons[0]}")
     else:
         await send_telegram_message(
             chat_id,
             "Please reply *YES* to accept and continue, or *NO* to decline."
         )
+
+
+# ──────────────────────────────────────────────
+# STEP: decline_reason (NEW)
+# ──────────────────────────────────────────────
+
+@register_step("decline_reason")
+async def _step_decline_reason(chat_id: int, state: dict, message: str):
+    msg = message.strip()
+    reason_map = {
+        "1": "didn't understand",
+        "2": "uncomfortable with terms",
+        "3": "just looking",
+        "4": "decide later",
+    }
+    reason = reason_map.get(msg, msg[:200])
+    print(f"User {chat_id} declined terms. Reason: {reason}")
+    await send_telegram_message(
+        chat_id,
+        "Thanks for letting me know. WaxPrep will be here whenever you're ready.\n\n"
+        "Type *HI* anytime to start again."
+    )
+    await clear_onboarding_state("telegram", str(chat_id))
 
 
 # ──────────────────────────────────────────────
@@ -235,12 +340,7 @@ async def _step_class_level(chat_id: int, state: dict, message: str):
 
     class_level = class_map.get(msg)
     if not class_level:
-        await send_telegram_message(
-            chat_id,
-            "Please reply with a number from 1 to 6:\n\n"
-            "1 — JSS1\n2 — JSS2\n3 — JSS3\n"
-            "4 — SS1\n5 — SS2\n6 — SS3"
-        )
+        await send_telegram_message(chat_id, _get_class_level_retry())
         return
 
     await send_telegram_message(
@@ -267,11 +367,7 @@ async def _step_target_exam(chat_id: int, state: dict, message: str):
 
     target_exam = exam_map.get(msg)
     if not target_exam:
-        await send_telegram_message(
-            chat_id,
-            "Please reply with 1, 2, or 3:\n\n"
-            "1 — JAMB\n2 — WAEC\n3 — NECO"
-        )
+        await send_telegram_message(chat_id, _get_exam_retry())
         return
 
     await send_telegram_message(
@@ -302,6 +398,8 @@ async def _step_state(chat_id: int, state: dict, message: str):
     )
     state["student_state"] = student_state
     state["awaiting_response_for"] = "pin_setup"
+    # Reset PIN failure counter
+    state["pin_failed_attempts"] = 0
     await save_onboarding_state("telegram", str(chat_id), state)
 
 
@@ -314,10 +412,10 @@ async def _step_pin_setup(chat_id: int, state: dict, message: str):
     pin = message.strip()
 
     if not pin.isdigit() or len(pin) != 4:
-        await send_telegram_message(
-            chat_id,
-            "Your PIN must be exactly 4 digits. Please try again."
-        )
+        failed = state.get("pin_failed_attempts", 0) + 1
+        state["pin_failed_attempts"] = failed
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(chat_id, _get_pin_retry(failed))
         return
 
     weak_pins = {"1234", "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999"}
