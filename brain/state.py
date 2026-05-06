@@ -90,49 +90,60 @@ ALLOWED_TRANSITIONS = {
 
 # ── State Manager ────────────────────────────
 
-async def get_state(student_id: str) -> str:
+async def get_state(student_id: str) -> Optional[str]:
     """
     Get the current state for a student.
-    Defaults to IDLE for existing students, ONBOARDING for new.
+    Returns None if the student doesn't exist.
+    Checks Redis first (fast), falls back to database (durable).
     """
-    # Check Redis first (fast)
+    # Check Redis first
     key = f"student_state:{student_id}"
     try:
         cached = redis_client.get(key)
         if cached:
             return cached
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Redis get_state error: {e}")
 
     # Fall back to database
     try:
         result = (
             supabase.table("students")
-            .select("onboarding_complete")
+            .select("current_state, onboarding_complete")
             .eq("id", student_id)
             .execute()
         )
         if result.data:
-            is_complete = result.data[0].get("onboarding_complete", False)
-            state = StudentState.IDLE.value if is_complete else StudentState.ONBOARDING.value
-            # Cache it
+            row = result.data[0]
+            state = row.get("current_state")
+            if not state:
+                # No state stored yet — infer from onboarding status
+                is_complete = row.get("onboarding_complete", False)
+                state = StudentState.IDLE.value if is_complete else StudentState.ONBOARDING.value
+            
+            # Repopulate Redis cache
             try:
                 redis_client.setex(key, 3600, state)
             except Exception:
                 pass
+            
             return state
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Database get_state error: {e}")
 
-    return StudentState.IDLE.value
+    return None  # Student not found
 
 
-async def set_state(student_id: str, new_state: str) -> bool:
+async def set_state(student_id: str, new_state: str, reason: str = "") -> bool:
     """
     Change a student's state. Returns True if successful.
     Validates the transition before saving.
+    Persists to both Redis (fast) and database (durable).
     """
     current_state_str = await get_state(student_id)
+    if not current_state_str:
+        print(f"set_state failed: student {student_id} not found")
+        return False
 
     # Parse current state
     try:
@@ -144,6 +155,7 @@ async def set_state(student_id: str, new_state: str) -> bool:
     try:
         target_state = StudentState(new_state)
     except ValueError:
+        print(f"set_state failed: invalid state '{new_state}'")
         return False
 
     # Check if transition is allowed
@@ -151,13 +163,26 @@ async def set_state(student_id: str, new_state: str) -> bool:
         print(f"State transition blocked: {current_state.value} → {new_state}")
         return False
 
-    # Save to Redis
+    # Log the transition
+    log_msg = f"STATE: {student_id}: {current_state.value} → {new_state}"
+    if reason:
+        log_msg += f" | {reason}"
+    print(log_msg)
+
+    # Save to Redis (fast)
     key = f"student_state:{student_id}"
     try:
         redis_client.setex(key, 3600, new_state)
     except Exception as e:
-        print(f"State save error: {e}")
-        return False
+        print(f"Redis set_state error: {e}")
+        # Continue — we'll try database
+
+    # Save to database (durable)
+    try:
+        supabase.table("students").update({"current_state": new_state}).eq("id", student_id).execute()
+    except Exception as e:
+        print(f"Database set_state error: {e}")
+        # Redis save may have succeeded, so this is non-fatal but worth logging
 
     return True
 
@@ -176,14 +201,24 @@ async def force_state(student_id: str, new_state: str):
     key = f"student_state:{student_id}"
     try:
         redis_client.setex(key, 3600, new_state)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"force_state Redis error: {e}")
+
+    try:
+        supabase.table("students").update({"current_state": new_state}).eq("id", student_id).execute()
+    except Exception as e:
+        print(f"force_state database error: {e}")
 
 
 async def clear_state(student_id: str):
-    """Remove state from cache (on account deletion)."""
+    """Remove state from cache and database (on account deletion)."""
     key = f"student_state:{student_id}"
     try:
         redis_client.delete(key)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"clear_state Redis error: {e}")
+
+    try:
+        supabase.table("students").update({"current_state": None}).eq("id", student_id).execute()
+    except Exception as e:
+        print(f"clear_state database error: {e}")
