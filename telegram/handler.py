@@ -51,13 +51,20 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 async def _handle_registered_student(chat_id: int, student: dict, text: str):
     """
     Route a registered student's message to the AI brain.
-    Sets up conversation context and sends the response.
+    Saves conversation history so Wax remembers what was said.
     """
     from ai.brain import think
     from brain.state import get_state, set_state
+    from database.conversations import get_history, save_message
 
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
+
+    # Save student's message to history
+    await save_message(student_id, "user", text)
+
+    # Load conversation history (now has memory!)
+    conversation_history = await get_history(student_id)
 
     # Get current state
     try:
@@ -76,11 +83,6 @@ async def _handle_registered_student(chat_id: int, student: dict, text: str):
     recent_subject = None
     if current_state in ("in_lesson", "in_practice", "stuck"):
         recent_subject = student.get("subjects", [None])[0] if student.get("subjects") else None
-
-    # TODO: Load conversation history from database
-    # This is the biggest missing piece — without it, Wax has amnesia
-    # Phase 2B: Implement message history storage and retrieval
-    conversation_history = []
 
     # TODO: Build context string from memory/progress
     # Phase 2C: Include recent performance, weak topics, session goals
@@ -102,6 +104,9 @@ async def _handle_registered_student(chat_id: int, student: dict, text: str):
             f"Ah, my brain just froze for a second, {name}. "
             f"Can you try again? I'm back now."
         )
+
+    # Save Wax's response to history
+    await save_message(student_id, "assistant", response)
 
     await send_telegram_message(chat_id, response)
 
