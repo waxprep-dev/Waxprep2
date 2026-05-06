@@ -129,6 +129,13 @@ async def _run_quick_tests(chat_id: int):
 
 async def _run_all_tests(chat_id: int):
     """Run expanded test suite (20+ scenarios)."""
+    # Cooldown check
+    cooldown_key = "test_all_cooldown"
+    if redis_client.get(cooldown_key):
+        await send_telegram_message(chat_id, "⏳ Tests already running. Please wait.")
+        return
+    redis_client.setex(cooldown_key, 300, "1")  # 5 minute cooldown
+
     await send_telegram_message(chat_id, "🧪 *Running full test suite... this may take a minute.*")
 
     import telegram.sender as sender_module
@@ -202,7 +209,7 @@ async def _run_all_tests(chat_id: int):
 
 
 # ═══════════════════════════════════════════════
-# AI BEHAVIOR TEST — ALL INLINE, NO EXTERNAL IMPORTS
+# AI BEHAVIOR TEST — ALL INLINE
 # ═══════════════════════════════════════════════
 
 STUDENT_TYPES = {
@@ -279,34 +286,28 @@ def _analyze_responses(messages: list, responses: list, student_type: str) -> di
     full = " ".join(responses).lower()
     student_text = " ".join(messages).lower()
     
-    # Check for "don't worry"
     if "don't worry" in full or "dont worry" in full:
         failures.append("Used 'don't worry' (dismissive)")
     
-    # Check for "wrong" or "incorrect"
     if "wrong." in full or "incorrect." in full:
         failures.append("Used 'wrong' or 'incorrect'")
     
-    # Check for multiple questions in one message
     for r in responses:
         if r.count("?") > 1:
             failures.append("Asked multiple questions in one message")
             break
     
-    # Check for walls of text
     for r in responses:
         if len(r) > 400:
             warnings.append("Some responses were long (>400 chars)")
             break
     
-    # Check for Nigerian examples
     nigerian_terms = ["danfo", "suya", "puff-puff", "egusi", "okada", "keke", "nepa", "wahala", "jollof", "garri"]
     if any(term in full for term in nigerian_terms):
         passes.append("Used Nigerian examples")
     else:
         warnings.append("No Nigerian examples detected")
     
-    # Confusion handling
     if student_type == "confused":
         confusion_signals = ["step back", "simpler", "another way", "different example", "no wahala", "let's try", "break it down"]
         if any(signal in full for signal in confusion_signals):
@@ -314,7 +315,6 @@ def _analyze_responses(messages: list, responses: list, student_type: str) -> di
         else:
             failures.append("Did not respond to repeated confusion signals")
     
-    # Progression for fast learner
     if student_type == "fast_learner":
         progression_signals = ["harder", "next level", "more difficult", "advanced", "next topic"]
         if any(signal in full for signal in progression_signals):
@@ -322,7 +322,6 @@ def _analyze_responses(messages: list, responses: list, student_type: str) -> di
         else:
             warnings.append("Did not clearly offer progression")
     
-    # Exam anxiety
     if student_type == "exam_anxious":
         if "don't worry" not in full:
             passes.append("Avoided 'don't worry' for anxious student")
@@ -330,7 +329,6 @@ def _analyze_responses(messages: list, responses: list, student_type: str) -> di
         if any(signal in full for signal in action_signals):
             passes.append("Offered concrete action plan")
     
-    # Calculate score
     total = len(failures) + len(passes) + len(warnings)
     if total == 0:
         score = 50
@@ -348,6 +346,13 @@ def _analyze_responses(messages: list, responses: list, student_type: str) -> di
 
 async def _run_ai_behavior_tests(chat_id: int):
     """Run AI behavior tests — ALL INLINE, NO EXTERNAL FILES NEEDED."""
+    # Cooldown check — prevent multiple simultaneous runs
+    cooldown_key = "test_ai_cooldown"
+    if redis_client.get(cooldown_key):
+        await send_telegram_message(chat_id, "⏳ Test AI already ran recently. Wait 5 minutes before running again.")
+        return
+    redis_client.setex(cooldown_key, 300, "1")  # 5 minute cooldown
+
     await send_telegram_message(chat_id, "🧠 *Running AI behavior tests...*\nSimulating student types. This will take ~1 minute.")
 
     import telegram.sender as sender_module
@@ -377,7 +382,6 @@ async def _run_ai_behavior_tests(chat_id: int):
         profile = STUDENT_TYPES[stype]
         topic = topics[i % len(topics)]
         
-        # Override first message with topic
         messages = list(profile["messages"])
         if "{topic}" in messages[0] or "Explain" in messages[0] or "Teach" in messages[0] or "teach" in messages[0]:
             messages[0] = messages[0].replace("{topic}", topic)
