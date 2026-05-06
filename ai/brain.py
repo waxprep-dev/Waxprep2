@@ -1,7 +1,7 @@
 """
 WaxPrep v2 — AI Brain
 Calls the Groq API with Wax's system prompt and returns the response.
-This is the bridge between the rules and the actual AI.
+Includes post-processing enforcement layer for critical rules.
 """
 
 import asyncio
@@ -23,6 +23,110 @@ def _get_client() -> Groq:
     return _groq_client
 
 
+# ═══════════════════════════════════════════════
+# POST-PROCESSING ENFORCEMENT LAYER
+# These rules are enforced in CODE, not just the prompt.
+# The model might ignore prompt rules. Code doesn't.
+# ═══════════════════════════════════════════════
+
+def enforce_one_question(response: str) -> str:
+    """
+    If the AI asks more than one question, keep only the first one.
+    Cuts at the first question mark and appends just that question.
+    """
+    questions = response.split("?")
+    if len(questions) > 2:  # More than one question mark
+        first_part = questions[0] + "?"
+        remaining = "?".join(questions[1:])
+        if len(remaining.strip()) > 10:
+            return first_part.strip()
+    return response
+
+
+def enforce_length(response: str, max_chars: int = 400) -> str:
+    """
+    If response is too long, trim to the last complete sentence under max_chars.
+    """
+    if len(response) <= max_chars:
+        return response
+    
+    truncated = response[:max_chars]
+    last_period = max(
+        truncated.rfind(". "),
+        truncated.rfind("! "),
+        truncated.rfind("? "),
+        truncated.rfind(".\n"),
+    )
+    
+    if last_period > 100:  # Only cut if we have enough context
+        return truncated[:last_period + 1].strip()
+    
+    # Fallback: hard cut at last complete word
+    return truncated.rsplit(" ", 1)[0] + "..."
+
+
+def clean_banned_phrases(response: str) -> str:
+    """
+    Remove banned phrases from the response.
+    """
+    banned = [
+        ("don't worry", "I hear you"),
+        ("dont worry", "I hear you"),
+        ("Don't worry", "I hear you"),
+        ("do not worry", "I hear you"),
+    ]
+    
+    for phrase, replacement in banned:
+        response = response.replace(phrase, replacement)
+    
+    return response
+
+
+def enforce_nigerian_example(response: str) -> str:
+    """
+    If the response is teaching (3+ sentences) and has no Nigerian reference,
+    log a warning. Soft enforcement — doesn't modify the response.
+    """
+    nigerian_terms = [
+        "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
+        "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
+        "achebe", "soyinka", "lagos", "abuja", "kano", "naira",
+        "generator", "borehole", "kerosene", "omo", "agege"
+    ]
+    
+    sentences = [s for s in response.split(".") if len(s.strip()) > 10]
+    if len(sentences) >= 3:
+        has_nigerian = any(term in response.lower() for term in nigerian_terms)
+        if not has_nigerian:
+            print(f"WARNING: Teaching response has no Nigerian example")
+    
+    return response
+
+
+def enforce_rules(response: str) -> str:
+    """
+    Run all post-processing enforcement rules.
+    Order matters: clean phrases first, then trim questions, then trim length.
+    """
+    # 1. Remove banned phrases
+    response = clean_banned_phrases(response)
+    
+    # 2. Enforce one question limit
+    response = enforce_one_question(response)
+    
+    # 3. Enforce length limit
+    response = enforce_length(response, max_chars=400)
+    
+    # 4. Soft enforcement — log if Nigerian examples missing
+    response = enforce_nigerian_example(response)
+    
+    return response
+
+
+# ═══════════════════════════════════════════════
+# MAIN AI FUNCTION
+# ═══════════════════════════════════════════════
+
 async def think(
     message: str,
     student: dict,
@@ -43,7 +147,7 @@ async def think(
         is_practice: If True, use lite prompt (cheaper for practice/chat)
     
     Returns:
-        Wax's response as a string
+        Wax's response as a string (post-processed for rule compliance)
     """
     conversation_history = conversation_history or []
     student_id = student.get('id', 'unknown')
@@ -73,24 +177,26 @@ async def think(
 
     # Call Groq with retry logic
     max_retries = 2
+    raw_response = None
+    
     for attempt in range(max_retries + 1):
         try:
             client = _get_client()
             
-            # Run the synchronous Groq call in a thread pool to avoid blocking the event loop
+            # Run the synchronous Groq call in a thread pool
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model=settings.GROQ_FAST_MODEL,
                 messages=messages,
-                max_tokens=600,
+                max_tokens=500,  # Reduced from 600 — shorter responses
                 temperature=0.75,
             )
             
             result = response.choices[0].message.content
             if result and len(result.strip()) > 5:
-                return result.strip()
+                raw_response = result.strip()
+                break
             
-            # Empty or too-short response — treat as failure
             print(f"Groq returned empty/short response for student {student_id}")
             
         except Exception as e:
@@ -98,24 +204,37 @@ async def think(
             print(f"Groq error (attempt {attempt+1}/{max_retries+1}): {error_type}: {e} | student={student_id}")
             
             if attempt < max_retries:
-                # Exponential backoff: 1s, 2s
                 wait_time = (attempt + 1) * 1.0
                 await asyncio.sleep(wait_time)
             else:
-                # All retries exhausted — log structured error
                 _log_ai_failure(student_id, error_type, str(e))
 
-    # Fallback — student should never see silence
-    fallbacks = [
-        f"I had a small technical hiccup, {name}. Can you ask me again?",
-        f"Ah, my brain lagged for a second, {name}. Try me one more time?",
-        f"Sorry, {name} — something glitched. What were you saying?",
-    ]
-    return fallbacks[hash(str(student_id)) % len(fallbacks)]
+    # If all retries failed, use fallback
+    if not raw_response:
+        fallbacks = [
+            f"I had a small technical hiccup, {name}. Can you ask me again?",
+            f"Ah, my brain lagged for a second, {name}. Try me one more time?",
+            f"Sorry, {name} — something glitched. What were you saying?",
+        ]
+        return fallbacks[hash(str(student_id)) % len(fallbacks)]
+
+    # ═══════════════════════════════════════════
+    # POST-PROCESSING: Enforce rules in code
+    # The prompt tells the model what to do.
+    # This code GUARANTEES it happens.
+    # ═══════════════════════════════════════════
+    
+    cleaned_response = enforce_rules(raw_response)
+    
+    # If enforcement trimmed too much, fall back to original
+    if len(cleaned_response) < 20 and len(raw_response) > 20:
+        cleaned_response = clean_banned_phrases(raw_response)
+        cleaned_response = enforce_length(cleaned_response, max_chars=500)
+    
+    return cleaned_response
 
 
 def _log_ai_failure(student_id: str, error_type: str, error_message: str):
     """Log AI failures for monitoring."""
     timestamp = datetime.utcnow().isoformat()
     print(f"AI_FAILURE | {timestamp} | student={student_id} | {error_type}: {error_message[:200]}")
-    # TODO: Send to monitoring dashboard (Datadog, Sentry, etc.)
