@@ -186,7 +186,7 @@ async def think(
             # Run the synchronous Groq call in a thread pool
             response = await asyncio.to_thread(
                 client.chat.completions.create,
-                model=settings.GROQ_FAST_MODEL,
+                model=settings.GROQ_SMART_MODEL,
                 messages=messages,
                 max_tokens=500,  # Reduced from 600 — shorter responses
                 temperature=0.75,
