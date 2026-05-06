@@ -1,6 +1,6 @@
 """
 WaxPrep v2 — Admin Commands
-Commands: DELETE ME, TEST ME, TEST ALL
+Commands: DELETE ME, TEST ME, TEST ALL, TEST AI
 """
 
 from database.client import supabase, redis_client
@@ -25,6 +25,9 @@ async def handle_admin_command(chat_id: int, text: str) -> bool:
         return True
     if command == "TEST ALL":
         await _run_all_tests(chat_id)
+        return True
+    if command == "TEST AI":
+        await _run_ai_behavior_tests(chat_id)
         return True
 
     return False
@@ -118,7 +121,6 @@ async def _run_quick_tests(chat_id: int):
     failed = 0
 
     for i, test in enumerate(tests):
-        # Fresh captured list for each test
         captured = []
 
         class TestMockSender:
@@ -150,7 +152,6 @@ async def _run_quick_tests(chat_id: int):
             failed += 1
             report += f"  🔴 {test['name']} — crashed: {str(e)[:80]}\n"
 
-    # Restore original sender BEFORE sending results
     sender_module.send_telegram_message = original_sender
 
     total = passed + failed
@@ -175,7 +176,6 @@ async def _run_all_tests(chat_id: int):
     from database.onboarding_state import get_onboarding_state, clear_onboarding_state
 
     tests = [
-        # Happy paths (8)
         {"name": "SS Physics JAMB", "msgs": ["1","1","YES","A One","4","Physics","1","Lagos","1001","1001"], "must_have": ["danfo","WAX-"]},
         {"name": "SS Chemistry WAEC", "msgs": ["1","2","YES","B Two","5","Chemistry","2","Abuja","1002","1002"], "must_have": ["puff-puff","WAX-"]},
         {"name": "SS Biology NECO", "msgs": ["1","1","YES","C Three","4","Biology","3","Rivers","1003","1003"], "must_have": ["egusi","WAX-"]},
@@ -184,20 +184,14 @@ async def _run_all_tests(chat_id: int):
         {"name": "JSS1 Science", "msgs": ["1","1","YES","F Six","1","science","Kano","1006","1006"], "must_have": ["spoon","Basic Science"]},
         {"name": "SS Government", "msgs": ["1","2","YES","G Seven","5","Government","2","Oyo","1007","1007"], "must_have": ["INEC","WAX-"]},
         {"name": "SS Literature", "msgs": ["1","1","YES","H Eight","4","Literature","1","Enugu","1008","1008"], "must_have": ["Achebe","WAX-"]},
-
-        # Typos (5)
         {"name": "Typo physcs", "msgs": ["1","1","YES","I1","4","physcs","1","Lagos","2001","2001"], "must_have": ["danfo"]},
         {"name": "Typo chemstry", "msgs": ["1","1","YES","I2","5","chemstry","2","Lagos","2002","2002"], "must_have": ["puff-puff"]},
         {"name": "Typo biolgy", "msgs": ["1","1","YES","I3","4","biolgy","1","Lagos","2003","2003"], "must_have": ["egusi"]},
         {"name": "Typo goverment", "msgs": ["1","1","YES","I4","5","goverment","2","Lagos","2004","2004"], "must_have": ["INEC"]},
         {"name": "Typo econmics", "msgs": ["1","1","YES","I5","5","econmics","2","Lagos","2005","2005"], "must_have": ["tomato"]},
-
-        # Number confusion (3)
         {"name": "Number 1 subj", "msgs": ["1","1","YES","J1","3","1","Lagos","3001","3001"], "must_have": ["Mathematics"]},
         {"name": "Number 2 subj", "msgs": ["1","1","YES","J2","5","2","Lagos","3002","3002"], "must_have": ["Mathematics"]},
         {"name": "Number 3 subj", "msgs": ["1","1","YES","J3","4","3","Lagos","3003","3003"], "must_have": ["Mathematics"]},
-
-        # Edge cases (4)
         {"name": "I dont know", "msgs": ["1","1","YES","K1","3","i dont know","Lagos","4001","4001"], "must_have": ["No wahala","Mathematics"]},
         {"name": "Short state Ka", "msgs": ["1","1","YES","K2","4","English","1","Ka","Kaduna","4002","4002"], "must_have": ["doesn't look like"]},
         {"name": "Weak PIN", "msgs": ["1","1","YES","K3","4","Physics","1","Lagos","1234","4003","4003"], "must_have": ["too easy"]},
@@ -210,7 +204,6 @@ async def _run_all_tests(chat_id: int):
     failures = []
 
     for i, test in enumerate(tests):
-        # Fresh captured list for each test
         captured = []
 
         class TestMockSender:
@@ -241,7 +234,6 @@ async def _run_all_tests(chat_id: int):
             failed += 1
             failures.append(f"  🔴 {test['name']}: crashed - {str(e)[:80]}")
 
-    # Restore original sender BEFORE sending results
     sender_module.send_telegram_message = original_sender
 
     total = passed + failed
@@ -255,3 +247,111 @@ async def _run_all_tests(chat_id: int):
             summary += f"\n{f}"
 
     await send_telegram_message(chat_id, summary)
+
+
+async def _run_ai_behavior_tests(chat_id: int):
+    """
+    Run AI behavior test harness — simulates different student types
+    against the live AI brain and reports failures.
+    """
+    await send_telegram_message(chat_id, "🧠 *Running AI behavior tests...*\nSimulating 8 student types. This will take 1-2 minutes.")
+
+    import telegram.sender as sender_module
+    original_sender = sender_module.send_telegram_message
+
+    from ai.brain import think
+    from test_harness.student_profiles import get_student_profile, get_all_student_types
+    from test_harness.message_generator import generate_message_sequence
+    from test_harness.failure_detector import detect_failures
+
+    # Test student data
+    test_student = {
+        "id": "test-harness-001",
+        "name": "Test Student",
+        "class_level": "SS3",
+        "target_exam": "JAMB",
+        "subjects": ["Mathematics", "English", "Physics", "Chemistry"],
+        "state": "Lagos",
+        "language_preference": "english",
+        "current_streak": 5,
+    }
+
+    topics = ["osmosis", "quadratic equations", "periodic table", "supply and demand"]
+    student_types = get_all_student_types()
+    
+    report_lines = []
+    total_passed = 0
+    total_failed = 0
+    total_score = 0
+
+    for i, student_type in enumerate(student_types):
+        topic = topics[i % len(topics)]
+        profile = get_student_profile(student_type, topic)
+        messages = generate_message_sequence(profile, num_messages=6)
+
+        # Run the conversation
+        conversation_history = []
+        responses = []
+
+        for msg in messages:
+            try:
+                response = await think(
+                    message=msg,
+                    student=test_student,
+                    conversation_history=conversation_history,
+                    recent_subject=topic,
+                    context_str="",
+                    is_practice=False,
+                )
+            except Exception as e:
+                response = f"[AI ERROR: {e}]"
+
+            conversation_history.append({"role": "user", "content": msg})
+            conversation_history.append({"role": "assistant", "content": response})
+            responses.append(response)
+
+        # Detect failures
+        analysis = detect_failures(messages, responses, student_type, profile)
+
+        total_score += analysis["score"]
+        
+        if analysis["verdict"] == "PASS":
+            total_passed += 1
+            emoji = "✅"
+        else:
+            total_failed += 1
+            emoji = "❌"
+
+        report_lines.append(f"{emoji} *{profile['name']}* — Score: {analysis['score']}/100")
+        
+        if analysis["failures"]:
+            for f in analysis["failures"]:
+                report_lines.append(f"   🔴 {f}")
+        
+        if analysis["warnings"]:
+            for w in analysis["warnings"][:2]:  # Limit warnings
+                report_lines.append(f"   🟡 {w}")
+
+    # Restore original sender
+    sender_module.send_telegram_message = original_sender
+
+    # Build summary
+    total = total_passed + total_failed
+    avg_score = total_score / total if total > 0 else 0
+
+    summary = f"📊 *AI Behavior Results: {total_passed}/{total} passed*"
+    summary += f"\nAverage Score: {avg_score:.0f}/100"
+
+    if total_failed == 0:
+        summary += "\n\n🎉 All student types passed!"
+    else:
+        summary += f"\n\n🔴 {total_failed} student type(s) failed."
+
+    # Send in chunks if too long
+    full_report = summary + "\n\n" + "\n".join(report_lines)
+    
+    if len(full_report) > 4000:
+        await send_telegram_message(chat_id, full_report[:4000])
+        await send_telegram_message(chat_id, full_report[4000:])
+    else:
+        await send_telegram_message(chat_id, full_report)
