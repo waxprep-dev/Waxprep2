@@ -84,10 +84,32 @@ async def test_onboarding():
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
     """Receives updates from Telegram and processes them."""
+    import httpx
+    from config.settings import settings
+    
     try:
         body = await request.json()
 
-        # Extract message text and chat ID
+        # Handle callback queries (quiz answer buttons)
+        callback_query = body.get("callback_query", {})
+        if callback_query:
+            chat_id = callback_query.get("message", {}).get("chat", {}).get("id")
+            data = callback_query.get("data", "")  # "A", "B", "C", or "D"
+            callback_id = callback_query.get("id")
+            
+            if chat_id and data:
+                # Acknowledge the callback (remove loading state)
+                url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(url, json={"callback_query_id": callback_id})
+                
+                # Process the answer as if the student typed it
+                from telegram.handler import process_telegram_message
+                await process_telegram_message(chat_id, data)
+            
+            return JSONResponse({"status": "ok"})
+
+        # Handle regular text messages
         message_data = body.get("message", {})
         chat = message_data.get("chat", {})
         chat_id = chat.get("id")
