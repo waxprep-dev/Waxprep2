@@ -10,7 +10,7 @@ from telegram.sender import send_telegram_message
 async def process_telegram_message(chat_id: int, text: str) -> None:
     """
     Entry point for all Telegram text messages.
-    Decides: is this a registered student or a new user?
+    Processes in strict order: Sanitize → Admin → Safety → Student Lookup → Route
     """
     # Sanitize
     text = text.strip()[:4000]
@@ -21,6 +21,11 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     from admin.commands import handle_admin_command
     if await handle_admin_command(chat_id, text):
         return
+
+    # ── Safety checks (MUST come before AI) ──
+    from brain.safety import run_safety_checks
+    if await run_safety_checks(chat_id, text):
+        return  # Message was handled by safety (crisis/malpractice)
 
     # ── Check if registered student ──────────
     from database.students import get_student_by_platform_id
