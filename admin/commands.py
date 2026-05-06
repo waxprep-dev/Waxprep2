@@ -74,46 +74,14 @@ async def _run_quick_tests(chat_id: int):
     from database.onboarding_state import get_onboarding_state, clear_onboarding_state
 
     tests = [
-        {
-            "name": "SS Physics JAMB Lagos",
-            "msgs": ["1","1","YES","David Emma","4","Physics","1","Lagos","5823","5823"],
-            "must_have": ["danfo", "WAX-"]
-        },
-        {
-            "name": "JSS2 Maths (skips exam)",
-            "msgs": ["1","1","YES","Mary John","2","Maths","Lagos","3434","3434"],
-            "must_have": ["biscuit", "WAX-"]
-        },
-        {
-            "name": "Typo rnglish",
-            "msgs": ["1","1","YES","Grace P","4","rnglish","1","Lagos","1113","1113"],
-            "must_have": ["Achebe"]
-        },
-        {
-            "name": "Number 1 defaults",
-            "msgs": ["1","1","YES","Blessing O","3","1","Lagos","1117","1117"],
-            "must_have": ["Mathematics"]
-        },
-        {
-            "name": "I dont know defaults",
-            "msgs": ["1","1","YES","Chioma N","3","i dont know","Lagos","1121","1121"],
-            "must_have": ["Mathematics"]
-        },
-        {
-            "name": "Short state Ka blocked",
-            "msgs": ["1","1","YES","Ngozi E","4","English","1","Ka","Kaduna","1126","1126"],
-            "must_have": ["Kaduna"]
-        },
-        {
-            "name": "Weak PIN 1234 rejected",
-            "msgs": ["1","1","YES","Joy Adamu","4","Physics","1","Lagos","1234","5824","5824"],
-            "must_have": ["too easy"]
-        },
-        {
-            "name": "Terms decline captured",
-            "msgs": ["1","1","no","3"],
-            "must_have": ["just looking"]
-        },
+        {"name": "SS Physics JAMB Lagos", "msgs": ["1","1","YES","David Emma","4","Physics","1","Lagos","5823","5823"], "must_have": ["danfo", "WAX-"]},
+        {"name": "JSS2 Maths (skips exam)", "msgs": ["1","1","YES","Mary John","2","Maths","Lagos","3434","3434"], "must_have": ["biscuit", "WAX-"]},
+        {"name": "Typo rnglish", "msgs": ["1","1","YES","Grace P","4","rnglish","1","Lagos","1113","1113"], "must_have": ["Achebe"]},
+        {"name": "Number 1 defaults", "msgs": ["1","1","YES","Blessing O","3","1","Lagos","1117","1117"], "must_have": ["Mathematics"]},
+        {"name": "I dont know defaults", "msgs": ["1","1","YES","Chioma N","3","i dont know","Lagos","1121","1121"], "must_have": ["Mathematics"]},
+        {"name": "Short state Ka blocked", "msgs": ["1","1","YES","Ngozi E","4","English","1","Ka","Kaduna","1126","1126"], "must_have": ["Kaduna"]},
+        {"name": "Weak PIN 1234 rejected", "msgs": ["1","1","YES","Joy Adamu","4","Physics","1","Lagos","1234","5824","5824"], "must_have": ["too easy"]},
+        {"name": "Terms decline captured", "msgs": ["1","1","no","3"], "must_have": ["just looking"]},
     ]
 
     report = ""
@@ -129,7 +97,6 @@ async def _run_quick_tests(chat_id: int):
                 captured.append(text)
 
         sender_module.send_telegram_message = TestMockSender.send_telegram_message
-
         cid = 70000 + i
         await clear_onboarding_state("telegram", str(cid))
 
@@ -137,10 +104,8 @@ async def _run_quick_tests(chat_id: int):
             for msg in test["msgs"]:
                 state = await get_onboarding_state("telegram", str(cid))
                 await handle_onboarding(cid, state, msg)
-
             full_text = " ".join(captured)
             all_ok = all(c.lower() in full_text.lower() for c in test["must_have"])
-
             if all_ok:
                 passed += 1
                 report += f"  ✅ {test['name']}\n"
@@ -153,15 +118,12 @@ async def _run_quick_tests(chat_id: int):
             report += f"  🔴 {test['name']} — crashed: {str(e)[:80]}\n"
 
     sender_module.send_telegram_message = original_sender
-
     total = passed + failed
     summary = f"📊 *Results: {passed}/{total} passed*"
-
     if failed == 0:
         summary += "\n\n🎉 All tests passed!"
     else:
         summary += f"\n\n🔴 {failed} test(s) failed."
-
     await send_telegram_message(chat_id, summary + "\n\n" + report)
 
 
@@ -171,7 +133,6 @@ async def _run_all_tests(chat_id: int):
 
     import telegram.sender as sender_module
     original_sender = sender_module.send_telegram_message
-
     from telegram.onboarding import handle_onboarding
     from database.onboarding_state import get_onboarding_state, clear_onboarding_state
 
@@ -205,25 +166,19 @@ async def _run_all_tests(chat_id: int):
 
     for i, test in enumerate(tests):
         captured = []
-
         class TestMockSender:
             @staticmethod
             async def send_telegram_message(cid, text):
                 captured.append(text)
-
         sender_module.send_telegram_message = TestMockSender.send_telegram_message
-
         cid = 80000 + i
         await clear_onboarding_state("telegram", str(cid))
-
         try:
             for msg in test["msgs"]:
                 state = await get_onboarding_state("telegram", str(cid))
                 await handle_onboarding(cid, state, msg)
-
             full_text = " ".join(captured)
             all_ok = all(c.lower() in full_text.lower() for c in test["must_have"])
-
             if all_ok:
                 passed += 1
             else:
@@ -235,38 +190,173 @@ async def _run_all_tests(chat_id: int):
             failures.append(f"  🔴 {test['name']}: crashed - {str(e)[:80]}")
 
     sender_module.send_telegram_message = original_sender
-
     total = passed + failed
     summary = f"📊 *Full Results: {passed}/{total} passed*"
-
     if failed == 0:
         summary += "\n\n🎉 All 20 tests passed!"
     else:
         summary += f"\n\n🔴 {failed} failed:"
         for f in failures[:10]:
             summary += f"\n{f}"
-
     await send_telegram_message(chat_id, summary)
 
 
+# ═══════════════════════════════════════════════
+# AI BEHAVIOR TEST — ALL INLINE, NO EXTERNAL IMPORTS
+# ═══════════════════════════════════════════════
+
+STUDENT_TYPES = {
+    "confused": {
+        "name": "Confused Student",
+        "messages": [
+            "Explain osmosis to me",
+            "I don't understand",
+            "Still confused",
+            "Can you make it simpler?",
+            "I still don't get it",
+            "What does that mean?",
+        ],
+    },
+    "fast_learner": {
+        "name": "Fast Learner",
+        "messages": [
+            "Teach me quadratic equations",
+            "I get it. What's next?",
+            "That was easy. Give me something harder.",
+            "Next topic?",
+            "I already know this. Move on.",
+        ],
+    },
+    "exam_anxious": {
+        "name": "Exam Anxious",
+        "messages": [
+            "JAMB is in 2 weeks and I don't know anything",
+            "I'm going to fail",
+            "What should I focus on?",
+            "Is it too late?",
+        ],
+    },
+    "random_spammer": {
+        "name": "Random Spammer",
+        "messages": [
+            "hi",
+            "explain physics",
+            "no wait chemistry",
+            "you pick",
+            "lol",
+            "what's your name",
+            "give me a test",
+        ],
+    },
+    "silent": {
+        "name": "Silent Student",
+        "messages": [
+            "teach me biology",
+            "ok",
+            "k",
+            "yes",
+            "go on",
+        ],
+    },
+    "corrector": {
+        "name": "Corrective Student",
+        "messages": [
+            "Explain the periodic table",
+            "That's not right",
+            "Actually, oxygen is O not O2",
+            "Check your facts",
+        ],
+    },
+}
+
+
+def _analyze_responses(messages: list, responses: list, student_type: str) -> dict:
+    """Analyze AI responses for failures."""
+    failures = []
+    passes = []
+    warnings = []
+    
+    full = " ".join(responses).lower()
+    student_text = " ".join(messages).lower()
+    
+    # Check for "don't worry"
+    if "don't worry" in full or "dont worry" in full:
+        failures.append("Used 'don't worry' (dismissive)")
+    
+    # Check for "wrong" or "incorrect"
+    if "wrong." in full or "incorrect." in full:
+        failures.append("Used 'wrong' or 'incorrect'")
+    
+    # Check for multiple questions in one message
+    for r in responses:
+        if r.count("?") > 1:
+            failures.append("Asked multiple questions in one message")
+            break
+    
+    # Check for walls of text
+    for r in responses:
+        if len(r) > 400:
+            warnings.append("Some responses were long (>400 chars)")
+            break
+    
+    # Check for Nigerian examples
+    nigerian_terms = ["danfo", "suya", "puff-puff", "egusi", "okada", "keke", "nepa", "wahala", "jollof", "garri"]
+    if any(term in full for term in nigerian_terms):
+        passes.append("Used Nigerian examples")
+    else:
+        warnings.append("No Nigerian examples detected")
+    
+    # Confusion handling
+    if student_type == "confused":
+        confusion_signals = ["step back", "simpler", "another way", "different example", "no wahala", "let's try", "break it down"]
+        if any(signal in full for signal in confusion_signals):
+            passes.append("Responded to confusion with simplification")
+        else:
+            failures.append("Did not respond to repeated confusion signals")
+    
+    # Progression for fast learner
+    if student_type == "fast_learner":
+        progression_signals = ["harder", "next level", "more difficult", "advanced", "next topic"]
+        if any(signal in full for signal in progression_signals):
+            passes.append("Offered progression for fast learner")
+        else:
+            warnings.append("Did not clearly offer progression")
+    
+    # Exam anxiety
+    if student_type == "exam_anxious":
+        if "don't worry" not in full:
+            passes.append("Avoided 'don't worry' for anxious student")
+        action_signals = ["let's", "plan", "focus", "today", "start"]
+        if any(signal in full for signal in action_signals):
+            passes.append("Offered concrete action plan")
+    
+    # Calculate score
+    total = len(failures) + len(passes) + len(warnings)
+    if total == 0:
+        score = 50
+    else:
+        score = int((len(passes) / total) * 100)
+    
+    return {
+        "failures": failures,
+        "passes": passes,
+        "warnings": warnings,
+        "score": score,
+        "verdict": "PASS" if len(failures) == 0 else "FAIL",
+    }
+
+
 async def _run_ai_behavior_tests(chat_id: int):
-    """
-    Run AI behavior test harness — simulates different student types
-    against the live AI brain and reports failures.
-    """
-    await send_telegram_message(chat_id, "🧠 *Running AI behavior tests...*\nSimulating 8 student types. This will take 1-2 minutes.")
+    """Run AI behavior tests — ALL INLINE, NO EXTERNAL FILES NEEDED."""
+    await send_telegram_message(chat_id, "🧠 *Running AI behavior tests...*\nSimulating student types. This will take ~1 minute.")
 
     import telegram.sender as sender_module
     original_sender = sender_module.send_telegram_message
 
     from ai.brain import think
-    from test_harness.student_profiles import get_student_profile, get_all_student_types
-    from test_harness.message_generator import generate_message_sequence
-    from test_harness.failure_detector import detect_failures
 
-    # Test student data
     test_student = {
-        "id": "test-harness-001",
+        "id": "test-001",
         "name": "Test Student",
         "class_level": "SS3",
         "target_exam": "JAMB",
@@ -277,19 +367,23 @@ async def _run_ai_behavior_tests(chat_id: int):
     }
 
     topics = ["osmosis", "quadratic equations", "periodic table", "supply and demand"]
-    student_types = get_all_student_types()
+    student_type_keys = list(STUDENT_TYPES.keys())
     
     report_lines = []
     total_passed = 0
     total_failed = 0
-    total_score = 0
 
-    for i, student_type in enumerate(student_types):
+    for i, stype in enumerate(student_type_keys):
+        profile = STUDENT_TYPES[stype]
         topic = topics[i % len(topics)]
-        profile = get_student_profile(student_type, topic)
-        messages = generate_message_sequence(profile, num_messages=6)
+        
+        # Override first message with topic
+        messages = list(profile["messages"])
+        if "{topic}" in messages[0] or "Explain" in messages[0] or "Teach" in messages[0] or "teach" in messages[0]:
+            messages[0] = messages[0].replace("{topic}", topic)
+            if "Explain" not in messages[0] and "Teach" not in messages[0] and "teach" not in messages[0] and "JAMB" not in messages[0] and "hi" not in messages[0].lower():
+                messages.insert(0, f"Teach me about {topic}")
 
-        # Run the conversation
         conversation_history = []
         responses = []
 
@@ -304,17 +398,14 @@ async def _run_ai_behavior_tests(chat_id: int):
                     is_practice=False,
                 )
             except Exception as e:
-                response = f"[AI ERROR: {e}]"
+                response = f"[ERROR: {e}]"
 
             conversation_history.append({"role": "user", "content": msg})
             conversation_history.append({"role": "assistant", "content": response})
             responses.append(response)
 
-        # Detect failures
-        analysis = detect_failures(messages, responses, student_type, profile)
+        analysis = _analyze_responses(messages, responses, stype)
 
-        total_score += analysis["score"]
-        
         if analysis["verdict"] == "PASS":
             total_passed += 1
             emoji = "✅"
@@ -323,31 +414,20 @@ async def _run_ai_behavior_tests(chat_id: int):
             emoji = "❌"
 
         report_lines.append(f"{emoji} *{profile['name']}* — Score: {analysis['score']}/100")
-        
-        if analysis["failures"]:
-            for f in analysis["failures"]:
-                report_lines.append(f"   🔴 {f}")
-        
-        if analysis["warnings"]:
-            for w in analysis["warnings"][:2]:  # Limit warnings
-                report_lines.append(f"   🟡 {w}")
+        for f in analysis.get("failures", []):
+            report_lines.append(f"   🔴 {f}")
+        for w in analysis.get("warnings", [])[:2]:
+            report_lines.append(f"   🟡 {w}")
+        for p in analysis.get("passes", []):
+            report_lines.append(f"   🟢 {p}")
 
-    # Restore original sender
     sender_module.send_telegram_message = original_sender
 
-    # Build summary
     total = total_passed + total_failed
-    avg_score = total_score / total if total > 0 else 0
-
     summary = f"📊 *AI Behavior Results: {total_passed}/{total} passed*"
-    summary += f"\nAverage Score: {avg_score:.0f}/100"
-
     if total_failed == 0:
         summary += "\n\n🎉 All student types passed!"
-    else:
-        summary += f"\n\n🔴 {total_failed} student type(s) failed."
 
-    # Send in chunks if too long
     full_report = summary + "\n\n" + "\n".join(report_lines)
     
     if len(full_report) > 4000:
