@@ -336,6 +336,10 @@ async def think(
     Returns:
         Wax's response as a string (post-processed for rule compliance)
     """
+    # FIXED: global declaration at the TOP of the function
+    # Python requires 'global' before any use of the variable
+    global _current_key_index
+
     conversation_history = conversation_history or []
     student_id = student.get('id', 'unknown')
     name = student.get('name', 'Student').split()[0]
@@ -363,12 +367,9 @@ async def think(
     messages.append({"role": "user", "content": message})
 
     # ── Check response cache before calling AI ──
-    # If this exact question has been answered before, return cached response.
-    # This cuts token costs by 80% for repeated questions like "what is osmosis".
     if _is_cacheable(message):
         cached_response = await _get_cached_response(message)
         if cached_response:
-            # Return cached response immediately — no API call, zero tokens
             return cached_response
 
     # ── Call Groq with multi-key rotation ──
@@ -398,8 +399,7 @@ async def think(
             result = response.choices[0].message.content
             if result and len(result.strip()) > 5:
                 raw_response = result.strip()
-                # Update rotation to next key for next request
-                global _current_key_index
+                # Update rotation to next key — NO 'global' here, already declared at top
                 _current_key_index = (key_index + 1) % len(keys)
                 break
             
@@ -453,7 +453,6 @@ async def think(
         cleaned_response = enforce_length(cleaned_response, max_chars=500)
     
     # ── Cache this response for future use ──
-    # Saves token costs — next student asking the same question gets instant response
     if _is_cacheable(message):
         await _cache_response(message, cleaned_response)
     
