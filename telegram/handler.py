@@ -303,11 +303,15 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
         Subject name string or None
     """
     # Scan last few assistant messages for subject mentions
+    # Use SUBJECT_MAP keys (all supported subjects) — no external import needed
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
-            for subject in ALL_SUPPORTED_SUBJECTS:
-                if subject.lower() in content.lower():
+            for subject in SUBJECT_MAP:
+                # Check if subject name appears in the message
+                # Handle both underscore and space versions
+                subject_display = subject.replace("_", " ")
+                if subject_display.lower() in content.lower():
                     return subject
 
     # Fallback: first subject from profile
@@ -356,18 +360,25 @@ async def _build_memory_context(student_id: str) -> str:
         score = last_session.get("score")
         struggled = last_session.get("struggled_with", [])
 
-        session_line = f"LAST SESSION: {subject} - {topic}."
-        if completed:
-            session_line += " Completed."
-            if score is not None:
-                session_line += f" Score: {int(score * 100)}%."
-        else:
-            session_line += " Not completed."
+        # Only include if there's actual content (not default/empty values)
+        has_content = (
+            subject not in ("unknown", "a subject", "") and
+            topic not in ("unknown", "a topic", "")
+        )
+        
+        if has_content:
+            session_line = f"LAST SESSION: {subject} - {topic}."
+            if completed:
+                session_line += " Completed."
+                if score is not None:
+                    session_line += f" Score: {int(score * 100)}%."
+            else:
+                session_line += " Not completed."
 
-        if struggled:
-            session_line += f" Struggled with: {', '.join(struggled)}."
+            if struggled:
+                session_line += f" Struggled with: {', '.join(struggled)}."
 
-        context_parts.append(session_line)
+            context_parts.append(session_line)
 
     # 2. Persistent student memory
     try:
@@ -433,8 +444,10 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     try:
         cached = redis_client.get(cache_key)
         if cached:
+            # Redis returns bytes — decode to string
+            cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
             logger.debug(f"Cache hit for questions:{subject}")
-            return json.loads(cached)
+            return json.loads(cached_str)
     except Exception:
         pass
 
@@ -655,7 +668,9 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
         if not raw:
             await send_telegram_message(chat_id, "No active quiz. Reply with *quiz* to start one!")
             return
-        quiz_data = json.loads(raw)
+        # Redis returns bytes — decode if needed
+        raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        quiz_data = json.loads(raw_str)
     except json.JSONDecodeError:
         logger.error(f"Corrupted quiz data for {student_id}")
         redis_client.delete(quiz_key)
