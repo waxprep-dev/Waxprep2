@@ -13,17 +13,11 @@ import logging
 from typing import Optional, Dict, Any
 
 import httpx
-from telegram.sender import escape_markdown  # Available if you have this utility
 from config.settings import settings
 
 logger = logging.getLogger("waxprep.telegram_sender")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}"
-
-# ── HTTP client (shared connection pool) ─────
-# Creating a new client for every message is wasteful.
-# Use a module-level client or a dependency-injected one.
-# For now, we create per-call but with connection pooling hints.
 
 # ── Message length limit ─────────────────────
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -276,8 +270,8 @@ def build_quiz_keyboard(question: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     max_option_length = 50
     opt_a = _truncate_button_text(opt_a, max_option_length)
     opt_b = _truncate_button_text(opt_b, max_option_length)
-    opt_c = _truncate_button_text(opt_c, max_option_length)
-    opt_d = _truncate_button_text(opt_d, max_option_length)
+    opt_c = _truncate_button_text(opt_c, max_option_length) if opt_c else ""
+    opt_d = _truncate_button_text(opt_d, max_option_length) if opt_d else ""
 
     keyboard = {
         "inline_keyboard": [
@@ -286,11 +280,18 @@ def build_quiz_keyboard(question: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 {"text": f"B) {opt_b}", "callback_data": "B"},
             ],
             [
-                {"text": f"C) {opt_c}", "callback_data": "C"},
-                {"text": f"D) {opt_d}", "callback_data": "D"},
+                {"text": f"C) {opt_c}", "callback_data": "C"} if opt_c else None,
+                {"text": f"D) {opt_d}", "callback_data": "D"} if opt_d else None,
             ],
         ]
     }
+    
+    # Remove None buttons (empty options)
+    keyboard["inline_keyboard"][1] = [
+        btn for btn in keyboard["inline_keyboard"][1] if btn is not None
+    ]
+    if not keyboard["inline_keyboard"][1]:
+        keyboard["inline_keyboard"] = keyboard["inline_keyboard"][:1]
 
     return keyboard
 
@@ -314,7 +315,7 @@ def _truncate_button_text(text: str, max_length: int = 50) -> str:
     return text[:max_length - 3].rstrip() + "..."
 
 
-def escape_user_input(text: str) -> str:
+def escape_markdown(text: str) -> str:
     """
     Escape user-provided text for safe use in Telegram Markdown messages.
     
@@ -322,12 +323,18 @@ def escape_user_input(text: str) -> str:
     _, *, [, ], (, ), ~, `, >, #, +, -, =, |, {, }, ., !
     
     This function escapes them so user names and input display correctly.
+    Use this when inserting student names or other user-provided text
+    into Markdown-formatted Telegram messages.
     
     Args:
         text: Raw user input (e.g., student name, subject)
         
     Returns:
         Escaped text safe for Markdown parse_mode
+        
+    Example:
+        >>> escape_markdown("Chidera_Emeka")
+        'Chidera\\_Emeka'
     """
     escape_chars = r"_*[]()~`>#+-=|{}.!"
     escaped = ""
