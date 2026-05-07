@@ -148,6 +148,25 @@ def _react_to_subject(subject: str, name: str) -> str:
             f"We're just going to give you the language to describe what you already know."
         )
 
+    elif "geography" in subject_lower:
+        return (
+            f"Geography! {name}, you want to understand the world — the land, the weather, "
+            f"the people, and how they all connect. That's big-picture thinking.\n\n"
+            f"Most people think Geography is just memorizing capitals. It's not. "
+            f"It's understanding why Lagos floods, why the north is dry, "
+            f"and why some places grow cocoa and others grow groundnuts.\n\n"
+            f"We'll make it real. Not textbook maps. Real places you've been to."
+        )
+
+    elif "history" in subject_lower:
+        return (
+            f"History! {name}, you want to understand how we got here. That's deep. "
+            f"Most people think History is just dates and dead people. It's not.\n\n"
+            f"It's the story of how Nigeria became Nigeria. The empires. The trade routes. "
+            f"The people who shaped everything before we were born.\n\n"
+            f"Once you start seeing those connections, you'll never look at Nigeria the same way."
+        )
+
     else:
         return (
             f"{subject.title()}! {name}, most students pick the 'easy' subjects. "
@@ -200,33 +219,41 @@ def _respond_to_emotion(feeling: str, name: str, subject: str) -> str:
         )
 
 
-# ── PIN setup messages ────────────────────────
+# ── PIN setup messages (FIXED: alphanumeric allowed) ──
 def _get_pin_prompt(state_name: str) -> str:
     return (
-        f"Last step, {state_name}. Pick a 4-digit PIN. Something easy for YOU to remember, "
+        f"Last step, {state_name}. Create a secret code — at least 4 characters. "
+        f"Letters, numbers, or mix them up. Something easy for YOU to remember, "
         f"but hard for your younger sibling to guess.\n\n"
-        f"Don't use 1234 o — I'll know. And I'll be disappointed. Not angry. Just... disappointed."
+        f"Don't use 1234 or password o — I'll know. And I'll be disappointed. "
+        f"Not angry. Just... disappointed."
     )
 
 
 def _get_weak_pin_response(name: str) -> str:
     return (
-        f"{name}. My friend. My brother. You chose the PIN equivalent of leaving your door "
+        f"{name}. My friend. My brother. You chose the secret code equivalent of leaving your door "
         f"wide open with a sign that says 'come in.' Pick another one. I believe in you."
     )
 
 
 def _get_pin_retry(failed_attempts: int) -> str:
     if failed_attempts < 3:
-        return "4 digits only. Try again. You've got this."
+        return "At least 4 characters. Letters, numbers, or both — your choice. Try again."
     elif failed_attempts < 5:
-        return "Still not quite right. 4 digits. Think of a number you see often but others don't notice."
+        return "4 characters minimum. Pick something you'll remember — like a nickname or a favorite number with letters mixed in."
     else:
-        return "I know this is frustrating. Take a breath. Pick any 4 digits that are easy for YOU to remember. Type them now."
+        return "I know this is frustrating. Pick any 4+ characters that are easy for YOU to remember. Letters or numbers — anything works."
 
 
-# ── Activation message ────────────────────────
-def _get_activation(name: str, subject: str, state_name: str, exam: str) -> str:
+# ── Activation message (FIXED: conditional exam line) ──
+def _get_activation(name: str, subject: str, state_name: str, exam: str, class_level: str) -> str:
+    # Build the exam line conditionally — SS1/SS2 don't have an exam
+    if exam and exam != "not_applicable":
+        exam_line = f"I know you're preparing for {exam}. And I know you've been struggling alone.\n\n"
+    else:
+        exam_line = f"And I know you've been working hard on your own.\n\n"
+    
     return (
         f"{name}. You're in! 🎉\n\n"
         f"Your WAX ID: {{wax_id}}\n"
@@ -234,8 +261,8 @@ def _get_activation(name: str, subject: str, state_name: str, exam: str) -> str:
         f"Write that code somewhere safe. Notebook. Phone. WhatsApp it to yourself. "
         f"Don't lose it. If you ever can't access your account, that code is your key back.\n\n"
         f"Now. Let me tell you what happens next.\n\n"
-        f"I know {subject} has been confusing you. I know you're preparing for {exam}. "
-        f"And I know you've been struggling alone.\n\n"
+        f"I know {subject} has been confusing you. "
+        f"{exam_line}"
         f"That ends today.\n\n"
         f"I'm going to teach you {subject} differently. No strange symbols until you're ready. "
         f"No assuming you already know things. Just us — one topic at a time — until it CLICKS.\n\n"
@@ -325,7 +352,7 @@ async def _step_wax_id_entry(chat_id: int, state: dict, message: str):
         state["awaiting_response_for"] = "pin_entry"
         await save_onboarding_state("telegram", str(chat_id), state)
         await send_telegram_message(chat_id,
-            f"Got you. Now your 4-digit PIN. And don't worry — if you've forgotten it, "
+            f"Got you. Now enter your secret code. And don't worry — if you've forgotten it, "
             f"just type forgot. No judgment here."
         )
         return
@@ -554,7 +581,7 @@ async def _step_state(chat_id: int, state: dict, message: str):
 
 
 # ═══════════════════════════════════════════════
-# STEP: pin_setup
+# STEP: pin_setup (FIXED: alphanumeric PINs allowed)
 # ═══════════════════════════════════════════════
 
 @register_step("pin_setup")
@@ -562,26 +589,32 @@ async def _step_pin_setup(chat_id: int, state: dict, message: str):
     pin = message.strip()
     name = state.get("name", "Student").split()[0]
 
-    if not pin.isdigit() or len(pin) != 4:
+    # FIXED: Allow letters + numbers, minimum 4 characters
+    if len(pin) < 4:
         failed = state.get("pin_failed_attempts", 0) + 1
         state["pin_failed_attempts"] = failed
         await save_onboarding_state("telegram", str(chat_id), state)
         await send_telegram_message(chat_id, _get_pin_retry(failed))
         return
 
-    weak_pins = {"1234", "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999"}
-    if pin in weak_pins:
+    # Expanded weak PINs to include common alphanumeric ones
+    weak_pins = {
+        "1234", "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
+        "abcd", "password", "qwerty", "waxp", "abcd1234", "pass", "admin", "letmein",
+        "12345", "abc123", "qwerty123", "login", "welcome", "monkey", "dragon",
+    }
+    if pin.lower() in weak_pins:
         await send_telegram_message(chat_id, _get_weak_pin_response(name))
         return
 
     state["pending_pin"] = pin
     state["awaiting_response_for"] = "pin_confirm"
     await save_onboarding_state("telegram", str(chat_id), state)
-    await send_telegram_message(chat_id, "Got it! Confirm your PIN — type it again.")
+    await send_telegram_message(chat_id, "Got it! Confirm your secret code — type it again.")
 
 
 # ═══════════════════════════════════════════════
-# STEP: pin_confirm
+# STEP: pin_confirm (FIXED: activation uses class_level)
 # ═══════════════════════════════════════════════
 
 @register_step("pin_confirm")
@@ -591,7 +624,7 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
 
     if pin_confirm != pending_pin:
         await send_telegram_message(chat_id,
-            "Those PINs don't match. Try again — enter your desired PIN:"
+            "Those codes don't match. Try again — enter your secret code:"
         )
         state["pending_pin"] = None
         state["awaiting_response_for"] = "pin_setup"
@@ -632,9 +665,10 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
     subject = state.get("student_subject", "your subject")
     student_state_name = state.get("student_state", "your state")
     exam = state.get("target_exam", "your exam")
+    class_level = state.get("class_level", "SS3")
 
-    # Build activation message
-    activation = _get_activation(first, subject, student_state_name, exam)
+    # Build activation message — FIXED: passes class_level for conditional exam line
+    activation = _get_activation(first, subject, student_state_name, exam, class_level)
     activation = activation.format(
         wax_id=student["wax_id"],
         recovery_code=student["recovery_code"]
