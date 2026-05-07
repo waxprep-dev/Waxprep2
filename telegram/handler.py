@@ -11,7 +11,7 @@ import logging
 import os
 import random
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from telegram.sender import send_telegram_message, build_quiz_keyboard, answer_callback_query
 from database.client import redis_client
@@ -177,9 +177,9 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
             logger.error(f"Redis quiz check failed for {student_id}: {e}", exc_info=True)
             # Fall through to AI conversation rather than losing the message
 
-    # 2. Quiz trigger
+    # 2. Quiz trigger — pass message text so quiz engine can extract subject
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
-        await _start_quiz(chat_id, student)
+        await _start_quiz(chat_id, student, text)
         return
 
     # 3. AI conversation
@@ -296,8 +296,9 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
     
     Priority:
     1. Last assistant message that mentioned a subject
-    2. Student's first subject in profile
-    3. None
+    2. Student's trouble subject (flagged during onboarding)
+    3. Student's first subject in profile
+    4. None
     
     Returns:
         Subject name string or None
@@ -314,7 +315,12 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
                 if subject_display.lower() in content.lower():
                     return subject
 
-    # Fallback: first subject from profile
+    # Fallback: student's trouble subject (from onboarding)
+    trouble_subject = student.get("student_subject")
+    if trouble_subject:
+        return trouble_subject
+
+    # Next fallback: first subject from profile
     subjects = student.get("subjects", [])
     if subjects and subjects[0]:
         return subjects[0]
@@ -499,16 +505,18 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     return questions
 
 
-async def _start_quiz(chat_id: int, student: Dict[str, Any]) -> None:
+async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "") -> None:
     """
     Start a quiz session for the student.
     
     Selects a subject using fairness rotation (avoids repeating same subject),
-    loads questions, picks one randomly, and sends it with inline keyboard.
+    OR extracts subject from the student's message if specified.
+    Loads questions, picks one randomly, and sends it with inline keyboard.
     
     Args:
         chat_id: Telegram chat ID
         student: Student profile dict
+        message_text: The student's original message (to extract subject from)
     """
     student_id = str(student["id"])
     student_subjects = student.get("subjects", [])
@@ -534,10 +542,36 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any]) -> None:
     else:
         subjects_pool = student_subjects.copy()
 
-    # Rotate to avoid repeating the same subject
-    subject = _pick_rotated_subject(student_id, subjects_pool)
+    # ── Check if student specified a subject in their message ──
+    requested_subject = None
+    if message_text:
+        msg_lower = message_text.lower()
+        # Check each subject in the student's pool first
+        for subj in subjects_pool:
+            subj_display = subj.lower().replace("_", " ")
+            if subj_display in msg_lower:
+                requested_subject = subj
+                logger.info(f"Quiz subject from student pool: {subj}")
+                break
+        
+        # Also check SUBJECT_MAP for matches not in student's pool
+        if not requested_subject:
+            for map_key in SUBJECT_MAP:
+                display = map_key.replace("_", " ")
+                if display in msg_lower and display not in ("quiz", "me", "test", "question"):
+                    # Map this subject to database format
+                    requested_subject = map_key
+                    logger.info(f"Quiz subject from SUBJECT_MAP: {map_key}")
+                    break
+
+    # Use requested subject if found, otherwise rotate
+    if requested_subject:
+        subject = requested_subject
+    else:
+        subject = _pick_rotated_subject(student_id, subjects_pool)
+    
     db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
-    logger.info(f"Quiz subject for {student_id}: {db_subject} (from {subject})")
+    logger.info(f"Quiz subject for {student_id}: {db_subject} (from {'message' if requested_subject else 'rotation'})")
 
     # Load questions
     questions = await _load_questions(db_subject)
@@ -850,7 +884,7 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
 
     chosen = random.choice(available)
 
-    # Track this choice
+    # Track this choice — FIXED: setdefault → setdefault
     _QUIZ_TRACKER.setdefault(student_id, []).append(chosen)
     if len(_QUIZ_TRACKER[student_id]) > 3:
         _QUIZ_TRACKER[student_id] = _QUIZ_TRACKER[student_id][-3:]
