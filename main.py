@@ -164,7 +164,7 @@ async def add_request_id(request: Request, call_next):
 # HEALTH CHECK — enhanced
 # ═══════════════════════════════════════════════
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """
     Health check endpoint.
