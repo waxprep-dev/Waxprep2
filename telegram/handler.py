@@ -126,6 +126,9 @@ SUBJECT_MAP = {
     "christian_religious_studies": "crs", "crs": "crs",
 }
 
+# Fallback subjects if student has none set
+DEFAULT_SUBJECTS = ["english", "mathematics", "physics", "chemistry", "biology"]
+
 
 async def _load_questions(subject: str) -> list:
     """
@@ -148,7 +151,6 @@ async def _load_questions(subject: str) -> list:
 
     # Fallback: load from JSON file
     try:
-        # On Render, file is in the project root (same directory as main.py)
         json_path = os.path.join(os.path.dirname(__file__), "..", "jamb_questions_clean.json")
         json_path = os.path.abspath(json_path)
         print(f"Loading questions from: {json_path}")
@@ -166,7 +168,13 @@ async def _load_questions(subject: str) -> list:
 async def _start_quiz(chat_id: int, student: dict):
     """Start a quiz session for the student."""
     student_id = str(student["id"])
-    subjects = student.get("subjects", ["english"])
+    subjects = student.get("subjects", [])
+    
+    # Fallback if no subjects are set
+    if not subjects:
+        subjects = DEFAULT_SUBJECTS
+        print(f"No subjects found for {student_id}, using defaults: {subjects}")
+    
     print(f"Starting quiz for {student_id}, subjects: {subjects}")
 
     # Pick a random subject from the student's list
