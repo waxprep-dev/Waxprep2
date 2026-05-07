@@ -2,25 +2,64 @@
 WaxPrep v2 — AI Brain
 Calls the Groq API with Wax's system prompt and returns the response.
 Includes post-processing enforcement layer for critical rules.
+
+Multi-Key Rotation:
+    Rotates through GROQ_API_KEYS on rate limit errors.
+    Each key has 100,000 tokens/day on Groq free tier.
+    With 3 keys = 300,000 tokens/day = ~30 active students.
 """
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from groq import Groq
 from config.settings import settings
 from ai.prompts import get_wax_system_prompt, get_lite_prompt
 
-# Cache the Groq client
-_groq_client = None
+# Cache for Groq clients — one per API key
+_clients = {}
+# Track which key to try next (simple round-robin)
+_current_key_index = 0
 
 
-def _get_client() -> Groq:
-    """Get or create the Groq client (singleton)."""
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = Groq(api_key=settings.GROQ_API_KEY)
-    return _groq_client
+def _get_client(api_key: str = None) -> Groq:
+    """
+    Get or create a Groq client for a specific API key.
+    
+    Args:
+        api_key: Specific API key to use. If None, uses default.
+        
+    Returns:
+        Groq client instance
+    """
+    key = api_key or settings.GROQ_API_KEY
+    
+    if key not in _clients:
+        _clients[key] = Groq(api_key=key)
+    
+    return _clients[key]
+
+
+def _next_key() -> str:
+    """
+    Get the next API key in rotation.
+    
+    Uses module-level counter for simple round-robin.
+    Thread-safe enough for async — worst case two requests use same key.
+    
+    Returns:
+        API key string
+    """
+    global _current_key_index
+    keys = settings.GROQ_API_KEYS
+    
+    if not keys or not keys[0]:
+        return ""
+    
+    key = keys[_current_key_index % len(keys)]
+    _current_key_index += 1
+    
+    return key
 
 
 # ═══════════════════════════════════════════════
@@ -138,10 +177,13 @@ async def think(
     """
     Main AI thinking function.
     
+    Multi-key rotation: Tries each available API key on rate limit errors.
+    With 3 keys, this gives 300,000 tokens/day on Groq free tier.
+    
     Args:
         message: The student's latest message
         student: Student profile dict
-        conversation_history: List of recent messages [{"role": "user/assistant", "content": "..."}]
+        conversation_history: List of recent messages
         recent_subject: Current subject if in a lesson
         context_str: Session context (memory, progress, etc.)
         is_practice: If True, use lite prompt (cheaper for practice/chat)
@@ -175,42 +217,69 @@ async def think(
     # Add the current message
     messages.append({"role": "user", "content": message})
 
-    # Call Groq with retry logic
-    max_retries = 2
+    # ── Call Groq with multi-key rotation ──
     raw_response = None
+    keys = settings.GROQ_API_KEYS
+    max_retries = len(keys) * 3  # 3 attempts per key
     
-    for attempt in range(max_retries + 1):
+    # Start with next key in rotation
+    start_index = _current_key_index % len(keys) if keys else 0
+    
+    for attempt in range(max_retries):
+        key_index = (start_index + attempt) % len(keys)
+        api_key = keys[key_index] if keys else ""
+        
         try:
-            client = _get_client()
+            client = _get_client(api_key)
             
             # Run the synchronous Groq call in a thread pool
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model=settings.GROQ_SMART_MODEL,
                 messages=messages,
-                max_tokens=500,  # Reduced from 600 — shorter responses
+                max_tokens=500,
                 temperature=0.75,
             )
             
             result = response.choices[0].message.content
             if result and len(result.strip()) > 5:
                 raw_response = result.strip()
+                # Update rotation to next key for next request
+                global _current_key_index
+                _current_key_index = (key_index + 1) % len(keys)
                 break
             
             print(f"Groq returned empty/short response for student {student_id}")
             
         except Exception as e:
             error_type = type(e).__name__
-            print(f"Groq error (attempt {attempt+1}/{max_retries+1}): {error_type}: {e} | student={student_id}")
+            error_str = str(e)
             
-            if attempt < max_retries:
-                wait_time = (attempt + 1) * 1.0
-                await asyncio.sleep(wait_time)
+            # Check if it's a rate limit error — switch key
+            is_rate_limit = (
+                "rate_limit" in error_str.lower() or
+                "429" in error_str
+            )
+            
+            if is_rate_limit:
+                print(
+                    f"Groq rate limit on key {key_index+1}/{len(keys)} "
+                    f"(attempt {attempt+1}/{max_retries}). Rotating key..."
+                )
+                # Don't sleep — just try next key immediately
+                continue
             else:
-                _log_ai_failure(student_id, error_type, str(e))
+                print(
+                    f"Groq error (attempt {attempt+1}/{max_retries}): "
+                    f"{error_type}: {error_str[:100]} | student={student_id}"
+                )
+                # For non-rate-limit errors, wait before retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
 
-    # If all retries failed, use fallback
+    # If all keys exhausted, log failure and use fallback
     if not raw_response:
+        _log_ai_failure(student_id, "ALL_KEYS_EXHAUSTED", "All API keys rate limited")
         fallbacks = [
             f"I had a small technical hiccup, {name}. Can you ask me again?",
             f"Ah, my brain lagged for a second, {name}. Try me one more time?",
@@ -220,8 +289,6 @@ async def think(
 
     # ═══════════════════════════════════════════
     # POST-PROCESSING: Enforce rules in code
-    # The prompt tells the model what to do.
-    # This code GUARANTEES it happens.
     # ═══════════════════════════════════════════
     
     cleaned_response = enforce_rules(raw_response)
@@ -236,5 +303,5 @@ async def think(
 
 def _log_ai_failure(student_id: str, error_type: str, error_message: str):
     """Log AI failures for monitoring."""
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     print(f"AI_FAILURE | {timestamp} | student={student_id} | {error_type}: {error_message[:200]}")
