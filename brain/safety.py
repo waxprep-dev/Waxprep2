@@ -249,7 +249,7 @@ EXPLOITATION_RESPONSE = (
 
 
 # ═══════════════════════════════════════════════
-# OUTPUT SAFETY (NEW)
+# OUTPUT SAFETY
 # ═══════════════════════════════════════════════
 # These patterns in AI-generated responses trigger a safety block.
 # The response is replaced with a safe fallback.
@@ -453,10 +453,12 @@ def _log_crisis_event(
         student_id: Optional database student ID
         escalation_count: How many crisis triggers in the current window
     """
+    # FIXED (Bug #5): Column name matched to database schema
+    # Database has 'phone_hash' not 'chat_id_hash'
     event_data = {
-        "chat_id_hash": str(hash(str(chat_id))),  # Hash, not raw chat_id
+        "phone_hash": str(hash(str(chat_id))),
         "student_id": student_id,
-        "message_preview": message[:100],  # Truncated for privacy
+        "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "escalation_count": escalation_count,
     }
@@ -503,8 +505,9 @@ def _log_malpractice_event(
         message: Raw student message
         student_id: Optional database student ID
     """
+    # FIXED (Bug #5): Column name matched to database schema
     event_data = {
-        "chat_id_hash": str(hash(str(chat_id))),
+        "phone_hash": str(hash(str(chat_id))),
         "student_id": student_id,
         "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -538,8 +541,9 @@ def _log_exploitation_flag(
         message: Raw student message
         student_id: Optional database student ID
     """
+    # FIXED (Bug #5): Column name matched to database schema
     event_data = {
-        "chat_id_hash": str(hash(str(chat_id))),
+        "phone_hash": str(hash(str(chat_id))),
         "student_id": student_id,
         "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
