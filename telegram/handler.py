@@ -196,6 +196,10 @@ async def _handle_ai_conversation(
     """
     Process a student message through the AI brain, with memory context.
     
+    Saves a session snapshot after every AI response so memory persists
+    even if the student never says goodbye — works for 1-minute breaks
+    and 1-day breaks alike.
+    
     Args:
         chat_id: Telegram chat ID
         student: Student profile dict
@@ -279,6 +283,50 @@ async def _handle_ai_conversation(
         await send_telegram_message(chat_id, response)
     except Exception as e:
         logger.error(f"Failed to send message to chat_id={chat_id}: {e}", exc_info=True)
+
+    # ── Save session snapshot after every AI response ──
+    # FIXED (Bug #4): Memory was inconsistent because we only saved on explicit
+    # goodbye. Now we save after EVERY message — student can close the app, lose
+    # data, or return hours later and Wax remembers exactly where they were.
+    try:
+        from database.conversations import save_session_summary
+
+        # Build session context from what's happening right now
+        session_subject = recent_subject or "unknown"
+
+        # Try to extract the topic from the AI's response
+        session_topic = "discussed"
+        if response:
+            topic_keywords = [
+                "Today:", "today:", "Let's learn about",
+                "let's learn about", "we'll cover", "focusing on",
+                "Let's focus on", "let's focus on",
+                "Let's dive into", "let's dive into"
+            ]
+            for keyword in topic_keywords:
+                if keyword in response:
+                    parts = response.split(keyword, 1)
+                    if len(parts) > 1:
+                        extracted = parts[1].strip().split(".")[0].strip()[:50]
+                        if extracted:
+                            session_topic = extracted
+                            break
+
+        await save_session_summary(student_id, {
+            "subject": session_subject,
+            "topic": session_topic,
+            "completed": False,  # Session still active
+            "score": None,
+            "struggled_with": [],
+            "ended_at": None  # Not ended yet — still in progress
+        })
+        logger.debug(
+            f"Session snapshot saved for {student_id}: "
+            f"{session_subject} - {session_topic}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to save session snapshot: {e}")
+        # Don't block — the student's message was already sent
 
     # Update state
     try:
