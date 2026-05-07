@@ -7,7 +7,7 @@ from database.client import supabase, redis_client
 from telegram.sender import send_telegram_message
 
 # Your Telegram chat ID for admin access
-ADMIN_CHAT_IDS = {8568663974}
+ADMIN_CHAT_IDS = {8510180724}
 
 
 async def handle_admin_command(chat_id: int, text: str) -> bool:
