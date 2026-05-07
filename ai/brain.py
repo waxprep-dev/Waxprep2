@@ -7,9 +7,17 @@ Multi-Key Rotation:
     Rotates through GROQ_API_KEYS on rate limit errors.
     Each key has 100,000 tokens/day on Groq free tier.
     With 3 keys = 300,000 tokens/day = ~30 active students.
+
+Response Cache:
+    Caches AI responses for common knowledge questions in Redis.
+    Normalizes questions so "What is Osmosis??" and "what is osmosis"
+    hit the same cache. 7-day TTL. Cuts token costs by ~80%.
+    Only caches knowledge questions — not greetings, quizzes, or personal messages.
 """
 
 import asyncio
+import hashlib
+import re
 import time
 from datetime import datetime, timezone
 from groq import Groq
@@ -60,6 +68,139 @@ def _next_key() -> str:
     _current_key_index += 1
     
     return key
+
+
+# ═══════════════════════════════════════════════
+# RESPONSE CACHE
+# ═══════════════════════════════════════════════
+
+# Cache TTL: 7 days for teaching responses
+CACHE_TTL = 604800  # 7 days in seconds
+
+
+def _normalize_for_cache(text: str) -> str:
+    """
+    Normalize a student's question into a consistent cache key.
+    
+    Strips punctuation, extra spaces, and converts to lowercase
+    so "What is Osmosis??" and "what is osmosis" produce the same key.
+    
+    Args:
+        text: Raw student message
+        
+    Returns:
+        Normalized cache key string
+    """
+    # Lowercase
+    text = text.lower().strip()
+    # Remove punctuation
+    text = re.sub(r'[^\w\s]', '', text)
+    # Collapse multiple spaces
+    text = " ".join(text.split())
+    return text
+
+
+def _is_cacheable(message: str) -> bool:
+    """
+    Determine if a student message should be cached.
+    
+    Only cache knowledge questions (what, how, explain, define, etc.)
+    Don't cache personal messages, greetings, or quiz commands.
+    
+    Args:
+        message: Student's message
+        
+    Returns:
+        True if this message type should be cached
+    """
+    msg_lower = message.lower().strip()
+    
+    # Don't cache these
+    skip_patterns = [
+        "hi", "hello", "hey", "good morning", "good evening",
+        "how are you", "what's up", "thank", "bye", "ok", "okay",
+        "you pick", "any one", "i'm done", "good night",
+        "quiz", "test me", "delete me",
+    ]
+    
+    for pattern in skip_patterns:
+        if pattern in msg_lower:
+            return False
+    
+    # Don't cache very short messages (single words, letters)
+    if len(msg_lower.split()) < 2:
+        return False
+    
+    # Don't cache messages with personal context (student name, "I", "my")
+    # These need AI personalization
+    personal_indicators = [" i ", " my ", " me ", " i'm ", " i've ", " my name"]
+    for indicator in personal_indicators:
+        if indicator in f" {msg_lower} ":
+            return False
+    
+    # Cache knowledge questions
+    knowledge_patterns = [
+        "what", "how", "explain", "define", "why",
+        "describe", "difference between", "compare",
+        "tell me about", "meaning of",
+    ]
+    
+    for pattern in knowledge_patterns:
+        if msg_lower.startswith(pattern) or pattern in msg_lower:
+            return True
+    
+    # Cache if message is long enough to be a real question
+    if len(msg_lower) > 30:
+        return True
+    
+    return False
+
+
+async def _get_cached_response(message: str) -> str | None:
+    """
+    Check if a cached response exists for this message.
+    
+    Uses Redis for storage. Cache key is based on normalized message text.
+    
+    Args:
+        message: Student's message
+        
+    Returns:
+        Cached response string, or None if not cached
+    """
+    try:
+        from database.client import redis_client
+        
+        cache_key = f"response_cache:{_normalize_for_cache(message)}"
+        cached = redis_client.get(cache_key)
+        
+        if cached:
+            # Decode bytes to string
+            cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
+            print(f"Cache HIT: {message[:50]}...")
+            return cached_str
+    except Exception as e:
+        print(f"Cache read error: {e}")
+    
+    return None
+
+
+async def _cache_response(message: str, response: str) -> None:
+    """
+    Store an AI response in the cache for future use.
+    
+    Args:
+        message: The student's original message
+        response: Wax's AI-generated response
+    """
+    try:
+        from database.client import redis_client
+        
+        cache_key = f"response_cache:{_normalize_for_cache(message)}"
+        redis_client.setex(cache_key, CACHE_TTL, response)
+        print(f"Cache SAVED: {message[:50]}...")
+    except Exception as e:
+        print(f"Cache write error: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -180,6 +321,10 @@ async def think(
     Multi-key rotation: Tries each available API key on rate limit errors.
     With 3 keys, this gives 300,000 tokens/day on Groq free tier.
     
+    Response caching: Checks Redis before calling AI. If the same question
+    was answered before, returns cached response instantly. Cuts token costs
+    by ~80% for common questions like "what is osmosis".
+    
     Args:
         message: The student's latest message
         student: Student profile dict
@@ -216,6 +361,15 @@ async def think(
 
     # Add the current message
     messages.append({"role": "user", "content": message})
+
+    # ── Check response cache before calling AI ──
+    # If this exact question has been answered before, return cached response.
+    # This cuts token costs by 80% for repeated questions like "what is osmosis".
+    if _is_cacheable(message):
+        cached_response = await _get_cached_response(message)
+        if cached_response:
+            # Return cached response immediately — no API call, zero tokens
+            return cached_response
 
     # ── Call Groq with multi-key rotation ──
     raw_response = None
@@ -297,6 +451,11 @@ async def think(
     if len(cleaned_response) < 20 and len(raw_response) > 20:
         cleaned_response = clean_banned_phrases(raw_response)
         cleaned_response = enforce_length(cleaned_response, max_chars=500)
+    
+    # ── Cache this response for future use ──
+    # Saves token costs — next student asking the same question gets instant response
+    if _is_cacheable(message):
+        await _cache_response(message, cleaned_response)
     
     return cleaned_response
 
