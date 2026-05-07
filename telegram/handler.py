@@ -725,23 +725,25 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     correct = question.get("correct_answer", "A").strip().upper()
     is_correct = (answer == correct)
 
-    # Build feedback message
-    explanation = question.get("explanation_correct", question.get("explanation", ""))
+    # ── Build feedback message ──
+    # FIXED: Use Python truthiness to filter None/empty values
+    # "None" no longer appears in quiz feedback
+    explanation = question.get("explanation_correct") or question.get("explanation") or ""
+    wrong_explanation = question.get(f"explanation_{answer.lower()}") or ""
 
     if is_correct:
-        response = (
-            f"✅ *Correct!*\n\n"
-            f"{explanation}\n\n"
-            f"Well done, {name}!"
-        )
+        response = f"✅ *Correct!*\n\n"
+        if explanation:
+            response += f"{explanation}\n\n"
+        response += f"Well done, {name}!"
     else:
         # Educational feedback: explain WHY it's wrong, not just WHAT is right
-        wrong_explanation = question.get(f"explanation_{answer.lower()}", "")
         response = (
             f"❌ That's not quite right.\n\n"
-            f"The correct answer is *{correct}*.\n\n"
-            f"{explanation}"
+            f"The correct answer is *{correct}*."
         )
+        if explanation:
+            response += f"\n\n{explanation}"
         if wrong_explanation:
             response += f"\n\n💡 *Why {answer} wasn't right:* {wrong_explanation}"
 
