@@ -1,5 +1,5 @@
 """
-WaxPrep v2 — Telegram Onboarding Flow
+WaxPrep v2 — Telegram Onboarding Flow (SS Only)
 """
 import asyncio
 import random
@@ -35,9 +35,9 @@ def _get_goal_retry():
 
 def _get_class_level_retry():
     return random.choice([
-        "Please reply with a number from 1 to 6:\n\n1 — JSS1\n2 — JSS2\n3 — JSS3\n4 — SS1\n5 — SS2\n6 — SS3",
-        "Just type the number that matches your class:\n\n1 = JSS1, 2 = JSS2, 3 = JSS3\n4 = SS1, 5 = SS2, 6 = SS3",
-        "Which class? Reply with just the number:\n\n1 — JSS1\n2 — JSS2\n3 — JSS3\n4 — SS1\n5 — SS2\n6 — SS3",
+        "Please reply with a number from 1 to 3:\n\n1 — SS1\n2 — SS2\n3 — SS3",
+        "Just type the number that matches your class:\n\n1 = SS1, 2 = SS2, 3 = SS3",
+        "Which class? Reply with just the number:\n\n1 — SS1\n2 — SS2\n3 — SS3",
     ])
 
 def _get_exam_retry():
@@ -177,73 +177,50 @@ async def _step_decline_reason(chat_id: int, state: dict, message: str):
 @register_step("wax_id_entry")
 async def _step_wax_id_entry(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
-    # Changed-mind bridge: returning user says they're actually new
     if any(k in msg for k in ["new", "1", "create", "register", "i'm new", "signup"]):
-        await send_telegram_message(
-            chat_id,
+        await send_telegram_message(chat_id,
             "Ah, so you're new after all? No wahala — let's start fresh.\n\n"
             "First, what do you need help with?\n\n"
-            "*1* — My schoolwork\n"
-            "*2* — Preparing for a test or exam\n"
-            "*3* — I just want to learn something new\n\n"
-            "_(Reply with the number, or just tell me in your own words)_"
-        )
+            "*1* — My schoolwork\n*2* — Preparing for a test or exam\n*3* — I just want to learn something new\n\n"
+            "_(Reply with the number, or just tell me in your own words)_")
         state["awaiting_response_for"] = "student_goal"
         state["is_new_student"] = True
         await save_onboarding_state("telegram", str(chat_id), state)
         return
-
-    # Valid WAX ID format: WAX-XXXXXX
     wax_id = message.strip().upper()
     if wax_id.startswith("WAX-") and len(wax_id) == 10:
         state["pending_wax_id"] = wax_id
         state["is_new_student"] = False
         state["awaiting_response_for"] = "pin_entry"
         await save_onboarding_state("telegram", str(chat_id), state)
-        await send_telegram_message(
-            chat_id,
+        await send_telegram_message(chat_id,
             f"WAX ID received: *{wax_id}*\n\n"
             "Now enter your 4-digit PIN to log in.\n\n"
-            "_(If you've forgotten your PIN, type *NEW* to create a fresh account)_"
-        )
+            "_(If you've forgotten your PIN, type *NEW* to create a fresh account)_")
         return
-
-    # Doesn't look like a WAX ID
-    await send_telegram_message(
-        chat_id,
+    await send_telegram_message(chat_id,
         "That doesn't look like a WAX ID. It should look like: *WAX-A74892*\n\n"
-        "Check and try again, or type *NEW* to create a fresh account."
-    )
+        "Check and try again, or type *NEW* to create a fresh account.")
 
 # ── pin_entry (for returning users) ───────────
 @register_step("pin_entry")
 async def _step_pin_entry(chat_id: int, state: dict, message: str):
     msg = message.strip().lower()
-    # Changed-mind bridge: returning user says they're actually new
     if any(k in msg for k in ["new", "create", "register", "i'm new", "signup"]):
-        await send_telegram_message(
-            chat_id,
+        await send_telegram_message(chat_id,
             "Ah, you'd rather start fresh? No wahala.\n\n"
             "First, what do you need help with?\n\n"
-            "*1* — My schoolwork\n"
-            "*2* — Preparing for a test or exam\n"
-            "*3* — I just want to learn something new\n\n"
-            "_(Reply with the number, or just tell me in your own words)_"
-        )
+            "*1* — My schoolwork\n*2* — Preparing for a test or exam\n*3* — I just want to learn something new\n\n"
+            "_(Reply with the number, or just tell me in your own words)_")
         state["awaiting_response_for"] = "student_goal"
         state["is_new_student"] = True
         state["pending_wax_id"] = None
         await save_onboarding_state("telegram", str(chat_id), state)
         return
-
-    # PIN login — placeholder until full login is built
-    wax_id = state.get("pending_wax_id", "Unknown")
-    await send_telegram_message(
-        chat_id,
+    await send_telegram_message(chat_id,
         f"PIN login is coming in a future update.\n\n"
         f"For now, you can create a fresh account to start studying immediately. "
-        f"Type *NEW* to get started."
-    )
+        f"Type *NEW* to get started.")
 
 # ── name ──────────────────────────────────────
 @register_step("name")
@@ -260,34 +237,25 @@ async def _step_name(chat_id: int, state: dict, message: str):
     state["name"] = name
     state["awaiting_response_for"] = "class_level"
     await save_onboarding_state("telegram", str(chat_id), state)
-    await send_telegram_message(chat_id, f"Nice to meet you, *{first}*!\n\nWhat class are you in?\n\n1 — JSS1\n2 — JSS2\n3 — JSS3\n4 — SS1\n5 — SS2\n6 — SS3\n\n_(Reply with the number)_")
+    await send_telegram_message(chat_id, f"Nice to meet you, *{first}*!\n\nWhat class are you in?\n\n1 — SS1\n2 — SS2\n3 — SS3\n\n_(Reply with the number)_")
 
 # ── class_level ───────────────────────────────
 @register_step("class_level")
 async def _step_class_level(chat_id: int, state: dict, message: str):
     msg = message.strip()
-    class_map = {"1": "JSS1", "2": "JSS2", "3": "JSS3", "4": "SS1", "5": "SS2", "6": "SS3"}
+    class_map = {"1": "SS1", "2": "SS2", "3": "SS3"}
     class_level = class_map.get(msg)
     if not class_level:
         await send_telegram_message(chat_id, _get_class_level_retry())
         return
     first = state.get("name", "Student").split()[0]
     state["class_level"] = class_level
-
-    # Level-appropriate subject examples
-    if class_level.startswith("JSS"):
-        examples = "Science, Maths, English, Social Studies"
-    else:
-        examples = "Physics, Maths, Chemistry, English"
-
     state["awaiting_response_for"] = "subject_selection"
     await save_onboarding_state("telegram", str(chat_id), state)
-    await send_telegram_message(
-        chat_id,
+    await send_telegram_message(chat_id,
         f"{_ack()} *{class_level}*!\n\n"
         f"Now, {first} — which subject gives you the most trouble right now?\n\n"
-        f"_(Just type the subject name — e.g. {examples})_"
-    )
+        f"_(Just type the subject name — e.g. Physics, Maths, Chemistry, English)_")
 
 # ── subject_selection + Magic Trick ───────────
 @register_step("subject_selection")
@@ -296,21 +264,12 @@ async def _step_subject_selection(chat_id: int, state: dict, message: str):
     level = state.get("class_level", "SS")
     first = state.get("name", "Student").split()[0]
 
-    # Level-appropriate subject examples
-    if level.startswith("JSS"):
-        examples = "Science, Maths, English, Social Studies"
-    else:
-        examples = "Physics, Maths, Chemistry, English"
-
-    # Catch numbers or "I don't know"
     dont_know = ["i don't know", "i dont know", "all of them", "everything", "not sure", "idk", "none", "all"]
     if raw_subject.lower() in dont_know or (raw_subject.isdigit() and len(raw_subject) <= 2):
         normalized = "Mathematics"
-        await send_telegram_message(
-            chat_id,
-            f"No wahala — I meant a subject name, like *{examples}*. "
-            "But no stress. Let's start with Mathematics — it's the foundation for most subjects."
-        )
+        await send_telegram_message(chat_id,
+            f"No wahala — I meant a subject name, like *Physics, Maths, Chemistry, English*. "
+            "But no stress. Let's start with Mathematics — it's the foundation for most subjects.")
     else:
         normalized = normalize_subject(raw_subject)
 
@@ -326,15 +285,10 @@ async def _step_subject_selection(chat_id: int, state: dict, message: str):
 
     await _breathe(0.6)
 
-    # JSS students skip exam question
-    if level.startswith("JSS"):
-        state["awaiting_response_for"] = "state"
-        await save_onboarding_state("telegram", str(chat_id), state)
-        await send_telegram_message(chat_id, f"Now, {first} — which state are you in?\n\n_(e.g. Lagos, Abuja, Kano, Rivers)_")
-    else:
-        state["awaiting_response_for"] = "target_exam"
-        await save_onboarding_state("telegram", str(chat_id), state)
-        await send_telegram_message(chat_id, f"Now, {first} — which exam are you preparing for?\n\n1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO\n\n_(Reply with the number)_")
+    # SS students go to exam selection
+    state["awaiting_response_for"] = "target_exam"
+    await save_onboarding_state("telegram", str(chat_id), state)
+    await send_telegram_message(chat_id, f"Now, {first} — which exam are you preparing for?\n\n1 — JAMB (UTME)\n2 — WAEC (SSCE)\n3 — NECO\n\n_(Reply with the number)_")
 
 # ── target_exam ───────────────────────────────
 @register_step("target_exam")
@@ -355,12 +309,9 @@ async def _step_target_exam(chat_id: int, state: dict, message: str):
 async def _step_state(chat_id: int, state: dict, message: str):
     raw = message.strip()
     student_state = raw.title()
-
-    # Validate: if input is short or doesn't match any Nigerian state, ask again
     if len(raw) <= 3 and raw.lower() not in NIGERIAN_STATES:
         await send_telegram_message(chat_id, "That doesn't look like a state — try typing the full name, like *Kano* or *Lagos*.")
         return
-
     state["student_state"] = student_state
     state["awaiting_response_for"] = "pin_setup"
     state["pin_failed_attempts"] = 0
@@ -397,17 +348,38 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
         state["awaiting_response_for"] = "pin_setup"
         await save_onboarding_state("telegram", str(chat_id), state)
         return
-    student = await create_student(platform="telegram", platform_user_id=str(chat_id), name=state.get("name", "Student"), pin=pending_pin, class_level=state.get("class_level"), target_exam=state.get("target_exam"), student_state=state.get("student_state"))
+
+    # Build subjects list — JAMB core + the student's trouble subject
+    student_subject = state.get("student_subject", "Mathematics")
+    subjects = ["english", "mathematics"]
+    if student_subject.lower() not in subjects:
+        subjects.append(student_subject.lower())
+    # Add physics and chemistry as defaults for science students
+    if student_subject.lower() in ("physics", "chemistry", "biology"):
+        for s in ("physics", "chemistry", "biology"):
+            if s not in subjects:
+                subjects.append(s)
+
+    student = await create_student(
+        platform="telegram",
+        platform_user_id=str(chat_id),
+        name=state.get("name", "Student"),
+        pin=pending_pin,
+        class_level=state.get("class_level"),
+        target_exam=state.get("target_exam"),
+        subjects=subjects,
+        student_state=state.get("student_state"),
+    )
     if not student:
         await send_telegram_message(chat_id, "Something went wrong creating your account. Please try again — send *HI* to restart.")
         return
     await clear_onboarding_state("telegram", str(chat_id))
     name_first = student["name"].split()[0]
-    student_subject = state.get("student_subject", "your subjects")
     await send_telegram_message(chat_id,
         f"Welcome to WaxPrep, *{name_first}*!\n\n"
         f"*Your account details — save these:*\n"
         f"WAX ID: *{student['wax_id']}*\n"
         f"Recovery Code: *{student['recovery_code']}*\n\n"
         f"*Full Access is now ACTIVE!*\n\n"
+        f"Subjects: {', '.join(subjects).title()}\n\n"
         f"We'll tackle {student_subject} together. You can ask me questions, take quizzes, and I'll remember everything you've learned. What would you like to study first?")
