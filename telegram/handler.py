@@ -19,7 +19,9 @@ from database.client import redis_client
 logger = logging.getLogger("waxprep.handler")
 
 # ── Quiz trigger keywords ────────────────────
-QUIZ_TRIGGERS = ["quiz", "quiz me", "test me", "question"]
+# FIXED (Bug #3): Removed "question" — too common in normal conversation.
+# Student saying "I was answering your english question" should NOT trigger a quiz.
+QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
 # "practice" removed — too ambiguous, could match "I need to practice differentiation"
 
 # ── Subject name mapping (student profile display → database column) ──
@@ -47,6 +49,7 @@ SUBJECT_MAP: Dict[str, str] = {
     "christian_religious_studies": "crs", "crs": "crs",
     "islamic_religious_studies": "irs", "irs": "irs",
     "geography": "geography",
+    "history": "history",
     # Nigerian languages
     "yoruba": "yoruba", "igbo": "igbo", "hausa": "hausa",
     # Other
@@ -152,7 +155,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     
     Priority:
     1. Quiz answer (single letter, active quiz exists)
-    2. Quiz trigger (explicit quiz keywords)
+    2. Quiz trigger (explicit quiz keywords — "quiz", "quiz me", "test me")
     3. AI conversation (everything else)
     
     Args:
@@ -177,7 +180,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
             logger.error(f"Redis quiz check failed for {student_id}: {e}", exc_info=True)
             # Fall through to AI conversation rather than losing the message
 
-    # 2. Quiz trigger — pass message text so quiz engine can extract subject
+    # 2. Quiz trigger — FIXED: "question" removed, only "quiz", "quiz me", "test me"
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
@@ -196,9 +199,9 @@ async def _handle_ai_conversation(
     """
     Process a student message through the AI brain, with memory context.
     
-    Saves a session snapshot after every AI response so memory persists
-    even if the student never says goodbye — works for 1-minute breaks
-    and 1-day breaks alike.
+    Saves a session snapshot after AI responses — but only when there's
+    a real conversation (2+ user messages). Prevents "Last time we didn't
+    cover anything" for brand new students.
     
     Args:
         chat_id: Telegram chat ID
@@ -284,49 +287,53 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Failed to send message to chat_id={chat_id}: {e}", exc_info=True)
 
-    # ── Save session snapshot after every AI response ──
-    # FIXED (Bug #4): Memory was inconsistent because we only saved on explicit
-    # goodbye. Now we save after EVERY message — student can close the app, lose
-    # data, or return hours later and Wax remembers exactly where they were.
+    # ── Save session snapshot ──
+    # FIXED (Bug #4): Only save if there's a real conversation (2+ user messages).
+    # Prevents "Last time we didn't cover anything" for brand new students.
     try:
         from database.conversations import save_session_summary
 
-        # Build session context from what's happening right now
-        session_subject = recent_subject or "unknown"
-
-        # Try to extract the topic from the AI's response
-        session_topic = "discussed"
-        if response:
-            topic_keywords = [
-                "Today:", "today:", "Let's learn about",
-                "let's learn about", "we'll cover", "focusing on",
-                "Let's focus on", "let's focus on",
-                "Let's dive into", "let's dive into"
-            ]
-            for keyword in topic_keywords:
-                if keyword in response:
-                    parts = response.split(keyword, 1)
-                    if len(parts) > 1:
-                        extracted = parts[1].strip().split(".")[0].strip()[:50]
-                        if extracted:
-                            session_topic = extracted
-                            break
-
-        await save_session_summary(student_id, {
-            "subject": session_subject,
-            "topic": session_topic,
-            "completed": False,  # Session still active
-            "score": None,
-            "struggled_with": [],
-            "ended_at": None  # Not ended yet — still in progress
-        })
-        logger.debug(
-            f"Session snapshot saved for {student_id}: "
-            f"{session_subject} - {session_topic}"
+        # Count user messages in recent history (excluding current)
+        user_msg_count = sum(
+            1 for m in conversation_history[-10:]
+            if m.get("role") == "user"
         )
+
+        # Only save snapshot if student has had at least 2 exchanges
+        if user_msg_count >= 2:
+            session_subject = recent_subject or "unknown"
+            session_topic = "discussed"
+
+            if response:
+                topic_keywords = [
+                    "Today:", "today:", "Let's learn about",
+                    "let's learn about", "we'll cover", "focusing on",
+                    "Let's focus on", "let's focus on",
+                    "Let's dive into", "let's dive into"
+                ]
+                for keyword in topic_keywords:
+                    if keyword in response:
+                        parts = response.split(keyword, 1)
+                        if len(parts) > 1:
+                            extracted = parts[1].strip().split(".")[0].strip()[:50]
+                            if extracted:
+                                session_topic = extracted
+                                break
+
+            await save_session_summary(student_id, {
+                "subject": session_subject,
+                "topic": session_topic,
+                "completed": False,
+                "score": None,
+                "struggled_with": [],
+                "ended_at": None
+            })
+            logger.debug(
+                f"Session snapshot saved for {student_id}: "
+                f"{session_subject} - {session_topic}"
+            )
     except Exception as e:
         logger.error(f"Failed to save session snapshot: {e}")
-        # Don't block — the student's message was already sent
 
     # Update state
     try:
@@ -352,18 +359,17 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
         Subject name string or None
     """
     # Scan last few assistant messages for subject mentions
-    # Use SUBJECT_MAP keys (all supported subjects) — no external import needed
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
             for subject in SUBJECT_MAP:
-                # Check if subject name appears in the message
-                # Handle both underscore and space versions
                 subject_display = subject.replace("_", " ")
                 if subject_display.lower() in content.lower():
                     return subject
 
     # Fallback: student's trouble subject (from onboarding)
+    # FIXED (Bug #2): This now correctly prioritizes the subject they said
+    # gives them trouble — even when they say "anything" or "you pick"
     trouble_subject = student.get("student_subject")
     if trouble_subject:
         return trouble_subject
@@ -493,12 +499,10 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     Returns:
         List of question dicts, empty list if no questions found
     """
-    # Check in-memory cache first
     cache_key = f"questions_cache:{subject}"
     try:
         cached = redis_client.get(cache_key)
         if cached:
-            # Redis returns bytes — decode to string
             cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
             logger.debug(f"Cache hit for questions:{subject}")
             return json.loads(cached_str)
@@ -507,15 +511,14 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
 
     questions: List[Dict[str, Any]] = []
 
-    # Try database
     try:
         from database.client import supabase
         result = (
             supabase.table("questions")
             .select("*")
             .eq("subject", subject)
-            .order("id", desc=False)  # Consistent ordering
-            .limit(200)  # Increased from 100 for better sampling
+            .order("id", desc=False)
+            .limit(200)
             .execute()
         )
         if result.data:
@@ -524,7 +527,6 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Database question load failed for {subject}: {e}")
 
-    # Fallback: JSON file
     if not questions:
         try:
             json_path = os.path.join(
@@ -543,7 +545,6 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"JSON question load failed for {subject}: {e}")
 
-    # Cache for 5 minutes
     if questions:
         try:
             redis_client.setex(cache_key, 300, json.dumps(questions))
@@ -557,9 +558,8 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     """
     Start a quiz session for the student.
     
-    Selects a subject using fairness rotation (avoids repeating same subject),
-    OR extracts subject from the student's message if specified.
-    Loads questions, picks one randomly, and sends it with inline keyboard.
+    Selects a subject using fairness rotation, OR extracts subject
+    from the student's message if specified.
     
     Args:
         chat_id: Telegram chat ID
@@ -570,16 +570,13 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     student_subjects = student.get("subjects", [])
     student_track = _infer_track(student_subjects)
 
-    # Determine subject pool
     if not student_subjects:
-        # No subjects set — use track-based fallback
         fallback = TRACK_FALLBACKS.get(student_track, TRACK_FALLBACKS["unknown"])
         subjects_pool = fallback.copy()
         logger.warning(
             f"Student {student_id} ({student_track} track) has no subjects set. "
             f"Using fallback: {subjects_pool}"
         )
-        # If track is unknown, warn the student
         if student_track == "unknown":
             await send_telegram_message(
                 chat_id,
@@ -590,11 +587,10 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     else:
         subjects_pool = student_subjects.copy()
 
-    # ── Check if student specified a subject in their message ──
+    # Extract subject from message if specified
     requested_subject = None
     if message_text:
         msg_lower = message_text.lower()
-        # Check each subject in the student's pool first
         for subj in subjects_pool:
             subj_display = subj.lower().replace("_", " ")
             if subj_display in msg_lower:
@@ -602,17 +598,14 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
                 logger.info(f"Quiz subject from student pool: {subj}")
                 break
         
-        # Also check SUBJECT_MAP for matches not in student's pool
         if not requested_subject:
             for map_key in SUBJECT_MAP:
                 display = map_key.replace("_", " ")
-                if display in msg_lower and display not in ("quiz", "me", "test", "question"):
-                    # Map this subject to database format
+                if display in msg_lower and display not in ("quiz", "me", "test"):
                     requested_subject = map_key
                     logger.info(f"Quiz subject from SUBJECT_MAP: {map_key}")
                     break
 
-    # Use requested subject if found, otherwise rotate
     if requested_subject:
         subject = requested_subject
     else:
@@ -621,7 +614,6 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
     logger.info(f"Quiz subject for {student_id}: {db_subject} (from {'message' if requested_subject else 'rotation'})")
 
-    # Load questions
     questions = await _load_questions(db_subject)
 
     if not questions:
@@ -632,20 +624,17 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
         )
         return
 
-    # Pick random question
     question = random.choice(questions)
     logger.debug(
         f"Selected question for {student_id}: "
         f"{question.get('question_text', question.get('question', ''))[:80]}..."
     )
 
-    # Validate question has required fields
     if not _validate_question(question):
         logger.error(f"Invalid question data for {db_subject}: {question.get('id', 'unknown')}")
         await send_telegram_message(chat_id, "This question has invalid options. Let me try another. Type *quiz*.")
         return
 
-    # Store active quiz in Redis
     quiz_key = f"active_quiz:{student_id}"
     try:
         redis_client.setex(
@@ -662,13 +651,11 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
         await send_telegram_message(chat_id, "Quiz setup failed. Type *quiz* to try again.")
         return
 
-    # Build inline keyboard
     keyboard = build_quiz_keyboard(question)
     if not keyboard:
         await send_telegram_message(chat_id, "This question is missing options. Type *quiz* for another.")
         return
 
-    # Format and send question
     display_subject = db_subject.replace("_", " ").title()
     question_body = question.get("question_text", question.get("question", "Question loading..."))
 
@@ -682,7 +669,6 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
         await send_telegram_message(chat_id, question_text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Failed to send quiz message to chat_id={chat_id}: {e}", exc_info=True)
-        # Clean up orphaned quiz state
         try:
             redis_client.delete(quiz_key)
         except Exception:
@@ -690,27 +676,14 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 
 
 async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_data: str) -> None:
-    """
-    Handle inline keyboard callback queries from quiz buttons.
-    
-    Telegram sends callback queries (not text messages) when users tap
-    inline keyboard buttons. This function MUST be called from the webhook
-    handler that receives callback_query updates.
-    
-    Args:
-        chat_id: Telegram chat ID (from callback_query.message.chat.id)
-        callback_query_id: Telegram callback query ID (for acknowledgment)
-        callback_data: The callback_data string from the button (e.g., "A", "B", "C", "D")
-    """
+    """Handle inline keyboard callback queries from quiz buttons."""
     logger.info(f"Quiz callback: chat_id={chat_id}, data={callback_data}")
 
-    # Acknowledge the callback immediately (Telegram requires this within ~30 seconds)
     try:
         await answer_callback_query(callback_query_id, text="")
     except Exception as e:
         logger.error(f"Callback acknowledgment failed: {e}")
 
-    # Look up student
     try:
         from database.students import get_student_by_platform_id
         student = await get_student_by_platform_id("telegram", str(chat_id))
@@ -722,7 +695,6 @@ async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_da
         await send_telegram_message(chat_id, "I can't find your account. Type *HI* to restart.")
         return
 
-    # Process the answer
     if callback_data in ("A", "B", "C", "D"):
         await _handle_quiz_answer(chat_id, student, callback_data)
     else:
@@ -730,27 +702,16 @@ async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_da
 
 
 async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str) -> None:
-    """
-    Evaluate a quiz answer and provide feedback.
-    
-    Works for both text answers and callback query answers.
-    
-    Args:
-        chat_id: Telegram chat ID
-        student: Student profile dict
-        answer: The student's answer ("A", "B", "C", or "D")
-    """
+    """Evaluate a quiz answer and provide feedback."""
     student_id = str(student["id"])
     quiz_key = f"active_quiz:{student_id}"
     name = student.get("name", "Student").split()[0]
 
-    # Load quiz data with error handling
     try:
         raw = redis_client.get(quiz_key)
         if not raw:
             await send_telegram_message(chat_id, "No active quiz. Reply with *quiz* to start one!")
             return
-        # Redis returns bytes — decode if needed
         raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         quiz_data = json.loads(raw_str)
     except json.JSONDecodeError:
@@ -763,7 +724,6 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
         await send_telegram_message(chat_id, "I lost track of the quiz. Type *quiz* to start a new one.")
         return
 
-    # Clean up immediately to prevent double-answering
     try:
         redis_client.delete(quiz_key)
     except Exception:
@@ -773,9 +733,6 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     correct = question.get("correct_answer", "A").strip().upper()
     is_correct = (answer == correct)
 
-    # ── Build feedback message ──
-    # FIXED: Use Python truthiness to filter None/empty values
-    # "None" no longer appears in quiz feedback
     explanation = question.get("explanation_correct") or question.get("explanation") or ""
     wrong_explanation = question.get(f"explanation_{answer.lower()}") or ""
 
@@ -785,7 +742,6 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
             response += f"{explanation}\n\n"
         response += f"Well done, {name}!"
     else:
-        # Educational feedback: explain WHY it's wrong, not just WHAT is right
         response = (
             f"❌ That's not quite right.\n\n"
             f"The correct answer is *{correct}*."
@@ -795,7 +751,6 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
         if wrong_explanation:
             response += f"\n\n💡 *Why {answer} wasn't right:* {wrong_explanation}"
 
-    # Show the options for context
     opt_key = f"option_{answer.lower()}"
     correct_key = f"option_{correct.lower()}"
     opt_text = question.get(opt_key, "")
@@ -803,10 +758,7 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     if opt_text and correct_text and answer != correct:
         response += f"\n\nYour answer: *{answer}*) {opt_text}\nCorrect answer: *{correct}*) {correct_text}"
 
-    # Log for progress tracking
     _log_quiz_answer(student_id, question, is_correct)
-
-    # Encouraging next step
     response += "\n\nType *quiz* for another question!"
 
     try:
@@ -816,16 +768,7 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
 
 
 def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool) -> None:
-    """
-    Log quiz answer to Redis for progress tracking and analytics.
-    
-    Uses atomic RPUSH + LTRIM for efficient list management.
-    
-    Args:
-        student_id: String student identifier
-        question: The question dict that was answered
-        is_correct: Whether the answer was correct
-    """
+    """Log quiz answer to Redis for progress tracking."""
     try:
         key = f"quiz_history:{student_id}"
         entry = json.dumps({
@@ -835,11 +778,10 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-        # Atomic push + trim using pipeline
         pipe = redis_client.pipeline()
         pipe.rpush(key, entry)
-        pipe.ltrim(key, -MAX_QUIZ_HISTORY, -1)  # Keep last N entries
-        pipe.expire(key, 86400 * 30)  # 30-day TTL
+        pipe.ltrim(key, -MAX_QUIZ_HISTORY, -1)
+        pipe.expire(key, 86400 * 30)
         pipe.execute()
 
         logger.debug(f"Quiz logged for {student_id}: correct={is_correct}")
@@ -848,56 +790,36 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
 
 
 def _validate_question(question: Dict[str, Any]) -> bool:
-    """
-    Validate that a question dict has the required fields for a quiz.
-    
-    Returns:
-        True if question is valid for display
-    """
-    # Must have question text
+    """Validate that a question dict has the required fields for a quiz."""
     if not question.get("question_text") and not question.get("question"):
         return False
-
-    # Must have a correct answer
     if not question.get("correct_answer"):
         return False
-
-    # Must have at least the correct option text
     correct = question["correct_answer"].strip().upper()
     if not question.get(f"option_{correct.lower()}"):
         return False
-
     return True
 
 
 def _infer_track(subjects: List[str]) -> str:
-    """
-    Infer the student's academic track from their subject list.
-    
-    Returns:
-        "science", "commercial", "arts", or "unknown"
-    """
+    """Infer the student's academic track from their subject list."""
     if not subjects:
         return "unknown"
 
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
 
-    # Science indicators
     science_indicators = {"physics", "chemistry", "biology", "further_mathematics", "agricultural_science"}
     if subject_set & science_indicators:
         return "science"
 
-    # Commercial indicators
     commercial_indicators = {"accounting", "commerce", "business_studies", "marketing"}
     if subject_set & commercial_indicators:
         return "commercial"
 
-    # Arts indicators
     arts_indicators = {"literature_in_english", "government", "civic_education", "crs", "irs"}
     if subject_set & arts_indicators:
         return "arts"
 
-    # Economics and Geography can go either Commercial or Arts
     if "economics" in subject_set and "government" in subject_set:
         return "arts"
     if "economics" in subject_set:
@@ -907,34 +829,17 @@ def _infer_track(subjects: List[str]) -> str:
 
 
 def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
-    """
-    Pick a subject using fair rotation to avoid repeating the same subject.
-    
-    Tracks recently used subjects per student in memory.
-    
-    Args:
-        student_id: Student identifier
-        subjects: Available subjects pool
-        
-    Returns:
-        Selected subject string
-    """
+    """Pick a subject using fair rotation."""
     if not subjects:
         return "mathematics"
 
-    # Get recently used subjects
     recent = _QUIZ_TRACKER.get(student_id, [])
-
-    # Filter out recently used if we have enough variety
     available = [s for s in subjects if s not in recent]
     if not available:
-        # All subjects recently used, reset rotation
         available = subjects
         _QUIZ_TRACKER[student_id] = []
 
     chosen = random.choice(available)
-
-    # Track this choice — FIXED: setdefault → setdefault
     _QUIZ_TRACKER.setdefault(student_id, []).append(chosen)
     if len(_QUIZ_TRACKER[student_id]) > 3:
         _QUIZ_TRACKER[student_id] = _QUIZ_TRACKER[student_id][-3:]
@@ -942,12 +847,8 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
     return chosen
 
 
-# ── Module-level preload of common subjects (optional warmup) ──
 async def warmup_question_cache() -> None:
-    """
-    Preload common subjects into Redis cache for faster cold starts.
-    Call during application startup.
-    """
+    """Preload common subjects into Redis cache."""
     common_subjects = ["mathematics", "english", "physics", "chemistry", "biology", "government", "economics"]
     for subject in common_subjects:
         try:
