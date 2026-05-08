@@ -12,6 +12,10 @@ Wax takes control. Doesn't ask again. Leads.
 
 Now with Session End Detection — natural endings like "I'm tired" or
 "I'm done" trigger formal session closure, saving memory for next time.
+
+Now with Confusion Detection — when a student is confused, Wax stops
+introducing new information, switches examples, and doesn't move forward
+until the student confirms understanding.
 """
 import asyncio
 import hashlib
@@ -38,8 +42,6 @@ DEFERRAL_KEYWORDS = [
 ]
 
 # ── Session end keywords ─────────────────────
-# When a student says these, Wax recognizes the session is ending.
-# State transitions to ENDED, memory saves, next return feels warm.
 SESSION_END_KEYWORDS = [
     "i'm tired", "i am tired", "i'm done", "i am done",
     "good night", "goodnight", "i need a break", "taking a break",
@@ -99,6 +101,14 @@ JAMB_CHECK_COOLDOWN = 604800  # 7 days in seconds
 
 # Deferral count TTL — 1 hour (resets each session)
 DEFERRAL_TTL = 3600
+
+# Understanding confirmation phrases — used to reset confusion counter
+UNDERSTANDING_PHRASES = [
+    "you've got it", "exactly", "you worked that out",
+    "you're right", "well done", "correct", "perfect",
+    "that's it", "you got it", "you understand",
+    "now you're getting it", "you're on a roll",
+]
 
 
 async def process_telegram_message(chat_id: int, text: str) -> None:
@@ -163,8 +173,8 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     
     Priority:
     0. JAMB ambition response
-    0.3. Session end keywords — "I'm tired", "goodnight" → end session
-    0.5. Deferral keywords — "anything", "you pick" → Wax leads
+    0.3. Session end keywords
+    0.5. Deferral keywords
     1. Quiz answer
     2. Quiz trigger
     3. AI conversation
@@ -183,9 +193,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
-    # 0.3. Session end keywords — FIXED (Bug #2)
-    # Detect natural endings like "I'm tired" and formally close the session.
-    # This ensures memory saves and next return feels warm.
+    # 0.3. Session end keywords
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
@@ -216,7 +224,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
 
 
 # ═══════════════════════════════════════════════
-# SESSION END HANDLER — "I'm tired" / "goodnight"
+# SESSION END HANDLER
 # ═══════════════════════════════════════════════
 
 async def _handle_session_end(
@@ -227,39 +235,24 @@ async def _handle_session_end(
     name: str,
     msg_lower: str
 ) -> None:
-    """
-    Handle natural session endings.
-    
-    When a student says "I'm tired" or "goodnight," Wax:
-    1. Lets the AI generate a warm goodbye response
-    2. Extracts the topic from recent conversation
-    3. Formally transitions state to ENDED
-    4. Saves session summary for next return
-    
-    This ensures "Welcome back! We were doing Physics — linear motion."
-    instead of "Where were we?"
-    """
+    """Handle natural session endings."""
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message, save_session_summary
 
-    # Load conversation history to extract topic
     try:
         conversation_history = await get_history(student_id)
     except Exception:
         conversation_history = []
 
-    # Determine what they were studying
     recent_subject = _infer_recent_subject(student, conversation_history)
     session_topic = _extract_topic_from_history(conversation_history)
 
-    # Save user message
     try:
         await save_message(student_id, "user", text)
     except Exception:
         pass
 
-    # Get current state
     try:
         current_state = await get_state(student_id)
         if not current_state:
@@ -267,13 +260,11 @@ async def _handle_session_end(
     except Exception:
         current_state = "chatting"
 
-    # Build memory context for the goodbye
     try:
         context_str = await _build_memory_context(student_id)
     except Exception:
         context_str = ""
 
-    # Generate goodbye via AI
     try:
         response = await think(
             message=text,
@@ -286,7 +277,6 @@ async def _handle_session_end(
     except Exception:
         response = f"No wahala, {name}. Take a break. We'll continue {recent_subject or 'studying'} when you're ready."
 
-    # Save and send response
     try:
         await save_message(student_id, "assistant", response)
     except Exception:
@@ -294,8 +284,6 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
-    # ── Formally end the session ──
-    # This is the fix: transition to ENDED so memory saves properly
     try:
         await set_state(
             student_id,
@@ -313,7 +301,6 @@ async def _handle_session_end(
     except Exception as e:
         logger.error(f"Failed to end session for {student_id}: {e}")
 
-    # Also save a session snapshot directly to ensure memory persists
     try:
         await save_session_summary(student_id, {
             "subject": recent_subject or "unknown",
@@ -328,39 +315,21 @@ async def _handle_session_end(
 
 
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
-    """
-    Extract the current topic from recent conversation history.
-    
-    Scans the last 10 messages for topic indicators — both opening phrases
-    like "Today we'll learn about..." and closing phrases like
-    "You were doing well with..." 
-    
-    FIXED (Bug #1): Now catches closing phrases, not just openings.
-    """
-    # FIXED: Added closing/during-session phrases
+    """Extract the current topic from recent conversation history."""
     topic_keywords = [
-        # Opening phrases
         "Today:", "today:", "Let's learn about",
         "let's learn about", "we'll cover", "focusing on",
         "Let's focus on", "let's focus on",
         "Let's dive into", "let's dive into",
-        # Closing/encouragement phrases — NOW CAPTURED
         "you were doing well with",
         "You were doing well with",
-        "we covered",
-        "We covered",
-        "we looked at",
-        "We looked at",
-        "we discussed",
-        "We discussed",
-        "don't forget that",
-        "Don't forget that",
-        "you worked that out",
-        "You worked that out",
-        "you're getting",
-        "You're getting",
-        "you understood",
-        "You understood",
+        "we covered", "We covered",
+        "we looked at", "We looked at",
+        "we discussed", "We discussed",
+        "don't forget that", "Don't forget that",
+        "you worked that out", "You worked that out",
+        "you're getting", "You're getting",
+        "you understood", "You understood",
     ]
 
     for msg in reversed(conversation_history[-10:]):
@@ -374,7 +343,6 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
                         if extracted and len(extracted) > 2:
                             return extracted
 
-    # Fallback: scan for any subject mentions
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
@@ -654,7 +622,7 @@ async def _handle_jamb_ambition_response(
 
 
 # ═══════════════════════════════════════════════
-# AI CONVERSATION HANDLER
+# AI CONVERSATION HANDLER — WITH CONFUSION DETECTION
 # ═══════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -664,22 +632,42 @@ async def _handle_ai_conversation(
     student_id: str,
     name: str
 ) -> None:
-    """Process a student message through the AI brain, with memory context."""
+    """
+    Process a student message through the AI brain, with memory context.
+    
+    Now with Confusion Detection:
+    - Detects confusion before AI call
+    - Injects reset instructions into the prompt
+    - Resets confusion counter when student demonstrates understanding
+    """
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
 
+    # ── FIXED: Import confusion detector at function level ──
+    # This prevents circular imports and makes the import available
+    # throughout the entire function scope.
+    try:
+        from brain.detectors import detect_confusion, reset_confusion_count
+        _confusion_detector_available = True
+    except ImportError:
+        logger.warning("Confusion detector not available")
+        _confusion_detector_available = False
+
+    # Save user message
     try:
         await save_message(student_id, "user", text)
     except Exception as e:
         logger.error(f"Failed to save user message for {student_id}: {e}", exc_info=True)
 
+    # Load conversation history
     try:
         conversation_history = await get_history(student_id)
     except Exception as e:
         logger.error(f"Failed to load history for {student_id}: {e}", exc_info=True)
         conversation_history = []
 
+    # Load current state
     try:
         current_state = await get_state(student_id)
         if not current_state:
@@ -688,16 +676,68 @@ async def _handle_ai_conversation(
         logger.error(f"Failed to load state for {student_id}: {e}", exc_info=True)
         current_state = "idle"
 
+    # Determine recent subject
     recent_subject = _infer_recent_subject(student, conversation_history)
 
+    # ── FIXED: Define current_topic BEFORE the try block ──
+    # This ensures it's available in the post-response section.
+    current_topic = recent_subject or "unknown"
+
+    # Build memory context
     try:
         context_str = await _build_memory_context(student_id)
     except Exception as e:
         logger.error(f"Memory context build failed for {student_id}: {e}", exc_info=True)
         context_str = ""
 
+    # ── Confusion Detection (NEW) ──
+    # FIXED: _pending_confusion_reset defined OUTSIDE try block
+    # so it persists for the post-response check.
+    _pending_confusion_reset = False
+
+    if _confusion_detector_available:
+        try:
+            # Count wrong answers on this topic from recent history
+            same_topic_wrong = 0
+            for msg in conversation_history[-6:]:
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if any(phrase in content.lower() for phrase in [
+                        "not quite", "not exactly", "close", "almost",
+                        "that's not", "incorrect", "not right",
+                    ]):
+                        same_topic_wrong += 1
+
+            confusion = await detect_confusion(
+                message=text,
+                student_id=student_id,
+                topic=current_topic,
+                same_topic_wrong_count=same_topic_wrong,
+            )
+
+            if confusion["confused"]:
+                # Inject confusion instruction BEFORE memory context
+                if context_str:
+                    context_str = confusion["context_instruction"] + "\n\n" + context_str
+                else:
+                    context_str = confusion["context_instruction"]
+
+                logger.info(
+                    f"Confusion detected for {student_id}: "
+                    f"topic={current_topic}, attempt={confusion['attempt']}, "
+                    f"explicit={confusion['explicit']}, "
+                    f"should_park={confusion['should_park']}"
+                )
+
+                # Mark for post-response reset check
+                _pending_confusion_reset = True
+        except Exception as e:
+            logger.error(f"Confusion detection failed: {e}", exc_info=True)
+
+    # Determine practice mode
     is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
 
+    # Call AI brain (with injected confusion context if confusion was detected)
     try:
         response = await think(
             message=text,
@@ -711,6 +751,7 @@ async def _handle_ai_conversation(
         logger.error(f"AI brain error for {student_id}: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
+    # Output safety check
     try:
         from brain.safety import check_output_safety
         if await check_output_safety(response):
@@ -721,17 +762,36 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Output safety check failed: {e}", exc_info=True)
 
+    # Save assistant response
     try:
         await save_message(student_id, "assistant", response)
     except Exception as e:
         logger.error(f"Failed to save assistant message for {student_id}: {e}", exc_info=True)
 
+    # Send response
     try:
         await send_telegram_message(chat_id, response)
     except Exception as e:
         logger.error(f"Failed to send message to chat_id={chat_id}: {e}", exc_info=True)
 
-    # Save session snapshot — FIXED: uses enhanced topic extraction
+    # ── Post-response: Reset confusion counter if student understood ──
+    # FIXED: _pending_confusion_reset is in scope, current_topic is in scope,
+    # and reset_confusion_count was imported at the top of the function.
+    if _pending_confusion_reset and _confusion_detector_available:
+        try:
+            student_understood = any(
+                phrase in response.lower()
+                for phrase in UNDERSTANDING_PHRASES
+            )
+            if student_understood:
+                await reset_confusion_count(student_id, current_topic)
+                logger.info(
+                    f"Confusion resolved for {student_id} on {current_topic}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to reset confusion count: {e}")
+
+    # Save session snapshot
     try:
         from database.conversations import save_session_summary
 
@@ -742,10 +802,8 @@ async def _handle_ai_conversation(
 
         if user_msg_count >= 2:
             session_subject = recent_subject or "unknown"
-            # FIXED (Bug #1): Use the enhanced extractor that catches closing phrases
             session_topic = _extract_topic_from_history(conversation_history)
             
-            # If the response itself contains a topic, prefer that
             if response:
                 for keyword in [
                     "Today:", "today:", "Let's learn about",
@@ -777,6 +835,7 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Failed to save session snapshot: {e}")
 
+    # Update state
     try:
         if current_state == "idle":
             await set_state(student_id, "chatting", reason="First message")
@@ -785,6 +844,7 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"State update failed for {student_id}: {e}", exc_info=True)
 
+    # JAMB Check trigger
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
 
 
