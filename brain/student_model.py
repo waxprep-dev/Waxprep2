@@ -34,8 +34,8 @@ logger = logging.getLogger("waxprep.student_model")
 # CONSTANTS
 # ═══════════════════════════════════════════════
 
-LEARNING_RATE = 0.2          # How much a single session changes a weight
-DECAY_RATE = 0.05            # How much old signals lose weight per session
+LEARNING_RATE = 0.2
+DECAY_RATE = 0.05
 MIN_SESSIONS_FOR_CONFIDENCE = 3
 MIN_SIGNALS_FOR_INFERENCE = 2
 MAX_TRACKED_DOMAINS = 10
@@ -54,7 +54,6 @@ EXAMPLE_DOMAINS = [
 COMMUNICATION_LEVELS = ["formal_english", "casual_english", "pidgin_mixed", "full_pidgin"]
 COMPETENCE_LEVELS = ["mastered", "in_progress", "struggling", "not_attempted"]
 
-# Centralized field list for serialization consistency
 _SERIALIZED_FIELDS = [
     "teaching_style", "teaching_style_by_subject", "teaching_style_confidence",
     "teaching_style_signals",
@@ -62,12 +61,14 @@ _SERIALIZED_FIELDS = [
     "communication_style", "communication_confidence", "communication_signals",
     "last_formality_score", "abrupt_shift_detected",
     "competence_map", "last_quiz_scores",
+    "recent_topics",
     "total_sessions", "last_updated", "model_version",
 ]
 
 _JSON_FIELDS = {
     "teaching_style", "teaching_style_by_subject", "example_domains",
     "communication_style", "competence_map", "last_quiz_scores",
+    "recent_topics",
 }
 
 _FLOAT_FIELDS = {
@@ -117,6 +118,9 @@ class StudentModel:
         # Category 4: Competence
         self.competence_map: Dict[str, Dict[str, str]] = {}
         self.last_quiz_scores: Dict[str, List[float]] = {}
+        
+        # Topic Coherence
+        self.recent_topics: List[str] = []
         
         # Metadata
         self.total_sessions: int = 0
@@ -348,7 +352,7 @@ class StudentModel:
     
     @classmethod
     def from_dict(cls, student_id: str, data: Dict[str, Any]) -> "StudentModel":
-        """Create a StudentModel from a dictionary. Only sets fields that exist."""
+        """Create a StudentModel from a dictionary."""
         model = cls(student_id)
         for field in _SERIALIZED_FIELDS:
             if field in data:
@@ -394,10 +398,6 @@ class StudentModel:
         
         return "LEARNING PROFILE:\n" + "\n".join(f"- {p}" for p in parts)
     
-    # ═══════════════════════════════════════════
-    # RESET
-    # ═══════════════════════════════════════════
-    
     def reset(self) -> None:
         """Completely reset the model."""
         self.__init__(self.student_id)
@@ -425,7 +425,7 @@ async def load_student_model(student_id: str) -> StudentModel:
                     try:
                         data[key_str] = json.loads(value_str)
                     except json.JSONDecodeError:
-                        data[key_str] = {}
+                        data[key_str] = {} if key_str != "recent_topics" else []
                 elif key_str in _FLOAT_FIELDS:
                     try:
                         data[key_str] = float(value_str)
@@ -449,7 +449,6 @@ async def load_student_model(student_id: str) -> StudentModel:
     except Exception as e:
         logger.error(f"Redis model load failed for {student_id}: {e}")
     
-    # Fallback to Supabase
     try:
         from database.client import supabase
         
@@ -471,10 +470,7 @@ async def load_student_model(student_id: str) -> StudentModel:
                     data[field] = value
             
             model = StudentModel.from_dict(student_id, data)
-            
-            # Repopulate Redis
             await save_student_model(model)
-            
             return model
             
     except Exception as e:
@@ -507,9 +503,8 @@ async def save_student_model(model: StudentModel) -> bool:
             else:
                 redis_client.hset(model.redis_key, key, str(value))
         
-        redis_client.expire(model.redis_key, 2592000)  # 30-day TTL
+        redis_client.expire(model.redis_key, 2592000)
         
-        # FIXED: Use asyncio.ensure_future for non-blocking async sync
         asyncio.ensure_future(_sync_to_supabase(model, data))
         
         return True
@@ -520,7 +515,7 @@ async def save_student_model(model: StudentModel) -> bool:
 
 
 async def _sync_to_supabase(model: StudentModel, data: Dict[str, Any]) -> None:
-    """Sync model to Supabase. Non-blocking. Fire and forget."""
+    """Sync model to Supabase. Non-blocking."""
     try:
         from database.client import supabase
         
@@ -533,6 +528,7 @@ async def _sync_to_supabase(model: StudentModel, data: Dict[str, Any]) -> None:
             "communication_style": data.get("communication_style", {}),
             "competence_map": data.get("competence_map", {}),
             "last_quiz_scores": data.get("last_quiz_scores", {}),
+            "recent_topics": data.get("recent_topics", []),
             "total_sessions": data.get("total_sessions", 0),
             "updated_at": model.last_updated,
             "model_version": model.model_version,
