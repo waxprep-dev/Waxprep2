@@ -3,6 +3,9 @@ WaxPrep v2 — Telegram Message Handler
 Processes incoming Telegram messages. Routes anonymous users to onboarding,
 registered users to the AI brain. Handles quiz commands and answers.
 Supports callback queries (inline keyboard) AND text-based answers.
+
+Now with JAMB Subject Checker — Wax proactively brings up university
+ambition at natural moments after trust is built.
 """
 import asyncio
 import hashlib
@@ -19,14 +22,9 @@ from database.client import redis_client
 logger = logging.getLogger("waxprep.handler")
 
 # ── Quiz trigger keywords ────────────────────
-# FIXED (Bug #3): Removed "question" — too common in normal conversation.
-# Student saying "I was answering your english question" should NOT trigger a quiz.
 QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
-# "practice" removed — too ambiguous, could match "I need to practice differentiation"
 
 # ── Subject name mapping (student profile display → database column) ──
-# Keys: what students might say or what's stored in profile
-# Values: database column/table subject identifier
 SUBJECT_MAP: Dict[str, str] = {
     # Core
     "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
@@ -59,12 +57,11 @@ SUBJECT_MAP: Dict[str, str] = {
 }
 
 # ── Fallback subject pools by track ───────────
-# Used when a student profile has no subjects set
 TRACK_FALLBACKS: Dict[str, List[str]] = {
     "science": ["english", "mathematics", "physics", "chemistry", "biology"],
     "commercial": ["english", "mathematics", "economics", "commerce", "accounting"],
     "arts": ["english", "mathematics", "government", "literature_in_english", "civic_education"],
-    "unknown": ["english", "mathematics"],  # Minimal fallback — prompt student to set subjects
+    "unknown": ["english", "mathematics"],
 }
 
 # TTL for active quiz in Redis
@@ -72,6 +69,9 @@ QUIZ_TTL_SECONDS = 1800  # 30 minutes
 
 # Maximum quiz history entries per student
 MAX_QUIZ_HISTORY = 200
+
+# JAMB check cooldown — 7 days between prompts
+JAMB_CHECK_COOLDOWN = 604800  # 7 days in seconds
 
 
 async def process_telegram_message(chat_id: int, text: str) -> None:
@@ -84,10 +84,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     3. Safety checks (child protection — MUST precede AI)
     4. Student lookup (registered or new)
     5. Route to: onboarding OR registered student handler
-    
-    Args:
-        chat_id: Telegram chat ID
-        text: Raw message text from user
     """
     # 1. Sanitize
     text = text.strip()[:4000]
@@ -96,7 +92,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
     logger.debug(f"Processing message from chat_id={chat_id}: {text[:100]}...")
 
-    # 2. Admin commands (MUST run first — bypasses all other logic)
+    # 2. Admin commands
     try:
         from admin.commands import handle_admin_command
         if await handle_admin_command(chat_id, text):
@@ -107,7 +103,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     except Exception as e:
         logger.error(f"Admin handler error for chat_id={chat_id}: {e}", exc_info=True)
 
-    # 3. Safety checks (child protection barrier)
+    # 3. Safety checks
     try:
         from brain.safety import run_safety_checks
         if await run_safety_checks(chat_id, text):
@@ -117,7 +113,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         logger.error(f"Safety module import failed: {e}")
     except Exception as e:
         logger.error(f"Safety check error for chat_id={chat_id}: {e}", exc_info=True)
-        # On safety failure, do NOT proceed to AI — block the message
         return
 
     # 4. Check if registered student
@@ -154,21 +149,26 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     Route a registered student's message to the appropriate handler.
     
     Priority:
-    1. Quiz answer (single letter, active quiz exists)
-    2. Quiz trigger (explicit quiz keywords — "quiz", "quiz me", "test me")
-    3. AI conversation (everything else)
-    
-    Args:
-        chat_id: Telegram chat ID
-        student: Student profile dict from database
-        text: Sanitized message text
+    1. JAMB ambition response (if Wax asked about university)
+    2. Quiz answer (single letter, active quiz exists)
+    3. Quiz trigger (explicit quiz keywords)
+    4. AI conversation (everything else)
     """
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
+    # 0. JAMB ambition response — student is replying to Wax's university question
+    try:
+        from database.onboarding_state import get_onboarding_state
+        jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
+        if jamb_state and jamb_state.get("awaiting_response_for") == "jamb_ambition":
+            await _handle_jamb_ambition_response(chat_id, student, text, student_id, jamb_state)
+            return
+    except Exception:
+        pass
+
     # 1. Quiz answer detection
-    # Check if single letter answer AND quiz is active
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -178,9 +178,8 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
                 return
         except Exception as e:
             logger.error(f"Redis quiz check failed for {student_id}: {e}", exc_info=True)
-            # Fall through to AI conversation rather than losing the message
 
-    # 2. Quiz trigger — FIXED: "question" removed, only "quiz", "quiz me", "test me"
+    # 2. Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
@@ -188,6 +187,252 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     # 3. AI conversation
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
+
+# ═══════════════════════════════════════════════
+# JAMB AMBITION HANDLER
+# ═══════════════════════════════════════════════
+
+async def _maybe_trigger_jamb_check(
+    student_id: str,
+    student: dict,
+    chat_id: int,
+    current_state: str
+) -> bool:
+    """
+    Check if it's the right moment to bring up the JAMB subject conversation.
+    
+    Conditions:
+    1. Student has completed at least 1 session (trust exists)
+    2. Student hasn't been asked recently (7-day cooldown)
+    3. Student is at a natural break (state is idle/chatting/ended/paused)
+    4. Student hasn't already declared a university ambition
+    
+    Returns True if Wax sent the JAMB message, False otherwise.
+    """
+    from database.conversations import get_student_memory
+
+    # Only at natural breaks — end of session, not mid-lesson
+    if current_state not in ("idle", "chatting", "ended", "paused"):
+        return False
+
+    # Check cooldown
+    cooldown_key = f"jamb_check_cooldown:{student_id}"
+    try:
+        if redis_client.get(cooldown_key):
+            return False
+    except Exception:
+        pass
+
+    # Get student memory
+    try:
+        memory = await get_student_memory(student_id)
+    except Exception:
+        memory = {}
+
+    # Has student completed at least 1 session?
+    sessions = memory.get("sessions_completed", 0)
+    if sessions < 1:
+        return False
+
+    # Has student already declared an ambition?
+    if student.get("university_ambition"):
+        return False
+
+    # All conditions met — bring it up
+    name = student.get("name", "Student").split()[0]
+
+    await send_telegram_message(
+        chat_id,
+        f"{name}, real quick before you go. I've been teaching you and you're "
+        f"making progress — that persistence is paying off. But I want to make "
+        f"sure I'm preparing you for the right thing.\n\n"
+        f"Have you thought about what you want to study in university? "
+        f"No pressure if you haven't figured it out yet. Just type your course "
+        f"or say 'not sure' — whatever is true."
+    )
+
+    # Set cooldown — don't ask again for 7 days
+    try:
+        redis_client.setex(cooldown_key, JAMB_CHECK_COOLDOWN, "1")
+    except Exception:
+        pass
+
+    # Save state so we know what the student is responding to
+    try:
+        from database.onboarding_state import save_onboarding_state
+        await save_onboarding_state("telegram", f"jamb_{student_id}", {
+            "awaiting_response_for": "jamb_ambition",
+            "name": student.get("name", ""),
+        })
+    except Exception:
+        pass
+
+    return True
+
+
+async def _handle_jamb_ambition_response(
+    chat_id: int,
+    student: dict,
+    text: str,
+    student_id: str,
+    jamb_state: dict
+) -> None:
+    """
+    Process the student's response to Wax's university ambition question.
+    
+    Three paths:
+    1. Student knows their course → run JAMB check
+    2. Student doesn't know → accept, promise to help later
+    3. Student already told us → reference existing ambition
+    """
+    from content.jamb_checker import check_jamb_readiness, resolve_course
+    from database.onboarding_state import clear_onboarding_state
+
+    name = student.get("name", "Student").split()[0]
+    msg = text.strip()
+
+    # Clear the JAMB state — we're handling the response now
+    try:
+        await clear_onboarding_state("telegram", f"jamb_{student_id}")
+    except Exception:
+        pass
+
+    # Path 2: Student doesn't know
+    dont_know = ["not sure", "i don't know", "i dont know", "idk", "haven't thought", "not yet", "undecided"]
+    if msg.lower() in dont_know or any(phrase in msg.lower() for phrase in dont_know):
+        await send_telegram_message(
+            chat_id,
+            f"No wahala. Plenty of SS3 students are still figuring it out. "
+            f"I was the same. Here's what I'll do — as we keep studying, I'll "
+            f"pay attention to what you're naturally good at and what you enjoy. "
+            f"After a few more sessions, I might have some suggestions for you. Sound good?"
+        )
+        # Save that student was asked but doesn't know yet
+        try:
+            from database.students import update_student
+            await update_student(student_id, {"university_ambition_status": "undecided"})
+        except Exception:
+            pass
+        return
+
+    # Resolve the course
+    course_key = resolve_course(msg)
+    if not course_key:
+        await send_telegram_message(
+            chat_id,
+            f"I don't have data for '{msg}' yet. Can you try a different "
+            f"course name? Or tell me the official JAMB name — I'll look it up."
+        )
+        return
+
+    # Run the check
+    result = check_jamb_readiness(
+        student_subjects=student.get("subjects", []),
+        desired_course=msg
+    )
+
+    if result.get("error"):
+        await send_telegram_message(
+            chat_id,
+            result.get("message", "I couldn't check that course. Can you try a different name?")
+        )
+        return
+
+    # Path 1: Match found — celebrate!
+    if result["ready"]:
+        course_display = result["course_display"]
+        have_list = "\n".join([f"✅ {s}" for s in result["have"]])
+        
+        await send_telegram_message(
+            chat_id,
+            f"{name}! Your subjects line up perfectly for {course_display}.\n\n"
+            f"{have_list}\n\n"
+            f"You're on track. Want me to put together a celebration card? "
+            f"It's got your name and your achievement on it. Some students "
+            f"send it to their friends. No pressure either way."
+        )
+
+        # Save the ambition
+        try:
+            from database.students import update_student
+            await update_student(student_id, {
+                "university_ambition": course_display,
+                "university_ambition_status": "matched",
+                "jamb_readiness_checked_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
+        return
+
+    # Path 1b: Mismatch — be honest but offer alternatives
+    missing_list = []
+    for m in result["missing"]:
+        if isinstance(m, dict):
+            if m.get("alternatives"):
+                alt_text = " or ".join(m["alternatives"])
+                missing_list.append(f"❌ {m['preferred']} (or {alt_text})")
+            else:
+                missing_list.append(f"❌ {m['preferred']}")
+        else:
+            missing_list.append(f"❌ {m}")
+
+    missing_text = "\n".join(missing_list)
+    have_text = "\n".join([f"✅ {s}" for s in result["have"]])
+    
+    alternatives = result.get("alternatives", [])
+    
+    # Build the mismatch message
+    message = (
+        f"{name}, I need to be straight with you. {result['course_display']} "
+        f"requires specific subjects — and you're missing some.\n\n"
+        f"What you have:\n{have_text}\n\n"
+        f"What's missing:\n{missing_text}"
+    )
+
+    if result.get("notes"):
+        message += f"\n\n{result['notes']}"
+
+    # Add the "not your fault" beat
+    message += (
+        f"\n\nAnd {name}? This doesn't mean you're not smart enough for "
+        f"{result['course_display']}. It means nobody told you earlier what "
+        f"you needed — and that's not your fault. What matters now is what "
+        f"you do with this information."
+    )
+
+    # Add alternatives if available
+    if alternatives:
+        alt_names = [a["display"] for a in alternatives[:3]]
+        alt_text = ", ".join(alt_names)
+        message += (
+            f"\n\nBut here's the thing — you're already on track for {alt_text} "
+            f"with the subjects you have right now. Want to explore any of those? "
+            f"Or do you want to figure out how to add the missing subjects before "
+            f"JAMB registration?"
+        )
+    else:
+        message += (
+            f"\n\nWant to explore what courses DO match your subjects? "
+            f"Or do you want to figure out how to add the missing subjects?"
+        )
+
+    await send_telegram_message(chat_id, message)
+
+    # Save the result
+    try:
+        from database.students import update_student
+        await update_student(student_id, {
+            "university_ambition": result["course_display"],
+            "university_ambition_status": "mismatched",
+            "jamb_readiness_checked_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════
+# AI CONVERSATION HANDLER
+# ═══════════════════════════════════════════════
 
 async def _handle_ai_conversation(
     chat_id: int,
@@ -198,17 +443,7 @@ async def _handle_ai_conversation(
 ) -> None:
     """
     Process a student message through the AI brain, with memory context.
-    
-    Saves a session snapshot after AI responses — but only when there's
-    a real conversation (2+ user messages). Prevents "Last time we didn't
-    cover anything" for brand new students.
-    
-    Args:
-        chat_id: Telegram chat ID
-        student: Student profile dict
-        text: Sanitized message text
-        student_id: String student ID (pre-extracted for reuse)
-        name: Student's first name (pre-extracted for reuse)
+    Triggers JAMB checker at natural moments.
     """
     from ai.brain import think
     from brain.state import get_state, set_state
@@ -219,7 +454,6 @@ async def _handle_ai_conversation(
         await save_message(student_id, "user", text)
     except Exception as e:
         logger.error(f"Failed to save user message for {student_id}: {e}", exc_info=True)
-        # Continue anyway — don't block the student
 
     # Load conversation history
     try:
@@ -237,7 +471,7 @@ async def _handle_ai_conversation(
         logger.error(f"Failed to load state for {student_id}: {e}", exc_info=True)
         current_state = "idle"
 
-    # Determine recent subject (prefer the one the student has been discussing)
+    # Determine recent subject
     recent_subject = _infer_recent_subject(student, conversation_history)
 
     # Build memory context
@@ -245,7 +479,7 @@ async def _handle_ai_conversation(
         context_str = await _build_memory_context(student_id)
     except Exception as e:
         logger.error(f"Memory context build failed for {student_id}: {e}", exc_info=True)
-        context_str = ""  # Graceful degradation — AI works without memory
+        context_str = ""
 
     # Determine practice mode
     is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
@@ -264,7 +498,7 @@ async def _handle_ai_conversation(
         logger.error(f"AI brain error for {student_id}: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
-    # Run output safety check before sending
+    # Output safety check
     try:
         from brain.safety import check_output_safety
         if await check_output_safety(response):
@@ -287,19 +521,15 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Failed to send message to chat_id={chat_id}: {e}", exc_info=True)
 
-    # ── Save session snapshot ──
-    # FIXED (Bug #4): Only save if there's a real conversation (2+ user messages).
-    # Prevents "Last time we didn't cover anything" for brand new students.
+    # Save session snapshot
     try:
         from database.conversations import save_session_summary
 
-        # Count user messages in recent history (excluding current)
         user_msg_count = sum(
             1 for m in conversation_history[-10:]
             if m.get("role") == "user"
         )
 
-        # Only save snapshot if student has had at least 2 exchanges
         if user_msg_count >= 2:
             session_subject = recent_subject or "unknown"
             session_topic = "discussed"
@@ -344,21 +574,16 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"State update failed for {student_id}: {e}", exc_info=True)
 
+    # ── JAMB Check: bring up university ambition at natural moment ──
+    await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
+
+
+# ═══════════════════════════════════════════════
+# SUBJECT INFERENCE
+# ═══════════════════════════════════════════════
 
 def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Dict]) -> Optional[str]:
-    """
-    Infer what subject the student is currently discussing.
-    
-    Priority:
-    1. Last assistant message that mentioned a subject
-    2. Student's trouble subject (flagged during onboarding)
-    3. Student's first subject in profile
-    4. None
-    
-    Returns:
-        Subject name string or None
-    """
-    # Scan last few assistant messages for subject mentions
+    """Infer what subject the student is currently discussing."""
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
@@ -367,14 +592,10 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
                 if subject_display.lower() in content.lower():
                     return subject
 
-    # Fallback: student's trouble subject (from onboarding)
-    # FIXED (Bug #2): This now correctly prioritizes the subject they said
-    # gives them trouble — even when they say "anything" or "you pick"
     trouble_subject = student.get("student_subject")
     if trouble_subject:
         return trouble_subject
 
-    # Next fallback: first subject from profile
     subjects = student.get("subjects", [])
     if subjects and subjects[0]:
         return subjects[0]
@@ -387,26 +608,11 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
 # ═══════════════════════════════════════════════
 
 async def _build_memory_context(student_id: str) -> str:
-    """
-    Build memory context for the AI prompt.
-    
-    Fetches last session summary and persistent student memory,
-    formats them into a concise context string for the AI.
-    
-    Returns empty string if no memory exists (new student).
-    This is intentional — the AI prompt handles empty context gracefully.
-    
-    Args:
-        student_id: String student identifier
-        
-    Returns:
-        Formatted memory context string, or empty string
-    """
+    """Build memory context for the AI prompt."""
     from database.conversations import get_session_summary, get_student_memory
 
     context_parts: List[str] = []
 
-    # 1. Last session summary
     try:
         last_session = await get_session_summary(student_id)
     except Exception as e:
@@ -420,7 +626,6 @@ async def _build_memory_context(student_id: str) -> str:
         score = last_session.get("score")
         struggled = last_session.get("struggled_with", [])
 
-        # Only include if there's actual content (not default/empty values)
         has_content = (
             subject not in ("unknown", "a subject", "") and
             topic not in ("unknown", "a topic", "")
@@ -440,7 +645,6 @@ async def _build_memory_context(student_id: str) -> str:
 
             context_parts.append(session_line)
 
-    # 2. Persistent student memory
     try:
         memory = await get_student_memory(student_id)
     except Exception as e:
@@ -455,17 +659,11 @@ async def _build_memory_context(student_id: str) -> str:
         pace = memory.get("preferred_pace")
 
         if struggles:
-            context_parts.append(
-                f"STUDENT STRUGGLES WITH: {', '.join(struggles[-5:])}."
-            )
+            context_parts.append(f"STUDENT STRUGGLES WITH: {', '.join(struggles[-5:])}.")
         if strengths:
-            context_parts.append(
-                f"STUDENT IS STRONG IN: {', '.join(strengths[-5:])}."
-            )
+            context_parts.append(f"STUDENT IS STRONG IN: {', '.join(strengths[-5:])}.")
         if mastered:
-            context_parts.append(
-                f"TOPICS MASTERED: {', '.join(mastered[-5:])}."
-            )
+            context_parts.append(f"TOPICS MASTERED: {', '.join(mastered[-5:])}.")
         if sessions_count > 0:
             context_parts.append(f"Sessions completed: {sessions_count}.")
         if pace:
@@ -481,24 +679,11 @@ async def _build_memory_context(student_id: str) -> str:
 # QUIZ ENGINE
 # ═══════════════════════════════════════════════
 
-# Track selection for fairness (avoid repeating same subject)
-_QUIZ_TRACKER: Dict[str, List[str]] = {}  # student_id → recently used subjects
+_QUIZ_TRACKER: Dict[str, List[str]] = {}
 
 
 async def _load_questions(subject: str) -> List[Dict[str, Any]]:
-    """
-    Load quiz questions for a subject with layered fallback.
-    
-    Order: Database (Supabase) → JSON file cache → Empty list
-    
-    Questions are cached in memory for 5 minutes to reduce database load.
-    
-    Args:
-        subject: Database subject identifier (e.g., "mathematics", "government")
-        
-    Returns:
-        List of question dicts, empty list if no questions found
-    """
+    """Load quiz questions for a subject with layered fallback."""
     cache_key = f"questions_cache:{subject}"
     try:
         cached = redis_client.get(cache_key)
@@ -555,17 +740,7 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
 
 
 async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "") -> None:
-    """
-    Start a quiz session for the student.
-    
-    Selects a subject using fairness rotation, OR extracts subject
-    from the student's message if specified.
-    
-    Args:
-        chat_id: Telegram chat ID
-        student: Student profile dict
-        message_text: The student's original message (to extract subject from)
-    """
+    """Start a quiz session for the student."""
     student_id = str(student["id"])
     student_subjects = student.get("subjects", [])
     student_track = _infer_track(student_subjects)
@@ -587,7 +762,6 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     else:
         subjects_pool = student_subjects.copy()
 
-    # Extract subject from message if specified
     requested_subject = None
     if message_text:
         msg_lower = message_text.lower()
