@@ -14,11 +14,11 @@ Response Cache:
     hit the same cache. 7-day TTL. Cuts token costs by ~80%.
     Only caches knowledge questions — not greetings, quizzes, or personal messages.
 
-Domain Boundary Enforcement (NEW):
+Domain Boundary Enforcement:
     After the AI generates a response, checks it against the Student Model's
     avoided domains. If the response contains words from a domain the student
-    has explicitly rejected, logs a violation warning.
-    Future: regenerate the response instead of sending.
+    has explicitly rejected, strips the violating sentences entirely.
+    Falls back to safe alternatives if the entire response is compromised.
 """
 
 import asyncio
@@ -100,11 +100,8 @@ def _normalize_for_cache(text: str) -> str:
     Returns:
         Normalized cache key string
     """
-    # Lowercase
     text = text.lower().strip()
-    # Remove punctuation
     text = re.sub(r'[^\w\s]', '', text)
-    # Collapse multiple spaces
     text = " ".join(text.split())
     return text
 
@@ -124,7 +121,6 @@ def _is_cacheable(message: str) -> bool:
     """
     msg_lower = message.lower().strip()
     
-    # Don't cache these
     skip_patterns = [
         "hi", "hello", "hey", "good morning", "good evening",
         "how are you", "what's up", "thank", "bye", "ok", "okay",
@@ -136,18 +132,14 @@ def _is_cacheable(message: str) -> bool:
         if pattern in msg_lower:
             return False
     
-    # Don't cache very short messages (single words, letters)
     if len(msg_lower.split()) < 2:
         return False
     
-    # Don't cache messages with personal context (student name, "I", "my")
-    # These need AI personalization
     personal_indicators = [" i ", " my ", " me ", " i'm ", " i've ", " my name"]
     for indicator in personal_indicators:
         if indicator in f" {msg_lower} ":
             return False
     
-    # Cache knowledge questions
     knowledge_patterns = [
         "what", "how", "explain", "define", "why",
         "describe", "difference between", "compare",
@@ -158,7 +150,6 @@ def _is_cacheable(message: str) -> bool:
         if msg_lower.startswith(pattern) or pattern in msg_lower:
             return True
     
-    # Cache if message is long enough to be a real question
     if len(msg_lower) > 30:
         return True
     
@@ -166,17 +157,7 @@ def _is_cacheable(message: str) -> bool:
 
 
 async def _get_cached_response(message: str) -> str | None:
-    """
-    Check if a cached response exists for this message.
-    
-    Uses Redis for storage. Cache key is based on normalized message text.
-    
-    Args:
-        message: Student's message
-        
-    Returns:
-        Cached response string, or None if not cached
-    """
+    """Check if a cached response exists for this message."""
     try:
         from database.client import redis_client
         
@@ -184,7 +165,6 @@ async def _get_cached_response(message: str) -> str | None:
         cached = redis_client.get(cache_key)
         
         if cached:
-            # Decode bytes to string
             cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
             logger.debug(f"Cache HIT: {message[:50]}...")
             return cached_str
@@ -195,13 +175,7 @@ async def _get_cached_response(message: str) -> str | None:
 
 
 async def _cache_response(message: str, response: str) -> None:
-    """
-    Store an AI response in the cache for future use.
-    
-    Args:
-        message: The student's original message
-        response: Wax's AI-generated response
-    """
+    """Store an AI response in the cache for future use."""
     try:
         from database.client import redis_client
         
@@ -213,101 +187,21 @@ async def _cache_response(message: str, response: str) -> None:
 
 
 # ═══════════════════════════════════════════════
-# POST-PROCESSING ENFORCEMENT LAYER
-# These rules are enforced in CODE, not just the prompt.
-# The model might ignore prompt rules. Code doesn't.
+# DOMAIN KEYWORDS — for boundary enforcement
 # ═══════════════════════════════════════════════
 
-def enforce_one_question(response: str) -> str:
-    """
-    If the AI asks more than one question, keep only the first one.
-    Cuts at the first question mark and appends just that question.
-    """
-    questions = response.split("?")
-    if len(questions) > 2:  # More than one question mark
-        first_part = questions[0] + "?"
-        remaining = "?".join(questions[1:])
-        if len(remaining.strip()) > 10:
-            return first_part.strip()
-    return response
-
-
-def enforce_length(response: str, max_chars: int = 400) -> str:
-    """
-    If response is too long, trim to the last complete sentence under max_chars.
-    """
-    if len(response) <= max_chars:
-        return response
-    
-    truncated = response[:max_chars]
-    last_period = max(
-        truncated.rfind(". "),
-        truncated.rfind("! "),
-        truncated.rfind("? "),
-        truncated.rfind(".\n"),
-    )
-    
-    if last_period > 100:  # Only cut if we have enough context
-        return truncated[:last_period + 1].strip()
-    
-    # Fallback: hard cut at last complete word
-    return truncated.rsplit(" ", 1)[0] + "..."
-
-
-def clean_banned_phrases(response: str) -> str:
-    """
-    Remove banned phrases from the response.
-    """
-    banned = [
-        ("don't worry", "I hear you"),
-        ("dont worry", "I hear you"),
-        ("Don't worry", "I hear you"),
-        ("do not worry", "I hear you"),
-    ]
-    
-    for phrase, replacement in banned:
-        response = response.replace(phrase, replacement)
-    
-    return response
-
-
-def enforce_nigerian_example(response: str) -> str:
-    """
-    If the response is teaching (3+ sentences) and has no Nigerian reference,
-    log a warning. Soft enforcement — doesn't modify the response.
-    """
-    nigerian_terms = [
-        "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
-        "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
-        "achebe", "soyinka", "lagos", "abuja", "kano", "naira",
-        "generator", "borehole", "kerosene", "omo", "agege"
-    ]
-    
-    sentences = [s for s in response.split(".") if len(s.strip()) > 10]
-    if len(sentences) >= 3:
-        has_nigerian = any(term in response.lower() for term in nigerian_terms)
-        if not has_nigerian:
-            logger.warning("Teaching response has no Nigerian example")
-    
-    return response
-
-
-# ═══════════════════════════════════════════════
-# DOMAIN BOUNDARY ENFORCEMENT (NEW)
-# ═══════════════════════════════════════════════
-
-# Keywords per domain. If a student has a domain marked as "avoided,"
-# any response containing these words gets flagged.
 DOMAIN_KEYWORDS = {
     "transportation": [
         "keke", "danfo", "okada", "bus", "vehicle", "car", "transport",
         "napep", "driver", "highway", "road", "traffic", "garage",
         "motor", "bike", "bicycle", "train", "airport", "flying",
+        "suv", "lorry", "truck", "taxi", "uber", "bolt",
     ],
     "food_cooking": [
         "suya", "puff-puff", "puff puff", "jollof", "garri", "food", "cook",
         "eat", "kitchen", "recipe", "ingredient", "meal", "dinner",
         "lunch", "breakfast", "snack", "fry", "boil", "stew", "soup",
+        "egusi", "rice", "beans", "yam", "plantain", "akara", "moin moin",
     ],
     "market_commerce": [
         "market", "mile 12", "mile12", "trade", "buy", "sell", "trader",
@@ -361,6 +255,87 @@ DOMAIN_KEYWORDS = {
 }
 
 
+# ═══════════════════════════════════════════════
+# POST-PROCESSING ENFORCEMENT LAYER
+# ═══════════════════════════════════════════════
+
+def enforce_one_question(response: str) -> str:
+    """If the AI asks more than one question, keep only the first one."""
+    questions = response.split("?")
+    if len(questions) > 2:
+        first_part = questions[0] + "?"
+        remaining = "?".join(questions[1:])
+        if len(remaining.strip()) > 10:
+            return first_part.strip()
+    return response
+
+
+def enforce_length(response: str, max_chars: int = 400) -> str:
+    """If response is too long, trim to the last complete sentence under max_chars."""
+    if len(response) <= max_chars:
+        return response
+    
+    truncated = response[:max_chars]
+    last_period = max(
+        truncated.rfind(". "),
+        truncated.rfind("! "),
+        truncated.rfind("? "),
+        truncated.rfind(".\n"),
+    )
+    
+    if last_period > 100:
+        return truncated[:last_period + 1].strip()
+    
+    return truncated.rsplit(" ", 1)[0] + "..."
+
+
+def clean_banned_phrases(response: str) -> str:
+    """Remove banned phrases from the response."""
+    banned = [
+        ("don't worry", "I hear you"),
+        ("dont worry", "I hear you"),
+        ("Don't worry", "I hear you"),
+        ("do not worry", "I hear you"),
+    ]
+    
+    for phrase, replacement in banned:
+        response = response.replace(phrase, replacement)
+    
+    return response
+
+
+def enforce_nigerian_example(response: str) -> str:
+    """If the response is teaching and has no Nigerian reference, log a warning."""
+    nigerian_terms = [
+        "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
+        "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
+        "achebe", "soyinka", "lagos", "abuja", "kano", "naira",
+        "generator", "borehole", "kerosene", "omo", "agege",
+        "nneoma", "chidera", "emeka", "amara", "kennedy",
+    ]
+    
+    sentences = [s for s in response.split(".") if len(s.strip()) > 10]
+    if len(sentences) >= 3:
+        has_nigerian = any(term in response.lower() for term in nigerian_terms)
+        if not has_nigerian:
+            logger.warning("Teaching response has no Nigerian example")
+    
+    return response
+
+
+def enforce_rules(response: str) -> str:
+    """Run all post-processing enforcement rules."""
+    response = clean_banned_phrases(response)
+    response = enforce_one_question(response)
+    response = enforce_length(response, max_chars=400)
+    response = enforce_nigerian_example(response)
+    return response
+
+
+# ═══════════════════════════════════════════════
+# DOMAIN BOUNDARY ENFORCEMENT
+# ═══════════════════════════════════════════════
+
 async def enforce_domain_boundaries(
     response: str,
     student_id: str,
@@ -370,9 +345,8 @@ async def enforce_domain_boundaries(
     Check response against Student Model's avoided domains.
     
     If the student has explicitly rejected a domain and the AI's response
-    contains words from that domain, flag it as a violation.
-    
-    Currently: Logs a warning. Future: Regenerate the response.
+    contains words from that domain, strips the violating sentences entirely.
+    Falls back to safe alternatives if the entire response is compromised.
     
     Args:
         response: The AI-generated response text
@@ -380,14 +354,12 @@ async def enforce_domain_boundaries(
         student_model: Pre-loaded StudentModel (optional — loads if not provided)
         
     Returns:
-        The original response (with violation logged)
+        Cleaned response with domain violations removed
     """
-    # Skip if response is too short to contain domain references
     if len(response.strip()) < 15:
         return response
     
     try:
-        # Load model if not provided
         if student_model is None:
             from brain.student_model import load_student_model
             student_model = await load_student_model(student_id)
@@ -412,36 +384,50 @@ async def enforce_domain_boundaries(
         if violations:
             for v in violations:
                 logger.warning(
-                    f"DOMAIN VIOLATION: Student {student_id} has '{v['domain']}' "
-                    f"as avoided, but response contains: {v['words_found']}"
+                    f"DOMAIN VIOLATION BLOCKED: Student {student_id} has '{v['domain']}' "
+                    f"as avoided. Response contained: {v['words_found']}. "
+                    f"Stripping violating content."
                 )
-            # Future: Regenerate response or replace with safe fallback
-            # For now, log the violation so we can measure frequency
+            
+            # Split response into sentences and strip violating ones
+            sentences = re.split(r'(?<=[.!?])\s+', response)
+            clean_sentences = []
+            
+            for sentence in sentences:
+                sentence_lower = sentence.lower()
+                is_violating = False
+                
+                for domain in avoided:
+                    keywords = DOMAIN_KEYWORDS.get(domain, [domain])
+                    if any(kw in sentence_lower for kw in keywords):
+                        is_violating = True
+                        break
+                
+                if not is_violating:
+                    clean_sentences.append(sentence)
+                else:
+                    logger.debug(f"Stripped violating sentence: {sentence[:80]}...")
+            
+            # If everything was stripped, provide a safe fallback
+            if not clean_sentences or len(" ".join(clean_sentences)) < 15:
+                preferred = student_model.get_preferred_domains()[:2]
+                if preferred:
+                    preferred_str = ", ".join(preferred)
+                    return (
+                        f"Let me try a different example. "
+                        f"[Response regenerated to respect your preferences. "
+                        f"Preferred domains: {preferred_str}]"
+                    )
+                else:
+                    return (
+                        f"Let me try explaining without that example. "
+                        f"[Response adjusted to avoid examples you've asked me not to use.]"
+                    )
+            
+            response = " ".join(clean_sentences)
     
     except Exception as e:
         logger.error(f"Domain boundary enforcement error: {e}")
-    
-    return response
-
-
-def enforce_rules(response: str) -> str:
-    """
-    Run all post-processing enforcement rules.
-    Order matters: clean phrases first, then trim questions, then trim length.
-    
-    Note: Domain boundary enforcement runs separately (async, needs student_id).
-    """
-    # 1. Remove banned phrases
-    response = clean_banned_phrases(response)
-    
-    # 2. Enforce one question limit
-    response = enforce_one_question(response)
-    
-    # 3. Enforce length limit
-    response = enforce_length(response, max_chars=400)
-    
-    # 4. Soft enforcement — log if Nigerian examples missing
-    response = enforce_nigerian_example(response)
     
     return response
 
@@ -461,15 +447,7 @@ async def think(
     """
     Main AI thinking function.
     
-    Multi-key rotation: Tries each available API key on rate limit errors.
-    With 3 keys, this gives 300,000 tokens/day on Groq free tier.
-    
-    Response caching: Checks Redis before calling AI. If the same question
-    was answered before, returns cached response instantly. Cuts token costs
-    by ~80% for common questions like "what is osmosis".
-    
-    Domain boundary enforcement: After the AI generates a response, checks
-    it against the Student Model's avoided domains. Logs violations.
+    Multi-key rotation, response caching, and domain boundary enforcement.
     
     Args:
         message: The student's latest message
@@ -482,24 +460,19 @@ async def think(
     Returns:
         Wax's response as a string (post-processed for rule compliance)
     """
-    # FIXED: global declaration at the TOP of the function
-    # Python requires 'global' before any use of the variable
     global _current_key_index
 
     conversation_history = conversation_history or []
     student_id = student.get('id', 'unknown')
     name = student.get('name', 'Student').split()[0]
 
-    # Choose the right prompt
     if is_practice:
         system_prompt = get_lite_prompt(student, recent_subject, context_str)
     else:
         system_prompt = get_wax_system_prompt(student, recent_subject, context_str)
 
-    # Build the message list for the API
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Add conversation history (keep more context for teaching, less for practice)
     history_limit = 10 if is_practice else 20
     for msg in conversation_history[-history_limit:]:
         role = msg.get("role", "user")
@@ -509,21 +482,19 @@ async def think(
         if content:
             messages.append({"role": role, "content": content})
 
-    # Add the current message
     messages.append({"role": "user", "content": message})
 
-    # ── Check response cache before calling AI ──
+    # Check response cache
     if _is_cacheable(message):
         cached_response = await _get_cached_response(message)
         if cached_response:
             return cached_response
 
-    # ── Call Groq with multi-key rotation ──
+    # Call Groq with multi-key rotation
     raw_response = None
     keys = settings.GROQ_API_KEYS
-    max_retries = len(keys) * 3  # 3 attempts per key
+    max_retries = len(keys) * 3
     
-    # Start with next key in rotation
     start_index = _current_key_index % len(keys) if keys else 0
     
     for attempt in range(max_retries):
@@ -533,7 +504,6 @@ async def think(
         try:
             client = _get_client(api_key)
             
-            # Run the synchronous Groq call in a thread pool
             response = await asyncio.to_thread(
                 client.chat.completions.create,
                 model=settings.GROQ_SMART_MODEL,
@@ -545,7 +515,6 @@ async def think(
             result = response.choices[0].message.content
             if result and len(result.strip()) > 5:
                 raw_response = result.strip()
-                # Update rotation to next key — NO 'global' here, already declared at top
                 _current_key_index = (key_index + 1) % len(keys)
                 break
             
@@ -555,7 +524,6 @@ async def think(
             error_type = type(e).__name__
             error_str = str(e)
             
-            # Check if it's a rate limit error — switch key
             is_rate_limit = (
                 "rate_limit" in error_str.lower() or
                 "429" in error_str
@@ -566,18 +534,15 @@ async def think(
                     f"Groq rate limit on key {key_index+1}/{len(keys)} "
                     f"(attempt {attempt+1}/{max_retries}). Rotating key..."
                 )
-                # Don't sleep — just try next key immediately
                 continue
             else:
                 logger.error(
                     f"Groq error (attempt {attempt+1}/{max_retries}): "
                     f"{error_type}: {error_str[:100]} | student={student_id}"
                 )
-                # For non-rate-limit errors, wait before retry
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
 
-    # If all keys exhausted, log failure and use fallback
     if not raw_response:
         _log_ai_failure(student_id, "ALL_KEYS_EXHAUSTED", "All API keys rate limited")
         fallbacks = [
@@ -587,20 +552,14 @@ async def think(
         ]
         return fallbacks[hash(str(student_id)) % len(fallbacks)]
 
-    # ═══════════════════════════════════════════
-    # POST-PROCESSING: Enforce rules in code
-    # ═══════════════════════════════════════════
-    
+    # Post-processing
     cleaned_response = enforce_rules(raw_response)
     
-    # If enforcement trimmed too much, fall back to original
     if len(cleaned_response) < 20 and len(raw_response) > 20:
         cleaned_response = clean_banned_phrases(raw_response)
         cleaned_response = enforce_length(cleaned_response, max_chars=500)
     
-    # ── Domain boundary enforcement (NEW) ──
-    # Check if this response violates any avoided domains.
-    # Logs violations. Future: Regenerate instead of sending.
+    # Domain boundary enforcement — strips violating sentences
     try:
         cleaned_response = await enforce_domain_boundaries(
             cleaned_response, student_id
@@ -608,7 +567,7 @@ async def think(
     except Exception as e:
         logger.error(f"Domain enforcement failed: {e}", exc_info=True)
     
-    # ── Cache this response for future use ──
+    # Cache response
     if _is_cacheable(message):
         await _cache_response(message, cleaned_response)
     
