@@ -19,6 +19,9 @@ until the student confirms understanding.
 
 Now with Student Model — Wax learns HOW each student learns. Teaching style,
 example domains, communication style, and competence map adapt over time.
+
+Now with Preference Detection — statements like "I don't like market examples"
+or "I prefer short definitions" are routed to AI, not intercepted by deferral.
 """
 import asyncio
 import hashlib
@@ -38,10 +41,22 @@ logger = logging.getLogger("waxprep.handler")
 QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
 
 # ── Deferral keywords ─────────────────────────
+# FIXED: These are ONLY for subject-choice deflection.
+# Preference statements ("I prefer X", "I don't like Y") are NOT deferral.
 DEFERRAL_KEYWORDS = [
     "anything", "you pick", "any one", "whatever",
     "up to you", "choose for me", "i don't know what to study",
     "i don't care", "surprise me",
+]
+
+# ── Preference keywords ───────────────────────
+# These indicate the student is stating a preference, not deflecting.
+# They should NEVER trigger the deferral handler.
+PREFERENCE_KEYWORDS = [
+    "i prefer", "i don't like", "i dont like", "i like",
+    "use something from", "don't use", "dont use",
+    "stop using", "no more", "i changed my mind",
+    "instead of", "rather than", "not that",
 ]
 
 # ── Session end keywords ─────────────────────
@@ -156,11 +171,22 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
-    """Route a registered student's message to the appropriate handler."""
+    """
+    Route a registered student's message to the appropriate handler.
+    
+    Priority:
+    0. JAMB ambition response
+    0.3. Session end keywords
+    0.5. Deferral keywords (BUT NOT preference statements)
+    1. Quiz answer
+    2. Quiz trigger
+    3. AI conversation
+    """
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
+    # 0. JAMB ambition response
     try:
         from database.onboarding_state import get_onboarding_state
         jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
@@ -170,14 +196,22 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
+    # 0.3. Session end keywords
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
-    if any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS):
+    # 0.5. Deferral keywords — BUT skip if it's a preference statement
+    # FIXED: "I don't like market examples" is a preference, not a deferral.
+    # "I prefer short definitions" is a preference, not a deferral.
+    is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
+    is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
+    
+    if is_deferral and not is_preference:
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
+    # 1. Quiz answer detection
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -188,10 +222,12 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         except Exception:
             pass
 
+    # 2. Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
 
+    # 3. AI conversation — handles preferences, teaching style changes, domain requests
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
@@ -305,7 +341,7 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
 async def _handle_deferral(
     chat_id: int, student: dict, student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle when a student defers."""
+    """Handle when a student defers — ONLY for subject-choice deflection."""
     from database.conversations import save_message
 
     trouble_subject = student.get("student_subject")
@@ -522,7 +558,6 @@ async def _handle_ai_conversation(
         context_str = ""
 
     # ── Load Student Model ──
-    # FIXED: _pending_model_update defined OUTSIDE try block for post-response access
     _pending_model_update = None
 
     if _student_model_available:
@@ -541,7 +576,6 @@ async def _handle_ai_conversation(
             logger.error(f"Student model load failed: {e}", exc_info=True)
 
     # ── Confusion Detection ──
-    # FIXED: _pending_confusion_reset defined OUTSIDE try block
     _pending_confusion_reset = False
 
     if _confusion_detector_available:
@@ -645,7 +679,6 @@ async def _handle_ai_conversation(
         pass
 
     # ── Update Student Model ──
-    # FIXED: Uses _pending_model_update from earlier load
     if _pending_model_update is not None and _student_model_available:
         try:
             session_signals = _extract_session_signals(
@@ -708,6 +741,11 @@ def _extract_session_signals(
         signals["teaching_style"]["definitions"] = signals["teaching_style"].get("definitions", 0) + 0.3
     if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
         signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
+    # FIXED: "I changed my mind" + request for example = shift toward examples
+    if any(phrase in msg_lower for phrase in ["i changed my mind"]) and any(
+        phrase in msg_lower for phrase in ["example", "show me"]
+    ):
+        signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.25
 
     if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
         if any(word in resp_lower for word in ["example", "imagine", "think of"]):
@@ -719,18 +757,24 @@ def _extract_session_signals(
         signals["teaching_style"]["socratic"] = signals["teaching_style"].get("socratic", 0) + 0.15
 
     # ── Example Domain Signals ──
+    # FIXED: Added explicit domain rejection phrases that students actually use
     domain_patterns = {
-        "transportation": ["keke", "danfo", "okada", "bus", "car", "vehicle", "suv"],
-        "food_cooking": ["suya", "puff-puff", "jollof", "garri", "food", "eat", "cook"],
-        "market_commerce": ["market", "mile 12", "buy", "sell", "trader", "price"],
-        "technology": ["phone", "app", "game", "download", "internet", "computer"],
-        "school_classroom": ["teacher", "class", "textbook", "exam", "school"],
-        "home_domestic": ["generator", "nepa", "fan", "tap", "light", "water"],
-        "body_physical": ["breathe", "heart", "run", "walk", "body", "hand"],
-        "nature_environment": ["rain", "sun", "wind", "plant", "tree", "river"],
+        "transportation": ["keke", "danfo", "okada", "bus", "car", "vehicle", "suv", "transport"],
+        "food_cooking": ["suya", "puff-puff", "puff puff", "jollof", "garri", "food", "eat", "cook", "cooking"],
+        "market_commerce": ["market", "mile 12", "mile12", "buy", "sell", "trader", "price", "trading", "bargain"],
+        "technology": ["phone", "app", "game", "download", "internet", "computer", "tech"],
+        "school_classroom": ["teacher", "class", "textbook", "exam", "school", "classroom"],
+        "home_domestic": ["generator", "nepa", "fan", "tap", "light", "water", "home", "backyard", "house"],
+        "body_physical": ["breathe", "heart", "run", "walk", "body", "hand", "breathing"],
+        "nature_environment": ["rain", "sun", "wind", "plant", "tree", "river", "cassava", "garden"],
     }
 
-    rejection_phrases = ["i don't", "i dont", "never", "i have never", "i haven't"]
+    rejection_phrases = [
+        "i don't", "i dont", "never", "i have never", "i haven't",
+        "don't use", "dont use", "stop using", "no more", "i don't like",
+        "i dont like", "not that", "i hate",
+    ]
+    
     for domain, keywords in domain_patterns.items():
         if any(kw in msg_lower for kw in keywords):
             if any(phrase in msg_lower for phrase in rejection_phrases):
@@ -738,6 +782,15 @@ def _extract_session_signals(
             else:
                 signals["example_domains"][domain] = "preferred"
 
+    # FIXED: Also check for explicit domain requests
+    # "use something from home" → home_domestic preferred
+    for domain, keywords in domain_patterns.items():
+        if any(kw in msg_lower for kw in keywords):
+            if any(phrase in msg_lower for phrase in ["use something from", "use a", "give me a", "something about"]):
+                if domain not in signals["example_domains"]:
+                    signals["example_domains"][domain] = "preferred"
+
+    # Check if Wax used a domain and student responded positively
     for domain, keywords in domain_patterns.items():
         if any(kw in resp_lower for kw in keywords):
             if any(phrase in msg_lower for phrase in ["yes", "ok", "right", "get it", "understand", "makes sense"]):
