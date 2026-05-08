@@ -386,6 +386,8 @@ COURSE_ALIASES = {
     "medicine and surgery": "medicine_and_surgery",
     "med": "medicine_and_surgery",
     "doctor": "medicine_and_surgery",
+    "dentistry": "medicine_and_surgery",
+    "dental": "medicine_and_surgery",
     "law": "law",
     "llb": "law",
     "lawyer": "law",
@@ -471,3 +473,329 @@ COURSE_ALTERNATIVES = {
         "biochemistry",
     ],
 }
+
+
+# ═══════════════════════════════════════════════
+# JAMB READINESS CHECKER
+# ═══════════════════════════════════════════════
+
+def resolve_course(raw_input: str) -> str | None:
+    """
+    Convert whatever the student typed into an official course key.
+    
+    Handles:
+    - Direct matches: "medicine" → "medicine_and_surgery"
+    - Alias matches: "doctor" → "medicine_and_surgery"
+    - Case variations: "Law" → "law"
+    - Extra whitespace: "  computer science  " → "computer science"
+    
+    Args:
+        raw_input: What the student typed
+        
+    Returns:
+        Official course key (e.g., "medicine_and_surgery") or None
+    """
+    cleaned = raw_input.strip().lower()
+    
+    # Direct alias match
+    if cleaned in COURSE_ALIASES:
+        return COURSE_ALIASES[cleaned]
+    
+    # Check if it's already a valid course key
+    if cleaned in JAMB_COMBINATIONS:
+        return cleaned
+    
+    # Partial match — check if any alias contains the input
+    for alias, course_key in COURSE_ALIASES.items():
+        if cleaned in alias or alias in cleaned:
+            return course_key
+    
+    return None
+
+
+def normalize_subject_for_jamb(subject: str) -> str:
+    """
+    Convert WaxPrep's internal subject names to official JAMB subject names.
+    
+    WaxPrep stores "english" — JAMB requires "Use of English".
+    WaxPrep stores "mathematics" — JAMB requires "Mathematics".
+    
+    Args:
+        subject: Subject name as stored in WaxPrep (lowercase, underscores)
+        
+    Returns:
+        Official JAMB subject name, or the original if no mapping exists
+    """
+    mapping = {
+        "english": "Use of English",
+        "english_language": "Use of English",
+        "mathematics": "Mathematics",
+        "maths": "Mathematics",
+        "math": "Mathematics",
+        "physics": "Physics",
+        "chemistry": "Chemistry",
+        "biology": "Biology",
+        "economics": "Economics",
+        "government": "Government",
+        "literature_in_english": "Literature in English",
+        "literature": "Literature in English",
+        "commerce": "Commerce",
+        "accounting": "Principles of Accounts",
+        "accounts": "Principles of Accounts",
+        "geography": "Geography",
+        "history": "History",
+        "agricultural_science": "Agricultural Science",
+        "further_mathematics": "Mathematics",
+        "civic_education": "Government",
+        "crs": "Christian Religious Studies (CRS)",
+        "christian_religious_studies": "Christian Religious Studies (CRS)",
+        "irs": "Islamic Studies (IRS)",
+        "islamic_religious_studies": "Islamic Studies (IRS)",
+        "computer_studies": "Computer Studies",
+        "ict": "Computer Studies",
+        "yoruba": "Yoruba",
+        "igbo": "Igbo",
+        "hausa": "Hausa",
+        "french": "French",
+        "arabic": "Arabic",
+        "music": "Music",
+        "art": "Art",
+        "visual_arts": "Art",
+        "physical_education": "Physical & Health Education (PHE)",
+        "health_education": "Physical & Health Education (PHE)",
+        "food_and_nutrition": "Home Economics",
+        "home_economics": "Home Economics",
+    }
+    
+    normalized = subject.lower().strip().replace(" ", "_")
+    return mapping.get(normalized, subject)
+
+
+def check_jamb_readiness(
+    student_subjects: list[str],
+    desired_course: str
+) -> dict:
+    """
+    Compare a student's subjects to JAMB requirements for their desired course.
+    
+    This is the core function that powers the JAMB Checker feature.
+    
+    Args:
+        student_subjects: List of subject names as stored in WaxPrep
+                         (e.g., ["english", "mathematics", "physics", "chemistry"])
+        desired_course: What the student wants to study
+                       (e.g., "medicine", "law", "engineering")
+    
+    Returns:
+        dict with:
+        {
+            "course_key": str,           # Official course identifier
+            "course_display": str,       # Human-readable course name
+            "ready": bool,               # Whether student meets all requirements
+            "required": list[str],       # All required subjects (JAMB names)
+            "have": list[str],           # Subjects the student has (JAMB names)
+            "missing": list[str],        # Required subjects the student lacks
+            "alternatives_available": list[str],  # Flexible positions and their options
+            "suggested_alternatives": list[str],  # Similar courses if not ready
+            "notes": str,                # University-specific notes
+            "category": str,             # "science", "commercial", or "arts"
+        }
+    """
+    # Resolve the course
+    course_key = resolve_course(desired_course)
+    
+    if not course_key:
+        return {
+            "course_key": None,
+            "course_display": desired_course,
+            "ready": False,
+            "error": "unknown_course",
+            "message": f"I don't have JAMB data for '{desired_course}' yet. Can you try a different course, or tell me the official name?"
+        }
+    
+    course_data = JAMB_COMBINATIONS[course_key]
+    required = course_data["required"]
+    alternatives = course_data.get("alternatives", {})
+    
+    # Normalize student subjects to JAMB names
+    jamb_subjects = []
+    for subj in student_subjects:
+        normalized = normalize_subject_for_jamb(subj)
+        if normalized and normalized not in jamb_subjects:
+            jamb_subjects.append(normalized)
+    
+    # Check what they have and what they're missing
+    have = []
+    missing = []
+    
+    for subject in required:
+        if subject in jamb_subjects:
+            have.append(subject)
+        else:
+            # Check if any alternative satisfies this requirement
+            # Alternatives are keyed by position ("3rd", "4th")
+            # For required subjects, check if any accepted alternative is present
+            found_alternative = False
+            for alt_list in alternatives.values():
+                if any(alt in jamb_subjects for alt in alt_list):
+                    if subject not in have:
+                        have.append(subject)
+                        found_alternative = True
+                        break
+            if not found_alternative:
+                missing.append(subject)
+    
+    # Build alternatives summary for display
+    alternatives_available = []
+    for position, options in alternatives.items():
+        alternatives_available.append({
+            "position": position,
+            "options": options,
+            "student_has": [opt for opt in options if opt in jamb_subjects]
+        })
+    
+    # Determine readiness
+    ready = len(missing) == 0
+    
+    # Get suggested alternatives if not ready
+    suggested = []
+    if not ready:
+        alt_courses = COURSE_ALTERNATIVES.get(course_key, [])
+        for alt_key in alt_courses:
+            if alt_key in JAMB_COMBINATIONS:
+                alt_data = JAMB_COMBINATIONS[alt_key]
+                # Check if student meets requirements for this alternative
+                alt_missing = [s for s in alt_data["required"] if s not in jamb_subjects and s != "Use of English"]
+                alt_ready = len(alt_missing) == 0
+                suggested.append({
+                    "course_key": alt_key,
+                    "display_name": alt_data["display_name"],
+                    "ready": alt_ready,
+                    "missing_for_this": alt_missing
+                })
+    
+    return {
+        "course_key": course_key,
+        "course_display": course_data["display_name"],
+        "ready": ready,
+        "required": required,
+        "have": have,
+        "missing": missing,
+        "alternatives_available": alternatives_available,
+        "suggested_alternatives": suggested,
+        "notes": course_data.get("notes", ""),
+        "category": course_data.get("category", "unknown"),
+    }
+
+
+def get_course_display_name(course_input: str) -> str:
+    """
+    Get the human-readable display name for a course.
+    
+    Args:
+        course_input: Raw student input or course key
+        
+    Returns:
+        Display name like "Medicine & Surgery" or the original input if unknown
+    """
+    course_key = resolve_course(course_input)
+    if course_key and course_key in JAMB_COMBINATIONS:
+        return JAMB_COMBINATIONS[course_key]["display_name"]
+    return course_input
+
+
+def get_all_courses_by_category(category: str = None) -> list[dict]:
+    """
+    Get all courses, optionally filtered by category.
+    
+    Args:
+        category: "science", "commercial", "arts", or None for all
+        
+    Returns:
+        List of course dicts with keys: course_key, display_name, category, required
+    """
+    courses = []
+    for key, data in JAMB_COMBINATIONS.items():
+        if category is None or data.get("category") == category:
+            courses.append({
+                "course_key": key,
+                "display_name": data["display_name"],
+                "category": data.get("category", "unknown"),
+                "required": data["required"],
+                "notes": data.get("notes", ""),
+            })
+    return courses
+
+
+def suggest_courses_from_subjects(student_subjects: list[str]) -> list[dict]:
+    """
+    Suggest courses that match a student's existing subjects.
+    
+    Useful when a student says "I don't know what to study."
+    Analyzes all known courses and returns ones where the student
+    meets at least 3 out of 4 requirements.
+    
+    Args:
+        student_subjects: List of WaxPrep subject names
+        
+    Returns:
+        List of matching courses, sorted by best match first
+    """
+    jamb_subjects = []
+    for subj in student_subjects:
+        normalized = normalize_subject_for_jamb(subj)
+        if normalized and normalized not in jamb_subjects:
+            jamb_subjects.append(normalized)
+    
+    matches = []
+    for course_key, data in JAMB_COMBINATIONS.items():
+        required = data["required"]
+        matched = [s for s in required if s in jamb_subjects]
+        score = len(matched)
+        total = len(required)
+        
+        if score >= 3:  # Need at least 3 matches to suggest
+            matches.append({
+                "course_key": course_key,
+                "display_name": data["display_name"],
+                "category": data.get("category", "unknown"),
+                "match_score": score,
+                "total_required": total,
+                "have": matched,
+                "missing": [s for s in required if s not in jamb_subjects],
+                "notes": data.get("notes", ""),
+            })
+    
+    # Sort by match score (highest first), then by total required (fewer requirements = easier to match)
+    matches.sort(key=lambda x: (-x["match_score"], x["total_required"]))
+    return matches
+
+
+def validate_jamb_subjects(subjects: list[str]) -> dict:
+    """
+    Check if a student's subjects are valid JAMB subjects.
+    
+    Args:
+        subjects: List of WaxPrep subject names
+        
+    Returns:
+        dict with valid subjects, invalid subjects, and suggestions
+    """
+    valid = []
+    invalid = []
+    
+    for subj in subjects:
+        jamb_name = normalize_subject_for_jamb(subj)
+        if jamb_name in OFFICIAL_JAMB_SUBJECTS:
+            if jamb_name not in valid:
+                valid.append(jamb_name)
+        else:
+            invalid.append(subj)
+    
+    return {
+        "valid": valid,
+        "invalid": invalid,
+        "total_valid": len(valid),
+        "total_invalid": len(invalid),
+        "all_valid": len(invalid) == 0,
+    }
