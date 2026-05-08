@@ -1,13 +1,13 @@
 """
 WaxPrep v2 — Student Signal Detectors
 Detects emotional and learning signals from student messages:
-confusion, fatigue, frustration, boredom, exam anxiety.
+confusion, fatigue, frustration, boredom, exam anxiety, topic hopping.
 
 Unified pattern: Detect → Count → Log → Escalate
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("waxprep.detectors")
 
@@ -78,13 +78,13 @@ async def detect_confusion(
     Returns:
         {
             "confused": bool,
-            "explicit": bool,  # Student explicitly said they're confused
-            "implicit": bool,  # Detected from wrong answers
-            "post_reset": bool,  # Student is STILL confused after a reset
+            "explicit": bool,
+            "implicit": bool,
+            "post_reset": bool,
             "topic": str,
-            "attempt": int,  # 1, 2, or 3
-            "should_park": bool,  # True if max attempts reached
-            "context_instruction": str,  # What to inject into the prompt
+            "attempt": int,
+            "should_park": bool,
+            "context_instruction": str,
         }
     """
     result = {
@@ -100,23 +100,14 @@ async def detect_confusion(
     
     msg_lower = message.strip().lower()
     
-    # ── Check 1: Explicit confusion phrases ──
     is_explicit = any(phrase in msg_lower for phrase in CONFUSION_PHRASES)
     
-    # ── Check 2: Post-reset confusion ──
-    # FIXED: Now actually used to influence behavior
     is_post_reset = is_explicit and any(
         word in msg_lower for word in POST_RESET_CONFUSION
     )
     
-    # ── Check 3: Same topic wrong twice (implicit confusion) ──
-    # FIXED: "I don't know" alone is NOT confusion — it's a genuine answer.
-    # Only count as confusion if it's combined with other signals.
     is_implicit = same_topic_wrong_count >= 2
     
-    # ── Check 4: "I don't know" + confusion indicator ──
-    # "i don't know" alone is not confusion. But "i don't know what that means"
-    # or "i don't know, i'm lost" IS confusion.
     is_idk_with_context = (
         "i don't know" in msg_lower or "i dont know" in msg_lower
     ) and (
@@ -130,29 +121,24 @@ async def detect_confusion(
     if not is_explicit and not is_implicit and not is_idk_with_context:
         return result
     
-    # ── Determine attempt count ──
     attempt_count = await _get_confusion_count(student_id, topic)
     
     if is_explicit or is_idk_with_context:
         attempt_count += 1
         await _increment_confusion_count(student_id, topic, attempt_count)
     
-    # FIXED: Post-reset confusion bumps the attempt count if not already counted
     if is_post_reset and not is_explicit:
         attempt_count += 1
         await _increment_confusion_count(student_id, topic, attempt_count)
     
-    # ── Check if we should park the topic ──
     should_park = attempt_count > MAX_CONFUSION_ATTEMPTS
     
-    # ── Build context instruction based on attempt ──
     if attempt_count == 1:
         instruction = (
             f"⚠️ CONFUSION DETECTED (Attempt 1/3). The student is confused "
             f"by your explanation of '{topic}'. You MUST: "
             f"1) Stop introducing ANY new information about '{topic}'. "
-            f"2) Use a COMPLETELY different example from a DIFFERENT domain "
-            f"(if you used transportation before, use cooking or market now). "
+            f"2) Use a COMPLETELY different example from a DIFFERENT domain. "
             f"3) Simplify — go back to the core idea, not the details. "
             f"4) Ask exactly ONE check question at the end. "
             f"5) Do NOT introduce the next topic until the student confirms understanding."
@@ -180,7 +166,6 @@ async def detect_confusion(
             f"your brain needs time to process. Want to try something else?'"
         )
     else:
-        # Over max — park immediately
         instruction = (
             f"⚠️ CONFUSION LIMIT REACHED. The student has been confused about "
             f"'{topic}' for {attempt_count} attempts. Do NOT explain '{topic}' "
@@ -188,7 +173,6 @@ async def detect_confusion(
             f"this for now and come back fresh. Want to try something else?'"
         )
     
-    # ── Build result ──
     result["confused"] = True
     result["explicit"] = is_explicit
     result["implicit"] = is_implicit
@@ -197,7 +181,6 @@ async def detect_confusion(
     result["should_park"] = should_park
     result["context_instruction"] = instruction
     
-    # ── Log to Supabase (non-blocking) ──
     await _log_confusion_signal(student_id, topic, attempt_count, is_explicit)
     
     return result
@@ -225,7 +208,7 @@ async def _increment_confusion_count(student_id: str, topic: str, count: int) ->
     try:
         from database.client import redis_client
         key = f"confusion:{student_id}:{topic}"
-        redis_client.setex(key, 7200, str(count))  # 2-hour TTL
+        redis_client.setex(key, 7200, str(count))
     except Exception as e:
         logger.error(f"Redis confusion count write error: {e}")
 
@@ -265,3 +248,186 @@ async def _log_confusion_signal(
         }).execute()
     except Exception as e:
         logger.error(f"Failed to log confusion signal: {e}")
+
+
+# ═══════════════════════════════════════════════
+# TOPIC COHERENCE DETECTION (NEW)
+# ═══════════════════════════════════════════════
+
+# Topic keywords for extraction
+TOPIC_KEYWORDS = {
+    "physics": {
+        "acceleration": ["acceleration", "accelerating", "accelerate"],
+        "velocity": ["velocity", "speed", "fast", "moving"],
+        "force": ["force", "push", "pull", "newton"],
+        "energy": ["energy", "kinetic", "potential", "thermal", "heat"],
+        "electricity": ["electricity", "current", "voltage", "resistance", "circuit"],
+        "momentum": ["momentum", "collision", "impulse"],
+        "motion": ["motion", "movement", "linear", "projectile"],
+        "waves": ["wave", "sound", "light wave", "frequency"],
+        "gravity": ["gravity", "gravitational", "weight"],
+    },
+    "chemistry": {
+        "atomic_structure": ["atom", "atomic", "proton", "neutron", "electron", "nucleus"],
+        "periodic_table": ["periodic table", "element", "group", "period", "metal"],
+        "bonding": ["bond", "ionic", "covalent", "metallic", "sigma", "pi"],
+        "acids_bases": ["acid", "base", "ph", "alkaline", "neutralization"],
+        "organic": ["organic", "carbon", "hydrocarbon", "alkane", "alkene"],
+        "electrolysis": ["electrolysis", "electrolyte", "anode", "cathode"],
+        "stoichiometry": ["mole", "molar", "stoichiometry", "equation"],
+    },
+    "biology": {
+        "cell": ["cell", "organelle", "mitochondria", "nucleus", "membrane"],
+        "photosynthesis": ["photosynthesis", "chlorophyll", "light reaction"],
+        "respiration": ["respiration", "aerobic", "anaerobic", "glycolysis"],
+        "genetics": ["genetics", "dna", "gene", "chromosome", "heredity"],
+        "ecology": ["ecology", "ecosystem", "habitat", "food chain"],
+        "osmosis": ["osmosis", "diffusion", "semi-permeable"],
+        "enzymes": ["enzyme", "catalyst", "substrate", "active site"],
+    },
+    "mathematics": {
+        "algebra": ["algebra", "equation", "variable", "solve"],
+        "quadratic": ["quadratic", "parabola", "discriminant"],
+        "trigonometry": ["trig", "sine", "cosine", "tangent", "sohcahtoa"],
+        "calculus": ["calculus", "derivative", "integral", "differentiation"],
+        "statistics": ["statistics", "probability", "mean", "median", "mode"],
+        "geometry": ["geometry", "triangle", "circle", "angle", "pythagoras"],
+    },
+}
+
+TOPIC_COMPLETION_SIGNALS = [
+    "i get it", "i understand", "that makes sense", "i'm ready to move on",
+    "next topic", "let's switch", "i got it", "i see", "that's clear",
+    "move on", "continue", "go ahead", "what's next", "i know this now",
+    "i've got it", "i understand now", "it's clear", "ready for the next",
+]
+
+
+def extract_topics_from_history(conversation_history: list, last_n: int = 10) -> List[str]:
+    """
+    Extract recent topics from conversation history.
+    Returns list of unique topic strings like ["physics:acceleration", "biology:photosynthesis"].
+    """
+    if not conversation_history:
+        return []
+    
+    recent = conversation_history[-last_n:]
+    topics_found = []
+    
+    for msg in recent:
+        content = msg.get("content", "").lower()
+        
+        for subject, topics in TOPIC_KEYWORDS.items():
+            for topic_name, keywords in topics.items():
+                if any(kw in content for kw in keywords):
+                    topic_key = f"{subject}:{topic_name}"
+                    if topic_key not in topics_found:
+                        topics_found.append(topic_key)
+    
+    return topics_found
+
+
+def detect_topic_completion(topic: str, conversation_history: list) -> bool:
+    """Check if a topic was completed based on student signals."""
+    if not conversation_history:
+        return False
+    
+    recent_user_msgs = [
+        m for m in conversation_history[-5:]
+        if m.get("role") == "user"
+    ]
+    
+    for msg in recent_user_msgs:
+        content = msg.get("content", "").lower()
+        if any(signal in content for signal in TOPIC_COMPLETION_SIGNALS):
+            return True
+    
+    recent_assistant_msgs = [
+        m for m in conversation_history[-5:]
+        if m.get("role") == "assistant"
+    ]
+    praise_phrases = ["exactly", "you've got it", "well done", "correct"]
+    for msg in recent_assistant_msgs:
+        content = msg.get("content", "").lower()
+        if any(phrase in content for phrase in praise_phrases):
+            return True
+    
+    return False
+
+
+def detect_topic_hopping(
+    conversation_history: list,
+    current_message: str = "",
+    student_id: str = "",
+) -> dict:
+    """
+    Detect if student is rapidly switching topics without completing any.
+    
+    Returns:
+        {
+            "hopping": bool,
+            "topics": list of recent incomplete topic keys,
+            "count": int,
+            "stage": "gentle" or "firm" or "accept",
+            "context_instruction": str or empty
+        }
+    """
+    result = {
+        "hopping": False,
+        "topics": [],
+        "count": 0,
+        "stage": "",
+        "context_instruction": "",
+    }
+    
+    if not conversation_history:
+        return result
+    
+    all_topics = extract_topics_from_history(conversation_history, last_n=10)
+    
+    if len(all_topics) < 3:
+        return result
+    
+    incomplete_topics = [
+        t for t in all_topics
+        if not detect_topic_completion(t, conversation_history)
+    ]
+    
+    if len(incomplete_topics) < 3:
+        return result
+    
+    result["hopping"] = True
+    result["topics"] = incomplete_topics
+    result["count"] = len(incomplete_topics)
+    
+    if len(incomplete_topics) <= 4:
+        result["stage"] = "gentle"
+        topic_names = [t.split(":")[1].replace("_", " ") for t in incomplete_topics]
+        result["context_instruction"] = (
+            f"⚠️ TOPIC HOPPING DETECTED (Gentle). The student has discussed "
+            f"{', '.join(topic_names)} without completing any. "
+            f"Before starting another new topic, gently check in: "
+            f"'We've touched on a few things. Want to pick one and go deep?' "
+            f"Don't block the switch — just offer focus. Keep it warm."
+        )
+    elif len(incomplete_topics) <= 6:
+        result["stage"] = "firm"
+        topic_names = [t.split(":")[1].replace("_", " ") for t in incomplete_topics]
+        result["context_instruction"] = (
+            f"⚠️ TOPIC HOPPING DETECTED (Firm). The student has discussed "
+            f"{len(incomplete_topics)} topics without completing any. "
+            f"Make a deal: 'That's {len(incomplete_topics)} topics without finishing any. "
+            f"Let's pick ONE and commit for 10 minutes. After that, we can switch. Deal?' "
+            f"Be warm but firm. They need structure."
+        )
+    else:
+        result["stage"] = "accept"
+        result["context_instruction"] = (
+            f"⚠️ TOPIC HOPPING DETECTED (Accept). The student has discussed "
+            f"{len(incomplete_topics)} topics without completing any. "
+            f"Accept exploration mode: 'Alright, you're in exploration mode today. "
+            f"That's fine. When you're ready to focus on one topic, I'm here.' "
+            f"Don't fight it. Adapt to their style."
+        )
+    
+    return result
