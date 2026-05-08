@@ -2,7 +2,7 @@
 WaxPrep v2 — Student Model
 A living, adaptive profile of each student that learns from every interaction.
 
-Phase 1 Categories (built tonight):
+Phase 1 Categories:
     1. Teaching Style Preference — examples, definitions, stories, Socratic
     2. Example Domain Preferences — which references work for THIS student
     3. Communication Style — formal, casual, Pidgin, code-switching
@@ -22,6 +22,7 @@ Privacy:
     - Model export for NDPR compliance
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional, Dict, Any, List
@@ -38,7 +39,7 @@ DECAY_RATE = 0.05            # How much old signals lose weight per session
 MIN_SESSIONS_FOR_CONFIDENCE = 3
 MIN_SIGNALS_FOR_INFERENCE = 2
 MAX_TRACKED_DOMAINS = 10
-MAX_QUIZ_SCORES_PER_TOPIC = 5  # FIXED: Reduced from 10 to control JSON size
+MAX_QUIZ_SCORES_PER_TOPIC = 5
 
 TEACHING_STYLES = ["examples", "definitions", "stories", "socratic", "mixed"]
 
@@ -53,8 +54,7 @@ EXAMPLE_DOMAINS = [
 COMMUNICATION_LEVELS = ["formal_english", "casual_english", "pidgin_mixed", "full_pidgin"]
 COMPETENCE_LEVELS = ["mastered", "in_progress", "struggling", "not_attempted"]
 
-# FIXED (Bug #5): Centralized field list for serialization consistency
-# Adding a new field only requires adding it here — to_dict/from_dict update automatically.
+# Centralized field list for serialization consistency
 _SERIALIZED_FIELDS = [
     "teaching_style", "teaching_style_by_subject", "teaching_style_confidence",
     "teaching_style_signals",
@@ -299,7 +299,6 @@ class StudentModel:
                     self.last_quiz_scores[score_key] = []
                 self.last_quiz_scores[score_key].append(score)
                 
-                # FIXED: Keep only last 5 scores (was 10 — too large for JSON storage)
                 if len(self.last_quiz_scores[score_key]) > MAX_QUIZ_SCORES_PER_TOPIC:
                     self.last_quiz_scores[score_key] = self.last_quiz_scores[score_key][-MAX_QUIZ_SCORES_PER_TOPIC:]
                 
@@ -337,7 +336,7 @@ class StudentModel:
         return struggling
     
     # ═══════════════════════════════════════════
-    # SERIALIZATION — FIXED: uses centralized field lists
+    # SERIALIZATION
     # ═══════════════════════════════════════════
     
     def to_dict(self) -> Dict[str, Any]:
@@ -494,8 +493,6 @@ async def save_student_model(model: StudentModel) -> bool:
         
         data = model.to_dict()
         
-        # FIXED (Bug #1): Use individual hset calls instead of mapping parameter
-        # This is compatible with all versions of Redis py.
         for key, value in data.items():
             if value is None:
                 redis_client.hset(model.redis_key, key, "")
@@ -512,8 +509,8 @@ async def save_student_model(model: StudentModel) -> bool:
         
         redis_client.expire(model.redis_key, 2592000)  # 30-day TTL
         
-        # Async Supabase sync
-        _sync_to_supabase(model, data)
+        # FIXED: Use asyncio.ensure_future for non-blocking async sync
+        asyncio.ensure_future(_sync_to_supabase(model, data))
         
         return True
         
@@ -527,8 +524,6 @@ async def _sync_to_supabase(model: StudentModel, data: Dict[str, Any]) -> None:
     try:
         from database.client import supabase
         
-        # FIXED (Bug #3): Remove on_conflict parameter — not supported in Supabase Python SDK
-        # The upsert uses the table's primary key (student_id) automatically.
         supabase.table("student_models").upsert({
             "student_id": model.student_id,
             "teaching_style": data.get("teaching_style", {}),
