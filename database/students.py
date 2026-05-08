@@ -51,6 +51,7 @@ async def create_student(
     class_level: str = None,
     target_exam: str = None,
     subjects: list = None,
+    student_subject: str = None,  # FIXED: Added — the subject the student struggles with
     exam_date: str = None,
     student_state: str = None,
     language_preference: str = "english",
@@ -77,6 +78,7 @@ async def create_student(
                 "class_level": class_level,
                 "target_exam": target_exam,
                 "subjects": subjects or [],
+                "student_subject": student_subject or "",  # FIXED: Now saved to database
                 "exam_date": exam_date,
                 "state": student_state,
                 "language_preference": language_preference,
@@ -107,3 +109,21 @@ async def create_student(
     except Exception as e:
         print(f"create_student error: {e}")
         return None
+
+
+async def update_student(student_id: str, updates: dict) -> bool:
+    """
+    Update a student record.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        result = (
+            supabase.table("students")
+            .update(updates)
+            .eq("id", student_id)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        print(f"update_student error: {e}")
+        return False
