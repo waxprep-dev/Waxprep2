@@ -16,6 +16,9 @@ Now with Session End Detection — natural endings like "I'm tired" or
 Now with Confusion Detection — when a student is confused, Wax stops
 introducing new information, switches examples, and doesn't move forward
 until the student confirms understanding.
+
+Now with Student Model — Wax learns HOW each student learns. Teaching style,
+example domains, communication style, and competence map adapt over time.
 """
 import asyncio
 import hashlib
@@ -50,21 +53,17 @@ SESSION_END_KEYWORDS = [
     "i'm leaving", "i have to go", "gotta go", "gtg",
 ]
 
-# ── Subject name mapping (student profile display → database column) ──
+# ── Subject name mapping ──────────────────────
 SUBJECT_MAP: Dict[str, str] = {
-    # Core
     "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
     "english": "english", "english_language": "english",
-    # Science
     "physics": "physics", "chemistry": "chemistry", "biology": "biology",
     "further_mathematics": "further_mathematics", "further mathematics": "further_mathematics",
     "agricultural_science": "agricultural_science", "agric": "agricultural_science",
-    # Commercial
     "economics": "economics", "commerce": "commerce",
     "accounting": "accounting", "accounts": "accounting",
     "business_studies": "business_studies", "business studies": "business_studies",
     "marketing": "marketing",
-    # Arts
     "government": "government",
     "literature": "literature_in_english",
     "literature_in_english": "literature_in_english",
@@ -72,11 +71,8 @@ SUBJECT_MAP: Dict[str, str] = {
     "civic_education": "civic_education", "civic education": "civic_education",
     "christian_religious_studies": "crs", "crs": "crs",
     "islamic_religious_studies": "irs", "irs": "irs",
-    "geography": "geography",
-    "history": "history",
-    # Nigerian languages
+    "geography": "geography", "history": "history",
     "yoruba": "yoruba", "igbo": "igbo", "hausa": "hausa",
-    # Other
     "food_and_nutrition": "food_and_nutrition", "food & nutrition": "food_and_nutrition",
     "technical_drawing": "technical_drawing", "technical drawing": "technical_drawing",
     "computer_studies": "computer_studies", "computer": "computer_studies", "ict": "computer_studies",
@@ -90,19 +86,13 @@ TRACK_FALLBACKS: Dict[str, List[str]] = {
     "unknown": ["english", "mathematics"],
 }
 
-# TTL for active quiz in Redis
-QUIZ_TTL_SECONDS = 1800  # 30 minutes
-
-# Maximum quiz history entries per student
+# TTLs and limits
+QUIZ_TTL_SECONDS = 1800
 MAX_QUIZ_HISTORY = 200
-
-# JAMB check cooldown — 7 days between prompts
-JAMB_CHECK_COOLDOWN = 604800  # 7 days in seconds
-
-# Deferral count TTL — 1 hour (resets each session)
+JAMB_CHECK_COOLDOWN = 604800
 DEFERRAL_TTL = 3600
 
-# Understanding confirmation phrases — used to reset confusion counter
+# Understanding confirmation phrases
 UNDERSTANDING_PHRASES = [
     "you've got it", "exactly", "you worked that out",
     "you're right", "well done", "correct", "perfect",
@@ -124,27 +114,26 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         if await handle_admin_command(chat_id, text):
             logger.info(f"Admin command handled for chat_id={chat_id}")
             return
-    except ImportError as e:
-        logger.error(f"Admin module import failed: {e}")
+    except ImportError:
+        pass
     except Exception as e:
-        logger.error(f"Admin handler error for chat_id={chat_id}: {e}", exc_info=True)
+        logger.error(f"Admin handler error: {e}", exc_info=True)
 
     try:
         from brain.safety import run_safety_checks
         if await run_safety_checks(chat_id, text):
-            logger.warning(f"Safety check blocked message from chat_id={chat_id}")
             return
-    except ImportError as e:
-        logger.error(f"Safety module import failed: {e}")
+    except ImportError:
+        pass
     except Exception as e:
-        logger.error(f"Safety check error for chat_id={chat_id}: {e}", exc_info=True)
+        logger.error(f"Safety check error: {e}", exc_info=True)
         return
 
     try:
         from database.students import get_student_by_platform_id
         student = await get_student_by_platform_id("telegram", str(chat_id))
     except Exception as e:
-        logger.error(f"Student lookup failed for chat_id={chat_id}: {e}", exc_info=True)
+        logger.error(f"Student lookup failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "I'm having trouble connecting. Please try again in a moment.")
         return
 
@@ -156,34 +145,22 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         from telegram.onboarding import handle_onboarding
         from database.onboarding_state import get_onboarding_state
         state = await get_onboarding_state("telegram", str(chat_id))
-    except Exception as e:
-        logger.error(f"Onboarding state fetch failed for chat_id={chat_id}: {e}", exc_info=True)
+    except Exception:
         state = {}
 
     try:
         await handle_onboarding(chat_id, state, text)
     except Exception as e:
-        logger.error(f"Onboarding handler failed for chat_id={chat_id}: {e}", exc_info=True)
+        logger.error(f"Onboarding handler failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "Something went wrong. Type *HI* to start again.")
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
-    """
-    Route a registered student's message to the appropriate handler.
-    
-    Priority:
-    0. JAMB ambition response
-    0.3. Session end keywords
-    0.5. Deferral keywords
-    1. Quiz answer
-    2. Quiz trigger
-    3. AI conversation
-    """
+    """Route a registered student's message to the appropriate handler."""
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
-    # 0. JAMB ambition response
     try:
         from database.onboarding_state import get_onboarding_state
         jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
@@ -193,17 +170,14 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
-    # 0.3. Session end keywords
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
-    # 0.5. Deferral keywords
     if any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS):
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
-    # 1. Quiz answer detection
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -211,15 +185,13 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
             if redis_client.exists(quiz_key):
                 await _handle_quiz_answer(chat_id, student, cleaned)
                 return
-        except Exception as e:
-            logger.error(f"Redis quiz check failed for {student_id}: {e}", exc_info=True)
+        except Exception:
+            pass
 
-    # 2. Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
 
-    # 3. AI conversation
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
@@ -228,12 +200,8 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
 # ═══════════════════════════════════════════════
 
 async def _handle_session_end(
-    chat_id: int,
-    student: dict,
-    text: str,
-    student_id: str,
-    name: str,
-    msg_lower: str
+    chat_id: int, student: dict, text: str,
+    student_id: str, name: str, msg_lower: str
 ) -> None:
     """Handle natural session endings."""
     from ai.brain import think
@@ -254,24 +222,15 @@ async def _handle_session_end(
         pass
 
     try:
-        current_state = await get_state(student_id)
-        if not current_state:
-            current_state = "chatting"
-    except Exception:
-        current_state = "chatting"
-
-    try:
         context_str = await _build_memory_context(student_id)
     except Exception:
         context_str = ""
 
     try:
         response = await think(
-            message=text,
-            student=student,
+            message=text, student=student,
             conversation_history=conversation_history,
-            recent_subject=recent_subject,
-            context_str=context_str,
+            recent_subject=recent_subject, context_str=context_str,
             is_practice=False
         )
     except Exception:
@@ -285,29 +244,21 @@ async def _handle_session_end(
     await send_telegram_message(chat_id, response)
 
     try:
-        await set_state(
-            student_id,
-            "ended",
+        await set_state(student_id, "ended",
             reason=f"Student ended session: {msg_lower[:50]}",
             session_context={
                 "subject": recent_subject or "unknown",
                 "topic": session_topic or "discussed",
-                "completed": False,
-                "score": None,
-                "struggled_with": [],
-            }
-        )
-        logger.info(f"Session ended for {student_id}: {recent_subject} - {session_topic}")
-    except Exception as e:
-        logger.error(f"Failed to end session for {student_id}: {e}")
+                "completed": False, "score": None, "struggled_with": [],
+            })
+    except Exception:
+        pass
 
     try:
         await save_session_summary(student_id, {
             "subject": recent_subject or "unknown",
             "topic": session_topic or "discussed",
-            "completed": False,
-            "score": None,
-            "struggled_with": [],
+            "completed": False, "score": None, "struggled_with": [],
             "ended_at": datetime.now(timezone.utc).isoformat(),
         })
     except Exception:
@@ -317,21 +268,16 @@ async def _handle_session_end(
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
     """Extract the current topic from recent conversation history."""
     topic_keywords = [
-        "Today:", "today:", "Let's learn about",
-        "let's learn about", "we'll cover", "focusing on",
-        "Let's focus on", "let's focus on",
+        "Today:", "today:", "Let's learn about", "let's learn about",
+        "we'll cover", "focusing on", "Let's focus on", "let's focus on",
         "Let's dive into", "let's dive into",
-        "you were doing well with",
-        "You were doing well with",
-        "we covered", "We covered",
-        "we looked at", "We looked at",
+        "you were doing well with", "You were doing well with",
+        "we covered", "We covered", "we looked at", "We looked at",
         "we discussed", "We discussed",
         "don't forget that", "Don't forget that",
         "you worked that out", "You worked that out",
-        "you're getting", "You're getting",
-        "you understood", "You understood",
+        "you're getting", "You're getting", "you understood", "You understood",
     ]
-
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
@@ -342,7 +288,6 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
                         extracted = parts[1].strip().split(".")[0].strip()[:50]
                         if extracted and len(extracted) > 2:
                             return extracted
-
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
@@ -350,7 +295,6 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
                 subject_display = subject.replace("_", " ")
                 if subject_display.lower() in content.lower():
                     return subject_display
-
     return "discussed"
 
 
@@ -359,13 +303,9 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
 # ═══════════════════════════════════════════════
 
 async def _handle_deferral(
-    chat_id: int,
-    student: dict,
-    student_id: str,
-    name: str,
-    msg_lower: str
+    chat_id: int, student: dict, student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle when a student defers — 'anything', 'you pick', 'whatever.'"""
+    """Handle when a student defers."""
     from database.conversations import save_message
 
     trouble_subject = student.get("student_subject")
@@ -387,34 +327,22 @@ async def _handle_deferral(
     deferral_count += 1
 
     if deferral_count == 1:
-        response = (
-            f"{trouble_subject}. You said it's been confusing you — "
-            f"that's exactly where we start. Let's go."
-        )
+        response = f"{trouble_subject}. You said it's been confusing you — that's exactly where we start. Let's go."
     elif deferral_count == 2:
-        response = (
-            f"{name}, I already picked. {trouble_subject}. You told me "
-            f"it's confusing and you're not alone in that. But running "
-            f"from it won't help. Let's face it together. Ready?"
-        )
+        response = f"{name}, I already picked. {trouble_subject}. You told me it's confusing and you're not alone in that. But running from it won't help. Let's face it together. Ready?"
     else:
-        response = (
-            f"{trouble_subject}, {name}. No more running. We're doing this. "
-            f"Tell me what you already know about {trouble_subject}."
-        )
+        response = f"{trouble_subject}, {name}. No more running. We're doing this. Tell me what you already know about {trouble_subject}."
 
     try:
         redis_client.setex(deferral_key, DEFERRAL_TTL, str(deferral_count))
     except Exception:
         pass
-
     try:
         await save_message(student_id, "assistant", response)
     except Exception:
         pass
 
     await send_telegram_message(chat_id, response)
-    logger.info(f"Deferral handled for {student_id}: count={deferral_count}, subject={trouble_subject}")
 
 
 # ═══════════════════════════════════════════════
@@ -422,40 +350,30 @@ async def _handle_deferral(
 # ═══════════════════════════════════════════════
 
 async def _maybe_trigger_jamb_check(
-    student_id: str,
-    student: dict,
-    chat_id: int,
-    current_state: str
+    student_id: str, student: dict, chat_id: int, current_state: str
 ) -> bool:
-    """Check if it's the right moment to bring up the JAMB subject conversation."""
+    """Check if it's the right moment for JAMB conversation."""
     from database.conversations import get_student_memory
 
     if current_state not in ("idle", "chatting", "ended", "paused"):
         return False
-
     cooldown_key = f"jamb_check_cooldown:{student_id}"
     try:
         if redis_client.get(cooldown_key):
             return False
     except Exception:
         pass
-
     try:
         memory = await get_student_memory(student_id)
     except Exception:
         memory = {}
-
-    sessions = memory.get("sessions_completed", 0)
-    if sessions < 1:
+    if memory.get("sessions_completed", 0) < 1:
         return False
-
     if student.get("university_ambition"):
         return False
 
     name = student.get("name", "Student").split()[0]
-
-    await send_telegram_message(
-        chat_id,
+    await send_telegram_message(chat_id,
         f"{name}, real quick before you go. I've been teaching you and you're "
         f"making progress — that persistence is paying off. But I want to make "
         f"sure I'm preparing you for the right thing.\n\n"
@@ -463,32 +381,17 @@ async def _maybe_trigger_jamb_check(
         f"No pressure if you haven't figured it out yet. Just type your course "
         f"or say 'not sure' — whatever is true."
     )
-
     try:
         redis_client.setex(cooldown_key, JAMB_CHECK_COOLDOWN, "1")
     except Exception:
         pass
-
-    try:
-        from database.onboarding_state import save_onboarding_state
-        await save_onboarding_state("telegram", f"jamb_{student_id}", {
-            "awaiting_response_for": "jamb_ambition",
-            "name": student.get("name", ""),
-        })
-    except Exception:
-        pass
-
     return True
 
 
 async def _handle_jamb_ambition_response(
-    chat_id: int,
-    student: dict,
-    text: str,
-    student_id: str,
-    jamb_state: dict
+    chat_id: int, student: dict, text: str, student_id: str, jamb_state: dict
 ) -> None:
-    """Process the student's response to Wax's university ambition question."""
+    """Process student's response to university ambition question."""
     from content.jamb_checker import check_jamb_readiness, resolve_course
     from database.onboarding_state import clear_onboarding_state
 
@@ -502,26 +405,18 @@ async def _handle_jamb_ambition_response(
 
     dont_know = ["not sure", "i don't know", "i dont know", "idk", "haven't thought", "not yet", "undecided"]
     if msg.lower() in dont_know or any(phrase in msg.lower() for phrase in dont_know):
-        await send_telegram_message(
-            chat_id,
+        await send_telegram_message(chat_id,
             f"No wahala. Plenty of SS3 students are still figuring it out. "
             f"I was the same. Here's what I'll do — as we keep studying, I'll "
             f"pay attention to what you're naturally good at and what you enjoy. "
             f"After a few more sessions, I might have some suggestions for you. Sound good?"
         )
-        try:
-            from database.students import update_student
-            await update_student(student_id, {"university_ambition_status": "undecided"})
-        except Exception:
-            pass
         return
 
     course_key = resolve_course(msg)
     if not course_key:
-        await send_telegram_message(
-            chat_id,
-            f"I don't have data for '{msg}' yet. Can you try a different "
-            f"course name? Or tell me the official JAMB name — I'll look it up."
+        await send_telegram_message(chat_id,
+            f"I don't have data for '{msg}' yet. Can you try a different course name?"
         )
         return
 
@@ -531,98 +426,44 @@ async def _handle_jamb_ambition_response(
     )
 
     if result.get("error"):
-        await send_telegram_message(
-            chat_id,
-            result.get("message", "I couldn't check that course. Can you try a different name?")
-        )
+        await send_telegram_message(chat_id, result.get("message", "I couldn't check that course."))
         return
 
     if result["ready"]:
-        course_display = result["course_display"]
         have_list = "\n".join([f"✅ {s}" for s in result["have"]])
-        
-        await send_telegram_message(
-            chat_id,
-            f"{name}! Your subjects line up perfectly for {course_display}.\n\n"
-            f"{have_list}\n\n"
-            f"You're on track. Want me to put together a celebration card? "
-            f"It's got your name and your achievement on it. Some students "
-            f"send it to their friends. No pressure either way."
+        await send_telegram_message(chat_id,
+            f"{name}! Your subjects line up perfectly for {result['course_display']}.\n\n"
+            f"{have_list}\n\nYou're on track."
         )
-
-        try:
-            from database.students import update_student
-            await update_student(student_id, {
-                "university_ambition": course_display,
-                "university_ambition_status": "matched",
-                "jamb_readiness_checked_at": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception:
-            pass
         return
 
     missing_list = []
     for m in result["missing"]:
         if isinstance(m, dict):
-            if m.get("alternatives"):
-                alt_text = " or ".join(m["alternatives"])
-                missing_list.append(f"❌ {m['preferred']} (or {alt_text})")
-            else:
-                missing_list.append(f"❌ {m['preferred']}")
+            alt_text = " or ".join(m.get("alternatives", []))
+            missing_list.append(f"❌ {m['preferred']}" + (f" (or {alt_text})" if alt_text else ""))
         else:
             missing_list.append(f"❌ {m}")
 
-    missing_text = "\n".join(missing_list)
-    have_text = "\n".join([f"✅ {s}" for s in result["have"]])
     alternatives = result.get("alternatives", [])
-    
     message = (
         f"{name}, I need to be straight with you. {result['course_display']} "
         f"requires specific subjects — and you're missing some.\n\n"
-        f"What you have:\n{have_text}\n\n"
-        f"What's missing:\n{missing_text}"
+        f"What you have:\n" + "\n".join([f"✅ {s}" for s in result["have"]]) + "\n\n"
+        f"What's missing:\n" + "\n".join(missing_list)
     )
-
-    if result.get("notes"):
-        message += f"\n\n{result['notes']}"
-
     message += (
-        f"\n\nAnd {name}? This doesn't mean you're not smart enough for "
-        f"{result['course_display']}. It means nobody told you earlier what "
-        f"you needed — and that's not your fault. What matters now is what "
-        f"you do with this information."
+        f"\n\nAnd {name}? This doesn't mean you're not smart enough. "
+        f"It means nobody told you earlier what you needed — and that's not your fault."
     )
-
     if alternatives:
         alt_names = [a["display"] for a in alternatives[:3]]
-        alt_text = ", ".join(alt_names)
-        message += (
-            f"\n\nBut here's the thing — you're already on track for {alt_text} "
-            f"with the subjects you have right now. Want to explore any of those? "
-            f"Or do you want to figure out how to add the missing subjects before "
-            f"JAMB registration?"
-        )
-    else:
-        message += (
-            f"\n\nWant to explore what courses DO match your subjects? "
-            f"Or do you want to figure out how to add the missing subjects?"
-        )
-
+        message += f"\n\nBut you're already on track for {', '.join(alt_names)} with the subjects you have right now."
     await send_telegram_message(chat_id, message)
-
-    try:
-        from database.students import update_student
-        await update_student(student_id, {
-            "university_ambition": result["course_display"],
-            "university_ambition_status": "mismatched",
-            "jamb_readiness_checked_at": datetime.now(timezone.utc).isoformat(),
-        })
-    except Exception:
-        pass
 
 
 # ═══════════════════════════════════════════════
-# AI CONVERSATION HANDLER — WITH CONFUSION DETECTION
+# AI CONVERSATION HANDLER — WITH STUDENT MODEL
 # ═══════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -632,72 +473,79 @@ async def _handle_ai_conversation(
     student_id: str,
     name: str
 ) -> None:
-    """
-    Process a student message through the AI brain, with memory context.
-    
-    Now with Confusion Detection:
-    - Detects confusion before AI call
-    - Injects reset instructions into the prompt
-    - Resets confusion counter when student demonstrates understanding
-    """
+    """Process a student message through the AI brain."""
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
 
-    # ── FIXED: Import confusion detector at function level ──
-    # This prevents circular imports and makes the import available
-    # throughout the entire function scope.
+    # ── Import detectors and model (function-level to prevent circular imports) ──
     try:
         from brain.detectors import detect_confusion, reset_confusion_count
         _confusion_detector_available = True
     except ImportError:
-        logger.warning("Confusion detector not available")
         _confusion_detector_available = False
 
-    # Save user message
+    try:
+        from brain.student_model import load_student_model, save_student_model
+        _student_model_available = True
+    except ImportError:
+        _student_model_available = False
+
+    # ── Save user message ──
     try:
         await save_message(student_id, "user", text)
-    except Exception as e:
-        logger.error(f"Failed to save user message for {student_id}: {e}", exc_info=True)
+    except Exception:
+        pass
 
-    # Load conversation history
+    # ── Load conversation history ──
     try:
         conversation_history = await get_history(student_id)
-    except Exception as e:
-        logger.error(f"Failed to load history for {student_id}: {e}", exc_info=True)
+    except Exception:
         conversation_history = []
 
-    # Load current state
+    # ── Load current state ──
     try:
         current_state = await get_state(student_id)
         if not current_state:
             current_state = "idle"
-    except Exception as e:
-        logger.error(f"Failed to load state for {student_id}: {e}", exc_info=True)
+    except Exception:
         current_state = "idle"
 
-    # Determine recent subject
+    # ── Determine recent subject ──
     recent_subject = _infer_recent_subject(student, conversation_history)
-
-    # ── FIXED: Define current_topic BEFORE the try block ──
-    # This ensures it's available in the post-response section.
     current_topic = recent_subject or "unknown"
 
-    # Build memory context
+    # ── Build memory context ──
     try:
         context_str = await _build_memory_context(student_id)
-    except Exception as e:
-        logger.error(f"Memory context build failed for {student_id}: {e}", exc_info=True)
+    except Exception:
         context_str = ""
 
-    # ── Confusion Detection (NEW) ──
+    # ── Load Student Model ──
+    # FIXED: _pending_model_update defined OUTSIDE try block for post-response access
+    _pending_model_update = None
+
+    if _student_model_available:
+        try:
+            student_model = await load_student_model(student_id)
+            model_context = student_model.to_prompt_context()
+
+            if model_context:
+                if context_str:
+                    context_str = model_context + "\n\n" + context_str
+                else:
+                    context_str = model_context
+
+            _pending_model_update = student_model
+        except Exception as e:
+            logger.error(f"Student model load failed: {e}", exc_info=True)
+
+    # ── Confusion Detection ──
     # FIXED: _pending_confusion_reset defined OUTSIDE try block
-    # so it persists for the post-response check.
     _pending_confusion_reset = False
 
     if _confusion_detector_available:
         try:
-            # Count wrong answers on this topic from recent history
             same_topic_wrong = 0
             for msg in conversation_history[-6:]:
                 if msg.get("role") == "assistant":
@@ -709,106 +557,73 @@ async def _handle_ai_conversation(
                         same_topic_wrong += 1
 
             confusion = await detect_confusion(
-                message=text,
-                student_id=student_id,
-                topic=current_topic,
-                same_topic_wrong_count=same_topic_wrong,
+                message=text, student_id=student_id,
+                topic=current_topic, same_topic_wrong_count=same_topic_wrong,
             )
 
             if confusion["confused"]:
-                # Inject confusion instruction BEFORE memory context
                 if context_str:
                     context_str = confusion["context_instruction"] + "\n\n" + context_str
                 else:
                     context_str = confusion["context_instruction"]
-
-                logger.info(
-                    f"Confusion detected for {student_id}: "
-                    f"topic={current_topic}, attempt={confusion['attempt']}, "
-                    f"explicit={confusion['explicit']}, "
-                    f"should_park={confusion['should_park']}"
-                )
-
-                # Mark for post-response reset check
                 _pending_confusion_reset = True
         except Exception as e:
             logger.error(f"Confusion detection failed: {e}", exc_info=True)
 
-    # Determine practice mode
+    # ── Determine practice mode ──
     is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
 
-    # Call AI brain (with injected confusion context if confusion was detected)
+    # ── Call AI brain ──
     try:
         response = await think(
-            message=text,
-            student=student,
+            message=text, student=student,
             conversation_history=conversation_history,
-            recent_subject=recent_subject,
-            context_str=context_str,
+            recent_subject=recent_subject, context_str=context_str,
             is_practice=is_practice
         )
     except Exception as e:
-        logger.error(f"AI brain error for {student_id}: {e}", exc_info=True)
+        logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
-    # Output safety check
+    # ── Output safety check ──
     try:
         from brain.safety import check_output_safety
         if await check_output_safety(response):
-            logger.warning(f"Output safety block for {student_id}")
             response = f"Let me try that differently, {name}. What subject are you studying right now?"
     except ImportError:
-        logger.warning("Output safety module not available")
-    except Exception as e:
-        logger.error(f"Output safety check failed: {e}", exc_info=True)
+        pass
+    except Exception:
+        pass
 
-    # Save assistant response
+    # ── Save and send response ──
     try:
         await save_message(student_id, "assistant", response)
-    except Exception as e:
-        logger.error(f"Failed to save assistant message for {student_id}: {e}", exc_info=True)
-
-    # Send response
+    except Exception:
+        pass
     try:
         await send_telegram_message(chat_id, response)
-    except Exception as e:
-        logger.error(f"Failed to send message to chat_id={chat_id}: {e}", exc_info=True)
+    except Exception:
+        pass
 
-    # ── Post-response: Reset confusion counter if student understood ──
-    # FIXED: _pending_confusion_reset is in scope, current_topic is in scope,
-    # and reset_confusion_count was imported at the top of the function.
+    # ── Post-response: reset confusion counter ──
     if _pending_confusion_reset and _confusion_detector_available:
         try:
-            student_understood = any(
-                phrase in response.lower()
-                for phrase in UNDERSTANDING_PHRASES
-            )
-            if student_understood:
+            if any(phrase in response.lower() for phrase in UNDERSTANDING_PHRASES):
                 await reset_confusion_count(student_id, current_topic)
-                logger.info(
-                    f"Confusion resolved for {student_id} on {current_topic}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to reset confusion count: {e}")
+        except Exception:
+            pass
 
-    # Save session snapshot
+    # ── Save session snapshot ──
     try:
         from database.conversations import save_session_summary
 
-        user_msg_count = sum(
-            1 for m in conversation_history[-10:]
-            if m.get("role") == "user"
-        )
-
+        user_msg_count = sum(1 for m in conversation_history[-10:] if m.get("role") == "user")
         if user_msg_count >= 2:
-            session_subject = recent_subject or "unknown"
             session_topic = _extract_topic_from_history(conversation_history)
-            
             if response:
                 for keyword in [
-                    "Today:", "today:", "Let's learn about",
-                    "let's learn about", "Let's focus on", "let's focus on",
-                    "Let's dive into", "let's dive into",
+                    "Today:", "today:", "Let's learn about", "let's learn about",
+                    "Let's focus on", "let's focus on", "Let's dive into", "let's dive into",
                     "you were doing well with", "You were doing well with",
                     "we covered", "We covered",
                 ]:
@@ -821,31 +636,165 @@ async def _handle_ai_conversation(
                                 break
 
             await save_session_summary(student_id, {
-                "subject": session_subject,
+                "subject": recent_subject or "unknown",
                 "topic": session_topic,
-                "completed": False,
-                "score": None,
-                "struggled_with": [],
-                "ended_at": None
+                "completed": False, "score": None,
+                "struggled_with": [], "ended_at": None
             })
-            logger.debug(
-                f"Session snapshot saved for {student_id}: "
-                f"{session_subject} - {session_topic}"
-            )
-    except Exception as e:
-        logger.error(f"Failed to save session snapshot: {e}")
+    except Exception:
+        pass
 
-    # Update state
+    # ── Update Student Model ──
+    # FIXED: Uses _pending_model_update from earlier load
+    if _pending_model_update is not None and _student_model_available:
+        try:
+            session_signals = _extract_session_signals(
+                message=text, response=response, student=student,
+                conversation_history=conversation_history,
+                recent_subject=recent_subject,
+            )
+            _pending_model_update.update_teaching_style(session_signals)
+            _pending_model_update.update_example_domains(session_signals)
+            _pending_model_update.update_communication_style(session_signals)
+            _pending_model_update.update_competence(session_signals)
+            await save_student_model(_pending_model_update)
+        except Exception as e:
+            logger.error(f"Student model update failed: {e}", exc_info=True)
+
+    # ── Update state ──
     try:
         if current_state == "idle":
             await set_state(student_id, "chatting", reason="First message")
         elif current_state == "paused":
             await set_state(student_id, "chatting", reason="Returned from pause")
-    except Exception as e:
-        logger.error(f"State update failed for {student_id}: {e}", exc_info=True)
+    except Exception:
+        pass
 
-    # JAMB Check trigger
+    # ── JAMB Check ──
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
+
+
+# ═══════════════════════════════════════════════
+# SESSION SIGNAL EXTRACTOR (for Student Model)
+# ═══════════════════════════════════════════════
+
+def _extract_session_signals(
+    message: str,
+    response: str,
+    student: dict,
+    conversation_history: list,
+    recent_subject: str,
+) -> dict:
+    """
+    Analyze a session to extract learning signals for the Student Model.
+    
+    Returns signals for: teaching_style, example_domains, communication, competence.
+    """
+    signals: Dict[str, Any] = {
+        "teaching_style": {},
+        "example_domains": {},
+        "communication": {},
+        "competence": {},
+        "subject": recent_subject,
+    }
+
+    msg_lower = message.strip().lower()
+    resp_lower = response.strip().lower()
+
+    # ── Teaching Style Signals ──
+    if any(phrase in msg_lower for phrase in ["give me an example", "show me", "can you give an example"]):
+        signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.3
+    if any(phrase in msg_lower for phrase in ["just the definition", "be direct", "straight to the point", "no examples"]):
+        signals["teaching_style"]["definitions"] = signals["teaching_style"].get("definitions", 0) + 0.3
+    if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
+        signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
+
+    if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
+        if any(word in resp_lower for word in ["example", "imagine", "think of"]):
+            signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.1
+        if any(word in resp_lower for word in ["definition", "is the", "refers to"]):
+            signals["teaching_style"]["definitions"] = signals["teaching_style"].get("definitions", 0) + 0.1
+
+    if "?" in message and len(message.split()) > 3:
+        signals["teaching_style"]["socratic"] = signals["teaching_style"].get("socratic", 0) + 0.15
+
+    # ── Example Domain Signals ──
+    domain_patterns = {
+        "transportation": ["keke", "danfo", "okada", "bus", "car", "vehicle", "suv"],
+        "food_cooking": ["suya", "puff-puff", "jollof", "garri", "food", "eat", "cook"],
+        "market_commerce": ["market", "mile 12", "buy", "sell", "trader", "price"],
+        "technology": ["phone", "app", "game", "download", "internet", "computer"],
+        "school_classroom": ["teacher", "class", "textbook", "exam", "school"],
+        "home_domestic": ["generator", "nepa", "fan", "tap", "light", "water"],
+        "body_physical": ["breathe", "heart", "run", "walk", "body", "hand"],
+        "nature_environment": ["rain", "sun", "wind", "plant", "tree", "river"],
+    }
+
+    rejection_phrases = ["i don't", "i dont", "never", "i have never", "i haven't"]
+    for domain, keywords in domain_patterns.items():
+        if any(kw in msg_lower for kw in keywords):
+            if any(phrase in msg_lower for phrase in rejection_phrases):
+                signals["example_domains"][domain] = "avoided"
+            else:
+                signals["example_domains"][domain] = "preferred"
+
+    for domain, keywords in domain_patterns.items():
+        if any(kw in resp_lower for kw in keywords):
+            if any(phrase in msg_lower for phrase in ["yes", "ok", "right", "get it", "understand", "makes sense"]):
+                if domain not in signals["example_domains"]:
+                    signals["example_domains"][domain] = "preferred"
+
+    # ── Communication Style Signals ──
+    pidgin_words = ["dey", "na", "wahala", "abeg", "omo", "sha", "nna", "abi",
+                    "wetin", "go", "come", "chop", "oya", "make", "e be", "wey"]
+    pidgin_count = sum(1 for word in pidgin_words if word in msg_lower)
+
+    formal_indicators = ["i am", "do not", "cannot", "will not", "i have", "i would"]
+    casual_indicators = ["i'm", "don't", "can't", "won't", "i've", "i'd", "bro", "guy"]
+
+    formal_count = sum(1 for ind in formal_indicators if ind in msg_lower)
+    casual_count = sum(1 for ind in casual_indicators if ind in msg_lower)
+
+    if pidgin_count >= 3:
+        signals["communication"]["full_pidgin"] = 0.3
+    elif pidgin_count >= 1:
+        signals["communication"]["pidgin_mixed"] = 0.2
+
+    if formal_count > casual_count:
+        signals["communication"]["formal_english"] = 0.2
+    else:
+        signals["communication"]["casual_english"] = 0.2
+
+    total_comm = formal_count + casual_count + pidgin_count
+    if total_comm > 0:
+        signals["formality_score"] = (formal_count * 1.0 + casual_count * 0.5) / (total_comm + 1)
+
+    # ── Competence Signals ──
+    if any(phrase in msg_lower for phrase in ["i understand", "i get it", "makes sense", "i see"]):
+        if recent_subject and recent_subject != "unknown":
+            topic = "discussed"
+            for hist_msg in reversed(conversation_history[-5:]):
+                if hist_msg.get("role") == "assistant":
+                    content = hist_msg.get("content", "")
+                    for keyword in ["Today:", "we'll cover", "focusing on", "Let's dive into"]:
+                        if keyword in content:
+                            parts = content.split(keyword, 1)
+                            if len(parts) > 1:
+                                topic = parts[1].strip().split(".")[0].strip()[:50]
+                                break
+            signals["competence"][f"{recent_subject}:{topic}"] = {
+                "score": 1.0,
+                "level": "mastered"
+            }
+
+    if any(phrase in resp_lower for phrase in ["not quite", "not exactly", "close", "almost"]):
+        if recent_subject and recent_subject != "unknown":
+            signals["competence"][f"{recent_subject}:discussed"] = {
+                "score": 0.3,
+                "level": "struggling"
+            }
+
+    return signals
 
 
 # ═══════════════════════════════════════════════
@@ -858,18 +807,14 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
             for subject in SUBJECT_MAP:
-                subject_display = subject.replace("_", " ")
-                if subject_display.lower() in content.lower():
+                if subject.replace("_", " ").lower() in content.lower():
                     return subject
-
     trouble_subject = student.get("student_subject")
     if trouble_subject:
         return trouble_subject
-
     subjects = student.get("subjects", [])
     if subjects and subjects[0]:
         return subjects[0]
-
     return None
 
 
@@ -882,43 +827,27 @@ async def _build_memory_context(student_id: str) -> str:
     from database.conversations import get_session_summary, get_student_memory
 
     context_parts: List[str] = []
-
     try:
         last_session = await get_session_summary(student_id)
-    except Exception as e:
-        logger.error(f"Failed to load session summary for {student_id}: {e}")
+    except Exception:
         last_session = None
 
     if last_session:
         subject = last_session.get("subject", "a subject")
         topic = last_session.get("topic", "a topic")
-        completed = last_session.get("completed", False)
-        score = last_session.get("score")
-        struggled = last_session.get("struggled_with", [])
-
-        has_content = (
-            subject not in ("unknown", "a subject", "") and
-            topic not in ("unknown", "a topic", "discussed", "")
-        )
-        
-        if has_content:
+        if subject not in ("unknown", "a subject", "") and topic not in ("unknown", "a topic", "discussed", ""):
             session_line = f"LAST SESSION: {subject} - {topic}."
-            if completed:
+            if last_session.get("completed"):
                 session_line += " Completed."
-                if score is not None:
-                    session_line += f" Score: {int(score * 100)}%."
-            else:
-                session_line += " Not completed."
-
-            if struggled:
-                session_line += f" Struggled with: {', '.join(struggled)}."
-
+                if last_session.get("score") is not None:
+                    session_line += f" Score: {int(last_session['score'] * 100)}%."
+            if last_session.get("struggled_with"):
+                session_line += f" Struggled with: {', '.join(last_session['struggled_with'])}."
             context_parts.append(session_line)
 
     try:
         memory = await get_student_memory(student_id)
-    except Exception as e:
-        logger.error(f"Failed to load student memory for {student_id}: {e}")
+    except Exception:
         memory = None
 
     if memory:
@@ -926,8 +855,6 @@ async def _build_memory_context(student_id: str) -> str:
         strengths = memory.get("strong_in", [])
         mastered = memory.get("topics_mastered", [])
         sessions_count = memory.get("sessions_completed", 0)
-        pace = memory.get("preferred_pace")
-
         if struggles:
             context_parts.append(f"STUDENT STRUGGLES WITH: {', '.join(struggles[-5:])}.")
         if strengths:
@@ -936,13 +863,8 @@ async def _build_memory_context(student_id: str) -> str:
             context_parts.append(f"TOPICS MASTERED: {', '.join(mastered[-5:])}.")
         if sessions_count > 0:
             context_parts.append(f"Sessions completed: {sessions_count}.")
-        if pace:
-            context_parts.append(f"Preferred pace: {pace}.")
 
-    if context_parts:
-        return "MEMORY CONTEXT:\n" + "\n".join(context_parts)
-
-    return ""
+    return "MEMORY CONTEXT:\n" + "\n".join(context_parts) if context_parts else ""
 
 
 # ═══════════════════════════════════════════════
@@ -953,62 +875,44 @@ _QUIZ_TRACKER: Dict[str, List[str]] = {}
 
 
 async def _load_questions(subject: str) -> List[Dict[str, Any]]:
-    """Load quiz questions for a subject with layered fallback."""
+    """Load quiz questions for a subject."""
     cache_key = f"questions_cache:{subject}"
     try:
         cached = redis_client.get(cache_key)
         if cached:
             cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
-            logger.debug(f"Cache hit for questions:{subject}")
             return json.loads(cached_str)
     except Exception:
         pass
 
     questions: List[Dict[str, Any]] = []
-
     try:
         from database.client import supabase
-        result = (
-            supabase.table("questions")
-            .select("*")
-            .eq("subject", subject)
-            .order("id", desc=False)
-            .limit(200)
-            .execute()
-        )
+        result = supabase.table("questions").select("*").eq("subject", subject).order("id", desc=False).limit(200).execute()
         if result.data:
             questions = result.data
-            logger.info(f"Loaded {len(questions)} questions from database for {subject}")
-    except Exception as e:
-        logger.warning(f"Database question load failed for {subject}: {e}")
+    except Exception:
+        pass
 
     if not questions:
         try:
-            json_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..",
-                "jamb_questions_clean.json"
-            )
-            json_path = os.path.abspath(json_path)
+            json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jamb_questions_clean.json")
             with open(json_path, "r", encoding="utf-8") as f:
                 all_questions = json.load(f)
             questions = [q for q in all_questions if q.get("subject") == subject]
-        except FileNotFoundError:
-            logger.error(f"Question JSON file not found: {json_path}")
-        except Exception as e:
-            logger.error(f"JSON question load failed for {subject}: {e}")
+        except Exception:
+            pass
 
     if questions:
         try:
             redis_client.setex(cache_key, 300, json.dumps(questions))
         except Exception:
             pass
-
     return questions
 
 
 async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "") -> None:
-    """Start a quiz session for the student."""
+    """Start a quiz session."""
     student_id = str(student["id"])
     student_subjects = student.get("subjects", [])
     student_track = _infer_track(student_subjects)
@@ -1017,11 +921,9 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
         fallback = TRACK_FALLBACKS.get(student_track, TRACK_FALLBACKS["unknown"])
         subjects_pool = fallback.copy()
         if student_track == "unknown":
-            await send_telegram_message(
-                chat_id,
-                "Your subject preferences aren't set yet. "
-                "I'll ask some general questions for now. "
-                "Reply with your subject (e.g. *Government*, *Physics*) to get specific quizzes."
+            await send_telegram_message(chat_id,
+                "Your subject preferences aren't set yet. Reply with your subject "
+                "(e.g. *Government*, *Physics*) to get specific quizzes."
             )
     else:
         subjects_pool = student_subjects.copy()
@@ -1042,18 +944,17 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 
     subject = requested_subject if requested_subject else _pick_rotated_subject(student_id, subjects_pool)
     db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
-
     questions = await _load_questions(db_subject)
+
     if not questions:
         await send_telegram_message(chat_id,
-            f"No questions found for *{db_subject.replace('_', ' ').title()}* yet. "
-            f"Try another subject — type *quiz {subjects_pool[0] if subjects_pool else 'maths'}* if you like."
+            f"No questions found for *{db_subject.replace('_', ' ').title()}* yet."
         )
         return
 
     question = random.choice(questions)
     if not _validate_question(question):
-        await send_telegram_message(chat_id, "This question has invalid options. Let me try another. Type *quiz*.")
+        await send_telegram_message(chat_id, "This question has invalid options. Type *quiz* to try another.")
         return
 
     quiz_key = f"active_quiz:{student_id}"
@@ -1073,10 +974,8 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 
     display_subject = db_subject.replace("_", " ").title()
     question_body = question.get("question_text", question.get("question", "Question loading..."))
-    question_text = f"📝 *{display_subject}*\n\n{question_body}\n\n_Tap your answer below:_"
-
     try:
-        await send_telegram_message(chat_id, question_text, reply_markup=keyboard)
+        await send_telegram_message(chat_id, f"📝 *{display_subject}*\n\n{question_body}\n\n_Tap your answer below:_", reply_markup=keyboard)
     except Exception:
         try:
             redis_client.delete(quiz_key)
@@ -1085,28 +984,25 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 
 
 async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_data: str) -> None:
-    """Handle inline keyboard callback queries from quiz buttons."""
+    """Handle quiz button callbacks."""
     try:
         await answer_callback_query(callback_query_id, text="")
     except Exception:
         pass
-
     try:
         from database.students import get_student_by_platform_id
         student = await get_student_by_platform_id("telegram", str(chat_id))
     except Exception:
         return
-
     if not student:
         await send_telegram_message(chat_id, "I can't find your account. Type *HI* to restart.")
         return
-
     if callback_data in ("A", "B", "C", "D"):
         await _handle_quiz_answer(chat_id, student, callback_data)
 
 
 async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str) -> None:
-    """Evaluate a quiz answer and provide feedback."""
+    """Evaluate a quiz answer."""
     student_id = str(student["id"])
     quiz_key = f"active_quiz:{student_id}"
     name = student.get("name", "Student").split()[0]
@@ -1136,19 +1032,13 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     is_correct = (answer == correct)
 
     explanation = question.get("explanation_correct") or question.get("explanation") or ""
-    wrong_explanation = question.get(f"explanation_{answer.lower()}") or ""
 
     if is_correct:
-        response = f"✅ *Correct!*\n\n"
-        if explanation:
-            response += f"{explanation}\n\n"
-        response += f"Well done, {name}!"
+        response = f"✅ *Correct!*\n\n{explanation}\n\nWell done, {name}!" if explanation else f"✅ *Correct!*\n\nWell done, {name}!"
     else:
         response = f"❌ That's not quite right.\n\nThe correct answer is *{correct}*."
         if explanation:
             response += f"\n\n{explanation}"
-        if wrong_explanation:
-            response += f"\n\n💡 *Why {answer} wasn't right:* {wrong_explanation}"
 
     opt_key = f"option_{answer.lower()}"
     correct_key = f"option_{correct.lower()}"
@@ -1159,7 +1049,6 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
 
     _log_quiz_answer(student_id, question, is_correct)
     response += "\n\nType *quiz* for another question!"
-
     try:
         await send_telegram_message(chat_id, response)
     except Exception:
@@ -1167,7 +1056,7 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
 
 
 def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool) -> None:
-    """Log quiz answer to Redis for progress tracking."""
+    """Log quiz answer to Redis."""
     try:
         key = f"quiz_history:{student_id}"
         entry = json.dumps({
@@ -1186,7 +1075,7 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
 
 
 def _validate_question(question: Dict[str, Any]) -> bool:
-    """Validate that a question dict has the required fields for a quiz."""
+    """Validate question has required fields."""
     if not question.get("question_text") and not question.get("question"):
         return False
     if not question.get("correct_answer"):
@@ -1198,7 +1087,7 @@ def _validate_question(question: Dict[str, Any]) -> bool:
 
 
 def _infer_track(subjects: List[str]) -> str:
-    """Infer the student's academic track from their subject list."""
+    """Infer student's academic track."""
     if not subjects:
         return "unknown"
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
@@ -1233,8 +1122,7 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
 
 async def warmup_question_cache() -> None:
     """Preload common subjects into Redis cache."""
-    common_subjects = ["mathematics", "english", "physics", "chemistry", "biology", "government", "economics"]
-    for subject in common_subjects:
+    for subject in ["mathematics", "english", "physics", "chemistry", "biology", "government", "economics"]:
         try:
             await _load_questions(subject)
         except Exception:
