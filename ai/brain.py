@@ -13,16 +13,25 @@ Response Cache:
     Normalizes questions so "What is Osmosis??" and "what is osmosis"
     hit the same cache. 7-day TTL. Cuts token costs by ~80%.
     Only caches knowledge questions — not greetings, quizzes, or personal messages.
+
+Domain Boundary Enforcement (NEW):
+    After the AI generates a response, checks it against the Student Model's
+    avoided domains. If the response contains words from a domain the student
+    has explicitly rejected, logs a violation warning.
+    Future: regenerate the response instead of sending.
 """
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
 from datetime import datetime, timezone
 from groq import Groq
 from config.settings import settings
 from ai.prompts import get_wax_system_prompt, get_lite_prompt
+
+logger = logging.getLogger("waxprep.ai_brain")
 
 # Cache for Groq clients — one per API key
 _clients = {}
@@ -177,10 +186,10 @@ async def _get_cached_response(message: str) -> str | None:
         if cached:
             # Decode bytes to string
             cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
-            print(f"Cache HIT: {message[:50]}...")
+            logger.debug(f"Cache HIT: {message[:50]}...")
             return cached_str
     except Exception as e:
-        print(f"Cache read error: {e}")
+        logger.error(f"Cache read error: {e}")
     
     return None
 
@@ -198,9 +207,9 @@ async def _cache_response(message: str, response: str) -> None:
         
         cache_key = f"response_cache:{_normalize_for_cache(message)}"
         redis_client.setex(cache_key, CACHE_TTL, response)
-        print(f"Cache SAVED: {message[:50]}...")
+        logger.debug(f"Cache SAVED: {message[:50]}...")
     except Exception as e:
-        print(f"Cache write error: {e}")
+        logger.error(f"Cache write error: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -278,7 +287,139 @@ def enforce_nigerian_example(response: str) -> str:
     if len(sentences) >= 3:
         has_nigerian = any(term in response.lower() for term in nigerian_terms)
         if not has_nigerian:
-            print(f"WARNING: Teaching response has no Nigerian example")
+            logger.warning("Teaching response has no Nigerian example")
+    
+    return response
+
+
+# ═══════════════════════════════════════════════
+# DOMAIN BOUNDARY ENFORCEMENT (NEW)
+# ═══════════════════════════════════════════════
+
+# Keywords per domain. If a student has a domain marked as "avoided,"
+# any response containing these words gets flagged.
+DOMAIN_KEYWORDS = {
+    "transportation": [
+        "keke", "danfo", "okada", "bus", "vehicle", "car", "transport",
+        "napep", "driver", "highway", "road", "traffic", "garage",
+        "motor", "bike", "bicycle", "train", "airport", "flying",
+    ],
+    "food_cooking": [
+        "suya", "puff-puff", "puff puff", "jollof", "garri", "food", "cook",
+        "eat", "kitchen", "recipe", "ingredient", "meal", "dinner",
+        "lunch", "breakfast", "snack", "fry", "boil", "stew", "soup",
+    ],
+    "market_commerce": [
+        "market", "mile 12", "mile12", "trade", "buy", "sell", "trader",
+        "price", "bargain", "customer", "shop", "store", "mall",
+        "business", "profit", "money", "cash", "trading",
+    ],
+    "technology": [
+        "phone", "tech", "internet", "computer", "app", "download",
+        "laptop", "software", "hardware", "digital", "online", "website",
+        "data", "wifi", "screen", "button", "click", "smartphone",
+    ],
+    "school_classroom": [
+        "teacher", "class", "textbook", "exam", "school", "classroom",
+        "student", "desk", "blackboard", "homework", "principal",
+        "lesson", "grade", "report card", "uniform",
+    ],
+    "home_domestic": [
+        "generator", "nepa", "fan", "tap", "light", "water", "home",
+        "backyard", "house", "room", "kitchen", "living room",
+        "bedroom", "door", "window", "roof", "fence",
+    ],
+    "body_physical": [
+        "breathe", "heart", "run", "walk", "body", "hand", "breathing",
+        "leg", "arm", "finger", "muscle", "bone", "blood", "brain",
+    ],
+    "nature_environment": [
+        "rain", "sun", "wind", "plant", "tree", "river", "cassava",
+        "garden", "flower", "ocean", "mountain", "forest", "sky",
+        "weather", "climate",
+    ],
+    "religion_worship": [
+        "church", "mosque", "pastor", "imam", "pray", "bible", "quran",
+        "god", "allah", "worship", "sermon", "faith", "spiritual",
+    ],
+    "football_sports": [
+        "football", "match", "player", "goal", "stadium", "sport",
+        "team", "coach", "score", "ball", "penalty", "league",
+    ],
+    "extended_family": [
+        "uncle", "aunty", "cousin", "nephew", "niece", "grandmother",
+        "grandfather", "in-law", "family", "relative", "sibling",
+    ],
+    "nollywood_media": [
+        "nollywood", "movie", "film", "actor", "actress", "scene",
+        "script", "director", "cinema", "drama", "episode",
+    ],
+    "nysc_corper": [
+        "corper", "nysc", "camp", "service year", "orientation",
+        "ppfa", "clearance", "cds", "pop", "passing out",
+    ],
+}
+
+
+async def enforce_domain_boundaries(
+    response: str,
+    student_id: str,
+    student_model=None
+) -> str:
+    """
+    Check response against Student Model's avoided domains.
+    
+    If the student has explicitly rejected a domain and the AI's response
+    contains words from that domain, flag it as a violation.
+    
+    Currently: Logs a warning. Future: Regenerate the response.
+    
+    Args:
+        response: The AI-generated response text
+        student_id: Student's database ID
+        student_model: Pre-loaded StudentModel (optional — loads if not provided)
+        
+    Returns:
+        The original response (with violation logged)
+    """
+    # Skip if response is too short to contain domain references
+    if len(response.strip()) < 15:
+        return response
+    
+    try:
+        # Load model if not provided
+        if student_model is None:
+            from brain.student_model import load_student_model
+            student_model = await load_student_model(student_id)
+        
+        avoided = student_model.get_avoided_domains()
+        
+        if not avoided:
+            return response
+        
+        resp_lower = response.lower()
+        violations = []
+        
+        for domain in avoided:
+            keywords = DOMAIN_KEYWORDS.get(domain, [domain])
+            found_words = [kw for kw in keywords if kw in resp_lower]
+            if found_words:
+                violations.append({
+                    "domain": domain,
+                    "words_found": found_words,
+                })
+        
+        if violations:
+            for v in violations:
+                logger.warning(
+                    f"DOMAIN VIOLATION: Student {student_id} has '{v['domain']}' "
+                    f"as avoided, but response contains: {v['words_found']}"
+                )
+            # Future: Regenerate response or replace with safe fallback
+            # For now, log the violation so we can measure frequency
+    
+    except Exception as e:
+        logger.error(f"Domain boundary enforcement error: {e}")
     
     return response
 
@@ -287,6 +428,8 @@ def enforce_rules(response: str) -> str:
     """
     Run all post-processing enforcement rules.
     Order matters: clean phrases first, then trim questions, then trim length.
+    
+    Note: Domain boundary enforcement runs separately (async, needs student_id).
     """
     # 1. Remove banned phrases
     response = clean_banned_phrases(response)
@@ -324,6 +467,9 @@ async def think(
     Response caching: Checks Redis before calling AI. If the same question
     was answered before, returns cached response instantly. Cuts token costs
     by ~80% for common questions like "what is osmosis".
+    
+    Domain boundary enforcement: After the AI generates a response, checks
+    it against the Student Model's avoided domains. Logs violations.
     
     Args:
         message: The student's latest message
@@ -403,7 +549,7 @@ async def think(
                 _current_key_index = (key_index + 1) % len(keys)
                 break
             
-            print(f"Groq returned empty/short response for student {student_id}")
+            logger.warning(f"Groq returned empty/short response for student {student_id}")
             
         except Exception as e:
             error_type = type(e).__name__
@@ -416,14 +562,14 @@ async def think(
             )
             
             if is_rate_limit:
-                print(
+                logger.warning(
                     f"Groq rate limit on key {key_index+1}/{len(keys)} "
                     f"(attempt {attempt+1}/{max_retries}). Rotating key..."
                 )
                 # Don't sleep — just try next key immediately
                 continue
             else:
-                print(
+                logger.error(
                     f"Groq error (attempt {attempt+1}/{max_retries}): "
                     f"{error_type}: {error_str[:100]} | student={student_id}"
                 )
@@ -452,6 +598,16 @@ async def think(
         cleaned_response = clean_banned_phrases(raw_response)
         cleaned_response = enforce_length(cleaned_response, max_chars=500)
     
+    # ── Domain boundary enforcement (NEW) ──
+    # Check if this response violates any avoided domains.
+    # Logs violations. Future: Regenerate instead of sending.
+    try:
+        cleaned_response = await enforce_domain_boundaries(
+            cleaned_response, student_id
+        )
+    except Exception as e:
+        logger.error(f"Domain enforcement failed: {e}", exc_info=True)
+    
     # ── Cache this response for future use ──
     if _is_cacheable(message):
         await _cache_response(message, cleaned_response)
@@ -462,4 +618,7 @@ async def think(
 def _log_ai_failure(student_id: str, error_type: str, error_message: str):
     """Log AI failures for monitoring."""
     timestamp = datetime.now(timezone.utc).isoformat()
-    print(f"AI_FAILURE | {timestamp} | student={student_id} | {error_type}: {error_message[:200]}")
+    logger.critical(
+        f"AI_FAILURE | {timestamp} | student={student_id} | "
+        f"{error_type}: {error_message[:200]}"
+    )
