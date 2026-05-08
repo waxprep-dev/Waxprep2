@@ -322,22 +322,19 @@ async def _step_pin_entry(chat_id: int, state: dict, message: str):
 
 
 # ═══════════════════════════════════════════════
-# STEP: name (FIXED: accepts single names)
+# STEP: name
 # ═══════════════════════════════════════════════
 
 @register_step("name")
 async def _step_name(chat_id: int, state: dict, message: str):
     name = clean_name(message)
 
-    # FIXED (Bug #1): Accept single names. Not everyone has two names.
-    # Minimum 2 characters — that's it.
     if len(name) < 2:
         await send_telegram_message(chat_id,
             "Give me a name — something I can call you. Doesn't have to be your full name."
         )
         return
 
-    # FIXED (Bug #5): If multiple names given, use first + last for formal moments
     parts = name.split()
     first = parts[0]
     if len(parts) >= 2:
@@ -513,6 +510,7 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
         class_level=state.get("class_level"),
         target_exam=state.get("target_exam"),
         subjects=subjects,
+        student_subject=state.get("student_subject"),
         student_state=state.get("student_state"),
     )
     if not student:
