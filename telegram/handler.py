@@ -6,6 +6,9 @@ Supports callback queries (inline keyboard) AND text-based answers.
 
 Now with JAMB Subject Checker — Wax proactively brings up university
 ambition at natural moments after trust is built.
+
+Now with Deferral Handler — when a student says "anything" or "you pick,"
+Wax takes control. Doesn't ask again. Leads.
 """
 import asyncio
 import hashlib
@@ -23,6 +26,15 @@ logger = logging.getLogger("waxprep.handler")
 
 # ── Quiz trigger keywords ────────────────────
 QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
+
+# ── Deferral keywords ─────────────────────────
+# When a student says any of these, Wax takes control.
+# No more asking "what subject?" — the teacher leads.
+DEFERRAL_KEYWORDS = [
+    "anything", "you pick", "any one", "whatever",
+    "up to you", "choose for me", "i don't know what to study",
+    "i don't care", "surprise me",
+]
 
 # ── Subject name mapping (student profile display → database column) ──
 SUBJECT_MAP: Dict[str, str] = {
@@ -72,6 +84,9 @@ MAX_QUIZ_HISTORY = 200
 
 # JAMB check cooldown — 7 days between prompts
 JAMB_CHECK_COOLDOWN = 604800  # 7 days in seconds
+
+# Deferral count TTL — 1 hour (resets each session)
+DEFERRAL_TTL = 3600
 
 
 async def process_telegram_message(chat_id: int, text: str) -> None:
@@ -149,10 +164,11 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     Route a registered student's message to the appropriate handler.
     
     Priority:
-    1. JAMB ambition response (if Wax asked about university)
-    2. Quiz answer (single letter, active quiz exists)
-    3. Quiz trigger (explicit quiz keywords)
-    4. AI conversation (everything else)
+    0. JAMB ambition response (if Wax asked about university)
+    0.5. Deferral keywords — "anything", "you pick" → Wax leads
+    1. Quiz answer (single letter, active quiz exists)
+    2. Quiz trigger (explicit quiz keywords)
+    3. AI conversation (everything else)
     """
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
@@ -167,6 +183,12 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
             return
     except Exception:
         pass
+
+    # 0.5. Deferral keywords — student says "anything" or "you pick"
+    # Wax takes control. Doesn't ask again. Leads.
+    if any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS):
+        await _handle_deferral(chat_id, student, student_id, name, msg_lower)
+        return
 
     # 1. Quiz answer detection
     cleaned = text.strip().upper()
@@ -186,6 +208,92 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
 
     # 3. AI conversation
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
+
+
+# ═══════════════════════════════════════════════
+# DEFERRAL HANDLER — "anything" / "you pick"
+# ═══════════════════════════════════════════════
+
+async def _handle_deferral(
+    chat_id: int,
+    student: dict,
+    student_id: str,
+    name: str,
+    msg_lower: str
+) -> None:
+    """
+    Handle when a student defers — "anything", "you pick", "whatever."
+    
+    Wax doesn't ask again. The teacher leads. The student's trouble subject
+    from onboarding is used. Deferral count escalates firmness across
+    three levels — warm, firm, direct.
+    
+    Args:
+        chat_id: Telegram chat ID
+        student: Student profile dict
+        student_id: String student ID
+        name: Student's first name
+        msg_lower: Lowercase message for keyword matching
+    """
+    from database.conversations import save_message
+
+    # Determine the trouble subject
+    trouble_subject = student.get("student_subject")
+    if not trouble_subject:
+        # Fallback: try to infer from conversation or profile
+        trouble_subject = _infer_recent_subject(student, [])
+    if not trouble_subject or trouble_subject in ("unknown", "a subject", ""):
+        # Last fallback: Mathematics — universal foundation
+        trouble_subject = "Mathematics"
+
+    # Track how many times this student has deferred
+    deferral_key = f"deferral_count:{student_id}"
+    deferral_count = 0
+    try:
+        raw = redis_client.get(deferral_key)
+        if raw:
+            raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            deferral_count = int(raw_str)
+    except Exception:
+        pass
+
+    deferral_count += 1
+
+    # Build response based on escalation level
+    if deferral_count == 1:
+        # First time — warm but firm. References their emotional check-in.
+        response = (
+            f"{trouble_subject}. You said it's been confusing you — "
+            f"that's exactly where we start. Let's go."
+        )
+    elif deferral_count == 2:
+        # Second time — firmer, uses their own words against hesitation
+        response = (
+            f"{name}, I already picked. {trouble_subject}. You told me "
+            f"it's confusing and you're not alone in that. But running "
+            f"from it won't help. Let's face it together. Ready?"
+        )
+    else:
+        # Third+ time — direct, no explanation needed. The teacher stands firm.
+        response = (
+            f"{trouble_subject}, {name}. No more running. We're doing this. "
+            f"Tell me what you already know about {trouble_subject}."
+        )
+
+    # Update deferral count with TTL
+    try:
+        redis_client.setex(deferral_key, DEFERRAL_TTL, str(deferral_count))
+    except Exception:
+        pass
+
+    # Save and send — bypass AI entirely
+    try:
+        await save_message(student_id, "assistant", response)
+    except Exception:
+        pass
+
+    await send_telegram_message(chat_id, response)
+    logger.info(f"Deferral handled for {student_id}: count={deferral_count}, subject={trouble_subject}")
 
 
 # ═══════════════════════════════════════════════
