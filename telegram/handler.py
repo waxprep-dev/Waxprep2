@@ -22,6 +22,9 @@ example domains, communication style, and competence map adapt over time.
 
 Now with Preference Detection — statements like "I don't like market examples"
 or "I prefer short definitions" are routed to AI, not intercepted by deferral.
+
+Now with Topic Coherence Check — when a student hops between topics without
+completing any, Wax gently guides them toward focus.
 """
 import asyncio
 import hashlib
@@ -41,8 +44,6 @@ logger = logging.getLogger("waxprep.handler")
 QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
 
 # ── Deferral keywords ─────────────────────────
-# FIXED: These are ONLY for subject-choice deflection.
-# Preference statements ("I prefer X", "I don't like Y") are NOT deferral.
 DEFERRAL_KEYWORDS = [
     "anything", "you pick", "any one", "whatever",
     "up to you", "choose for me", "i don't know what to study",
@@ -50,8 +51,6 @@ DEFERRAL_KEYWORDS = [
 ]
 
 # ── Preference keywords ───────────────────────
-# These indicate the student is stating a preference, not deflecting.
-# They should NEVER trigger the deferral handler.
 PREFERENCE_KEYWORDS = [
     "i prefer", "i don't like", "i dont like", "i like",
     "use something from", "don't use", "dont use",
@@ -127,7 +126,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     try:
         from admin.commands import handle_admin_command
         if await handle_admin_command(chat_id, text):
-            logger.info(f"Admin command handled for chat_id={chat_id}")
             return
     except ImportError:
         pass
@@ -171,22 +169,11 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
-    """
-    Route a registered student's message to the appropriate handler.
-    
-    Priority:
-    0. JAMB ambition response
-    0.3. Session end keywords
-    0.5. Deferral keywords (BUT NOT preference statements)
-    1. Quiz answer
-    2. Quiz trigger
-    3. AI conversation
-    """
+    """Route a registered student's message to the appropriate handler."""
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
-    # 0. JAMB ambition response
     try:
         from database.onboarding_state import get_onboarding_state
         jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
@@ -196,14 +183,10 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
-    # 0.3. Session end keywords
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
-    # 0.5. Deferral keywords — BUT skip if it's a preference statement
-    # FIXED: "I don't like market examples" is a preference, not a deferral.
-    # "I prefer short definitions" is a preference, not a deferral.
     is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
     is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
     
@@ -211,7 +194,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
-    # 1. Quiz answer detection
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -222,12 +204,10 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         except Exception:
             pass
 
-    # 2. Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
 
-    # 3. AI conversation — handles preferences, teaching style changes, domain requests
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
@@ -341,7 +321,7 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
 async def _handle_deferral(
     chat_id: int, student: dict, student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle when a student defers — ONLY for subject-choice deflection."""
+    """Handle when a student defers."""
     from database.conversations import save_message
 
     trouble_subject = student.get("student_subject")
@@ -411,11 +391,9 @@ async def _maybe_trigger_jamb_check(
     name = student.get("name", "Student").split()[0]
     await send_telegram_message(chat_id,
         f"{name}, real quick before you go. I've been teaching you and you're "
-        f"making progress — that persistence is paying off. But I want to make "
-        f"sure I'm preparing you for the right thing.\n\n"
-        f"Have you thought about what you want to study in university? "
-        f"No pressure if you haven't figured it out yet. Just type your course "
-        f"or say 'not sure' — whatever is true."
+        f"making progress. But I want to make sure I'm preparing you for the "
+        f"right thing.\n\nHave you thought about what you want to study in "
+        f"university? No pressure if you haven't figured it out yet."
     )
     try:
         redis_client.setex(cooldown_key, JAMB_CHECK_COOLDOWN, "1")
@@ -443,9 +421,8 @@ async def _handle_jamb_ambition_response(
     if msg.lower() in dont_know or any(phrase in msg.lower() for phrase in dont_know):
         await send_telegram_message(chat_id,
             f"No wahala. Plenty of SS3 students are still figuring it out. "
-            f"I was the same. Here's what I'll do — as we keep studying, I'll "
-            f"pay attention to what you're naturally good at and what you enjoy. "
-            f"After a few more sessions, I might have some suggestions for you. Sound good?"
+            f"As we keep studying, I'll pay attention to what you're naturally "
+            f"good at. After a few more sessions, I might have suggestions."
         )
         return
 
@@ -490,16 +467,16 @@ async def _handle_jamb_ambition_response(
     )
     message += (
         f"\n\nAnd {name}? This doesn't mean you're not smart enough. "
-        f"It means nobody told you earlier what you needed — and that's not your fault."
+        f"It means nobody told you earlier — and that's not your fault."
     )
     if alternatives:
         alt_names = [a["display"] for a in alternatives[:3]]
-        message += f"\n\nBut you're already on track for {', '.join(alt_names)} with the subjects you have right now."
+        message += f"\n\nBut you're already on track for {', '.join(alt_names)} with your current subjects."
     await send_telegram_message(chat_id, message)
 
 
 # ═══════════════════════════════════════════════
-# AI CONVERSATION HANDLER — WITH STUDENT MODEL
+# AI CONVERSATION HANDLER
 # ═══════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -514,12 +491,13 @@ async def _handle_ai_conversation(
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
 
-    # ── Import detectors and model (function-level to prevent circular imports) ──
     try:
-        from brain.detectors import detect_confusion, reset_confusion_count
+        from brain.detectors import detect_confusion, reset_confusion_count, detect_topic_hopping
         _confusion_detector_available = True
+        _coherence_detector_available = True
     except ImportError:
         _confusion_detector_available = False
+        _coherence_detector_available = False
 
     try:
         from brain.student_model import load_student_model, save_student_model
@@ -527,19 +505,16 @@ async def _handle_ai_conversation(
     except ImportError:
         _student_model_available = False
 
-    # ── Save user message ──
     try:
         await save_message(student_id, "user", text)
     except Exception:
         pass
 
-    # ── Load conversation history ──
     try:
         conversation_history = await get_history(student_id)
     except Exception:
         conversation_history = []
 
-    # ── Load current state ──
     try:
         current_state = await get_state(student_id)
         if not current_state:
@@ -547,30 +522,22 @@ async def _handle_ai_conversation(
     except Exception:
         current_state = "idle"
 
-    # ── Determine recent subject ──
     recent_subject = _infer_recent_subject(student, conversation_history)
     current_topic = recent_subject or "unknown"
 
-    # ── Build memory context ──
     try:
         context_str = await _build_memory_context(student_id)
     except Exception:
         context_str = ""
 
-    # ── Load Student Model ──
     _pending_model_update = None
 
     if _student_model_available:
         try:
             student_model = await load_student_model(student_id)
             model_context = student_model.to_prompt_context()
-
             if model_context:
-                if context_str:
-                    context_str = model_context + "\n\n" + context_str
-                else:
-                    context_str = model_context
-
+                context_str = model_context + "\n\n" + context_str if context_str else model_context
             _pending_model_update = student_model
         except Exception as e:
             logger.error(f"Student model load failed: {e}", exc_info=True)
@@ -596,18 +563,33 @@ async def _handle_ai_conversation(
             )
 
             if confusion["confused"]:
-                if context_str:
-                    context_str = confusion["context_instruction"] + "\n\n" + context_str
-                else:
-                    context_str = confusion["context_instruction"]
+                context_str = confusion["context_instruction"] + "\n\n" + context_str if context_str else confusion["context_instruction"]
                 _pending_confusion_reset = True
         except Exception as e:
             logger.error(f"Confusion detection failed: {e}", exc_info=True)
 
-    # ── Determine practice mode ──
+    # ── Topic Coherence Check (NEW) ──
+    if _coherence_detector_available:
+        try:
+            coherence = detect_topic_hopping(
+                conversation_history=conversation_history,
+                current_message=text,
+                student_id=student_id,
+            )
+
+            if coherence["hopping"]:
+                context_str = coherence["context_instruction"] + "\n\n" + context_str if context_str else coherence["context_instruction"]
+                logger.info(
+                    f"Topic hopping detected for {student_id}: "
+                    f"{coherence['count']} topics, stage={coherence['stage']}"
+                )
+                if _pending_model_update is not None:
+                    _pending_model_update.recent_topics = coherence["topics"]
+        except Exception as e:
+            logger.error(f"Topic coherence check failed: {e}", exc_info=True)
+
     is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
 
-    # ── Call AI brain ──
     try:
         response = await think(
             message=text, student=student,
@@ -619,7 +601,6 @@ async def _handle_ai_conversation(
         logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
-    # ── Output safety check ──
     try:
         from brain.safety import check_output_safety
         if await check_output_safety(response):
@@ -629,7 +610,6 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # ── Save and send response ──
     try:
         await save_message(student_id, "assistant", response)
     except Exception:
@@ -639,7 +619,6 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # ── Post-response: reset confusion counter ──
     if _pending_confusion_reset and _confusion_detector_available:
         try:
             if any(phrase in response.lower() for phrase in UNDERSTANDING_PHRASES):
@@ -647,10 +626,8 @@ async def _handle_ai_conversation(
         except Exception:
             pass
 
-    # ── Save session snapshot ──
     try:
         from database.conversations import save_session_summary
-
         user_msg_count = sum(1 for m in conversation_history[-10:] if m.get("role") == "user")
         if user_msg_count >= 2:
             session_topic = _extract_topic_from_history(conversation_history)
@@ -668,7 +645,6 @@ async def _handle_ai_conversation(
                             if extracted and len(extracted) > 2:
                                 session_topic = extracted
                                 break
-
             await save_session_summary(student_id, {
                 "subject": recent_subject or "unknown",
                 "topic": session_topic,
@@ -678,7 +654,6 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # ── Update Student Model ──
     if _pending_model_update is not None and _student_model_available:
         try:
             session_signals = _extract_session_signals(
@@ -694,7 +669,6 @@ async def _handle_ai_conversation(
         except Exception as e:
             logger.error(f"Student model update failed: {e}", exc_info=True)
 
-    # ── Update state ──
     try:
         if current_state == "idle":
             await set_state(student_id, "chatting", reason="First message")
@@ -703,26 +677,18 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # ── JAMB Check ──
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
 
 
 # ═══════════════════════════════════════════════
-# SESSION SIGNAL EXTRACTOR (for Student Model)
+# SESSION SIGNAL EXTRACTOR
 # ═══════════════════════════════════════════════
 
 def _extract_session_signals(
-    message: str,
-    response: str,
-    student: dict,
-    conversation_history: list,
-    recent_subject: str,
+    message: str, response: str, student: dict,
+    conversation_history: list, recent_subject: str,
 ) -> dict:
-    """
-    Analyze a session to extract learning signals for the Student Model.
-    
-    Returns signals for: teaching_style, example_domains, communication, competence.
-    """
+    """Analyze a session to extract learning signals for the Student Model."""
     signals: Dict[str, Any] = {
         "teaching_style": {},
         "example_domains": {},
@@ -734,47 +700,34 @@ def _extract_session_signals(
     msg_lower = message.strip().lower()
     resp_lower = response.strip().lower()
 
-    # ── Teaching Style Signals ──
-    if any(phrase in msg_lower for phrase in ["give me an example", "show me", "can you give an example"]):
+    if any(phrase in msg_lower for phrase in ["give me an example", "show me"]):
         signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.3
-    if any(phrase in msg_lower for phrase in ["just the definition", "be direct", "straight to the point", "no examples"]):
+    if any(phrase in msg_lower for phrase in ["just the definition", "be direct", "no examples"]):
         signals["teaching_style"]["definitions"] = signals["teaching_style"].get("definitions", 0) + 0.3
     if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
         signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
-    # FIXED: "I changed my mind" + request for example = shift toward examples
-    if any(phrase in msg_lower for phrase in ["i changed my mind"]) and any(
-        phrase in msg_lower for phrase in ["example", "show me"]
-    ):
-        signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.25
 
     if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
         if any(word in resp_lower for word in ["example", "imagine", "think of"]):
             signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.1
-        if any(word in resp_lower for word in ["definition", "is the", "refers to"]):
-            signals["teaching_style"]["definitions"] = signals["teaching_style"].get("definitions", 0) + 0.1
 
-    if "?" in message and len(message.split()) > 3:
-        signals["teaching_style"]["socratic"] = signals["teaching_style"].get("socratic", 0) + 0.15
-
-    # ── Example Domain Signals ──
-    # FIXED: Added explicit domain rejection phrases that students actually use
     domain_patterns = {
-        "transportation": ["keke", "danfo", "okada", "bus", "car", "vehicle", "suv", "transport"],
-        "food_cooking": ["suya", "puff-puff", "puff puff", "jollof", "garri", "food", "eat", "cook", "cooking"],
-        "market_commerce": ["market", "mile 12", "mile12", "buy", "sell", "trader", "price", "trading", "bargain"],
-        "technology": ["phone", "app", "game", "download", "internet", "computer", "tech"],
-        "school_classroom": ["teacher", "class", "textbook", "exam", "school", "classroom"],
-        "home_domestic": ["generator", "nepa", "fan", "tap", "light", "water", "home", "backyard", "house"],
-        "body_physical": ["breathe", "heart", "run", "walk", "body", "hand", "breathing"],
-        "nature_environment": ["rain", "sun", "wind", "plant", "tree", "river", "cassava", "garden"],
+        "transportation": ["keke", "danfo", "okada", "bus", "car", "vehicle", "suv"],
+        "food_cooking": ["suya", "puff-puff", "jollof", "garri", "food", "eat", "cook"],
+        "market_commerce": ["market", "mile 12", "buy", "sell", "trader", "price"],
+        "technology": ["phone", "app", "game", "download", "internet", "computer"],
+        "school_classroom": ["teacher", "class", "textbook", "exam", "school"],
+        "home_domestic": ["generator", "nepa", "fan", "tap", "light", "water", "home", "backyard"],
+        "body_physical": ["breathe", "heart", "run", "walk", "body", "hand"],
+        "nature_environment": ["rain", "sun", "wind", "plant", "tree", "cassava", "garden"],
     }
 
     rejection_phrases = [
-        "i don't", "i dont", "never", "i have never", "i haven't",
+        "i don't", "i dont", "never", "i have never",
         "don't use", "dont use", "stop using", "no more", "i don't like",
         "i dont like", "not that", "i hate",
     ]
-    
+
     for domain, keywords in domain_patterns.items():
         if any(kw in msg_lower for kw in keywords):
             if any(phrase in msg_lower for phrase in rejection_phrases):
@@ -782,70 +735,18 @@ def _extract_session_signals(
             else:
                 signals["example_domains"][domain] = "preferred"
 
-    # FIXED: Also check for explicit domain requests
-    # "use something from home" → home_domestic preferred
-    for domain, keywords in domain_patterns.items():
-        if any(kw in msg_lower for kw in keywords):
-            if any(phrase in msg_lower for phrase in ["use something from", "use a", "give me a", "something about"]):
-                if domain not in signals["example_domains"]:
-                    signals["example_domains"][domain] = "preferred"
-
-    # Check if Wax used a domain and student responded positively
-    for domain, keywords in domain_patterns.items():
-        if any(kw in resp_lower for kw in keywords):
-            if any(phrase in msg_lower for phrase in ["yes", "ok", "right", "get it", "understand", "makes sense"]):
-                if domain not in signals["example_domains"]:
-                    signals["example_domains"][domain] = "preferred"
-
-    # ── Communication Style Signals ──
     pidgin_words = ["dey", "na", "wahala", "abeg", "omo", "sha", "nna", "abi",
                     "wetin", "go", "come", "chop", "oya", "make", "e be", "wey"]
     pidgin_count = sum(1 for word in pidgin_words if word in msg_lower)
-
-    formal_indicators = ["i am", "do not", "cannot", "will not", "i have", "i would"]
-    casual_indicators = ["i'm", "don't", "can't", "won't", "i've", "i'd", "bro", "guy"]
-
-    formal_count = sum(1 for ind in formal_indicators if ind in msg_lower)
-    casual_count = sum(1 for ind in casual_indicators if ind in msg_lower)
 
     if pidgin_count >= 3:
         signals["communication"]["full_pidgin"] = 0.3
     elif pidgin_count >= 1:
         signals["communication"]["pidgin_mixed"] = 0.2
 
-    if formal_count > casual_count:
-        signals["communication"]["formal_english"] = 0.2
-    else:
-        signals["communication"]["casual_english"] = 0.2
-
-    total_comm = formal_count + casual_count + pidgin_count
-    if total_comm > 0:
-        signals["formality_score"] = (formal_count * 1.0 + casual_count * 0.5) / (total_comm + 1)
-
-    # ── Competence Signals ──
-    if any(phrase in msg_lower for phrase in ["i understand", "i get it", "makes sense", "i see"]):
+    if any(phrase in msg_lower for phrase in ["i understand", "i get it", "makes sense"]):
         if recent_subject and recent_subject != "unknown":
-            topic = "discussed"
-            for hist_msg in reversed(conversation_history[-5:]):
-                if hist_msg.get("role") == "assistant":
-                    content = hist_msg.get("content", "")
-                    for keyword in ["Today:", "we'll cover", "focusing on", "Let's dive into"]:
-                        if keyword in content:
-                            parts = content.split(keyword, 1)
-                            if len(parts) > 1:
-                                topic = parts[1].strip().split(".")[0].strip()[:50]
-                                break
-            signals["competence"][f"{recent_subject}:{topic}"] = {
-                "score": 1.0,
-                "level": "mastered"
-            }
-
-    if any(phrase in resp_lower for phrase in ["not quite", "not exactly", "close", "almost"]):
-        if recent_subject and recent_subject != "unknown":
-            signals["competence"][f"{recent_subject}:discussed"] = {
-                "score": 0.3,
-                "level": "struggling"
-            }
+            signals["competence"][f"{recent_subject}:discussed"] = {"score": 1.0, "level": "mastered"}
 
     return signals
 
@@ -890,12 +791,8 @@ async def _build_memory_context(student_id: str) -> str:
         topic = last_session.get("topic", "a topic")
         if subject not in ("unknown", "a subject", "") and topic not in ("unknown", "a topic", "discussed", ""):
             session_line = f"LAST SESSION: {subject} - {topic}."
-            if last_session.get("completed"):
-                session_line += " Completed."
-                if last_session.get("score") is not None:
-                    session_line += f" Score: {int(last_session['score'] * 100)}%."
-            if last_session.get("struggled_with"):
-                session_line += f" Struggled with: {', '.join(last_session['struggled_with'])}."
+            if last_session.get("completed") and last_session.get("score") is not None:
+                session_line += f" Score: {int(last_session['score'] * 100)}%."
             context_parts.append(session_line)
 
     try:
@@ -933,15 +830,14 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     try:
         cached = redis_client.get(cache_key)
         if cached:
-            cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
-            return json.loads(cached_str)
+            return json.loads(cached.decode("utf-8") if isinstance(cached, bytes) else cached)
     except Exception:
         pass
 
     questions: List[Dict[str, Any]] = []
     try:
         from database.client import supabase
-        result = supabase.table("questions").select("*").eq("subject", subject).order("id", desc=False).limit(200).execute()
+        result = supabase.table("questions").select("*").eq("subject", subject).limit(200).execute()
         if result.data:
             questions = result.data
     except Exception:
@@ -951,8 +847,7 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
         try:
             json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jamb_questions_clean.json")
             with open(json_path, "r", encoding="utf-8") as f:
-                all_questions = json.load(f)
-            questions = [q for q in all_questions if q.get("subject") == subject]
+                questions = [q for q in json.load(f) if q.get("subject") == subject]
         except Exception:
             pass
 
@@ -971,38 +866,16 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     student_track = _infer_track(student_subjects)
 
     if not student_subjects:
-        fallback = TRACK_FALLBACKS.get(student_track, TRACK_FALLBACKS["unknown"])
-        subjects_pool = fallback.copy()
-        if student_track == "unknown":
-            await send_telegram_message(chat_id,
-                "Your subject preferences aren't set yet. Reply with your subject "
-                "(e.g. *Government*, *Physics*) to get specific quizzes."
-            )
+        subjects_pool = TRACK_FALLBACKS.get(student_track, TRACK_FALLBACKS["unknown"]).copy()
     else:
         subjects_pool = student_subjects.copy()
 
-    requested_subject = None
-    if message_text:
-        msg_lower = message_text.lower()
-        for subj in subjects_pool:
-            if subj.lower().replace("_", " ") in msg_lower:
-                requested_subject = subj
-                break
-        if not requested_subject:
-            for map_key in SUBJECT_MAP:
-                display = map_key.replace("_", " ")
-                if display in msg_lower and display not in ("quiz", "me", "test"):
-                    requested_subject = map_key
-                    break
-
-    subject = requested_subject if requested_subject else _pick_rotated_subject(student_id, subjects_pool)
+    subject = _pick_rotated_subject(student_id, subjects_pool)
     db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
     questions = await _load_questions(db_subject)
 
     if not questions:
-        await send_telegram_message(chat_id,
-            f"No questions found for *{db_subject.replace('_', ' ').title()}* yet."
-        )
+        await send_telegram_message(chat_id, f"No questions found for *{db_subject.replace('_', ' ').title()}* yet.")
         return
 
     question = random.choice(questions)
@@ -1065,11 +938,10 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
         if not raw:
             await send_telegram_message(chat_id, "No active quiz. Reply with *quiz* to start one!")
             return
-        raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        quiz_data = json.loads(raw_str)
+        quiz_data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
     except json.JSONDecodeError:
         redis_client.delete(quiz_key)
-        await send_telegram_message(chat_id, "Quiz data was corrupted. Let's start fresh — type *quiz*.")
+        await send_telegram_message(chat_id, "Quiz data was corrupted. Type *quiz* to start fresh.")
         return
     except Exception:
         await send_telegram_message(chat_id, "I lost track of the quiz. Type *quiz* to start a new one.")
@@ -1084,21 +956,10 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     correct = question.get("correct_answer", "A").strip().upper()
     is_correct = (answer == correct)
 
-    explanation = question.get("explanation_correct") or question.get("explanation") or ""
-
     if is_correct:
-        response = f"✅ *Correct!*\n\n{explanation}\n\nWell done, {name}!" if explanation else f"✅ *Correct!*\n\nWell done, {name}!"
+        response = f"✅ *Correct!*\n\nWell done, {name}!"
     else:
         response = f"❌ That's not quite right.\n\nThe correct answer is *{correct}*."
-        if explanation:
-            response += f"\n\n{explanation}"
-
-    opt_key = f"option_{answer.lower()}"
-    correct_key = f"option_{correct.lower()}"
-    opt_text = question.get(opt_key, "")
-    correct_text = question.get(correct_key, "")
-    if opt_text and correct_text and answer != correct:
-        response += f"\n\nYour answer: *{answer}*) {opt_text}\nCorrect answer: *{correct}*) {correct_text}"
 
     _log_quiz_answer(student_id, question, is_correct)
     response += "\n\nType *quiz* for another question!"
@@ -1128,19 +989,14 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
 
 
 def _validate_question(question: Dict[str, Any]) -> bool:
-    """Validate question has required fields."""
     if not question.get("question_text") and not question.get("question"):
         return False
     if not question.get("correct_answer"):
-        return False
-    correct = question["correct_answer"].strip().upper()
-    if not question.get(f"option_{correct.lower()}"):
         return False
     return True
 
 
 def _infer_track(subjects: List[str]) -> str:
-    """Infer student's academic track."""
     if not subjects:
         return "unknown"
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
@@ -1150,15 +1006,10 @@ def _infer_track(subjects: List[str]) -> str:
         return "commercial"
     if subject_set & {"literature_in_english", "government", "civic_education", "crs", "irs"}:
         return "arts"
-    if "economics" in subject_set and "government" in subject_set:
-        return "arts"
-    if "economics" in subject_set:
-        return "commercial"
     return "unknown"
 
 
 def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
-    """Pick a subject using fair rotation."""
     if not subjects:
         return "mathematics"
     recent = _QUIZ_TRACKER.get(student_id, [])
@@ -1174,7 +1025,6 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
 
 
 async def warmup_question_cache() -> None:
-    """Preload common subjects into Redis cache."""
     for subject in ["mathematics", "english", "physics", "chemistry", "biology", "government", "economics"]:
         try:
             await _load_questions(subject)
