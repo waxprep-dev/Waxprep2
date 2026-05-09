@@ -25,6 +25,8 @@ or "I prefer short definitions" are routed to AI, not intercepted by deferral.
 
 Now with Topic Coherence Check — when a student hops between topics without
 completing any, Wax gently guides them toward focus.
+
+Now with Hybrid Onboarding — AI-driven conversation with code-guided structure.
 """
 import asyncio
 import hashlib
@@ -68,8 +70,6 @@ SESSION_END_KEYWORDS = [
 ]
 
 # ── Subject name mapping ──────────────────────
-# FIXED: Expanded from 23 to 55+ entries covering all curriculum streams.
-# Core, Science, Commercial, Arts, Nigerian Languages, and Trade subjects.
 SUBJECT_MAP: Dict[str, str] = {
     # ── Core/Compulsory ──
     "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
@@ -119,7 +119,6 @@ SUBJECT_MAP: Dict[str, str] = {
 }
 
 # ── Fallback subject pools by track ───────────
-# FIXED: Expanded to include new curriculum subjects per track.
 TRACK_FALLBACKS: Dict[str, List[str]] = {
     "science": [
         "english", "mathematics", "physics", "chemistry", "biology",
@@ -195,15 +194,23 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
+    # 5. Unregistered user — onboarding flow
+    # FIXED: Uses hybrid onboarding. Falls back to scripted if hybrid not deployed.
     try:
-        from telegram.onboarding_hybrid import handle_onboarding_hybrid as handle_onboarding
+        from telegram.onboarding_hybrid import handle_onboarding_hybrid
         from database.onboarding_state import get_onboarding_state
         state = await get_onboarding_state("telegram", str(chat_id))
-    except Exception:
-        state = {}
-
-    try:
-        await handle_onboarding(chat_id, state, text)
+        await handle_onboarding_hybrid(chat_id, state, text)
+    except ImportError:
+        # Hybrid not available — fall back to scripted onboarding
+        try:
+            from telegram.onboarding import handle_onboarding
+            from database.onboarding_state import get_onboarding_state
+            state = await get_onboarding_state("telegram", str(chat_id))
+            await handle_onboarding(chat_id, state, text)
+        except Exception as e:
+            logger.error(f"Onboarding handler failed: {e}", exc_info=True)
+            await send_telegram_message(chat_id, "Something went wrong. Type *HI* to start again.")
     except Exception as e:
         logger.error(f"Onboarding handler failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "Something went wrong. Type *HI* to start again.")
@@ -810,6 +817,7 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
         return subjects[0]
     return None
 
+
 # ═══════════════════════════════════════════════
 # MEMORY CONTEXT BUILDER
 # ═══════════════════════════════════════════════
@@ -1035,7 +1043,6 @@ def _validate_question(question: Dict[str, Any]) -> bool:
 
 
 def _infer_track(subjects: List[str]) -> str:
-    # FIXED: Expanded to detect Trade subjects and new curriculum streams
     if not subjects:
         return "unknown"
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
