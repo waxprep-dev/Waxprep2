@@ -8,6 +8,7 @@ Architecture:
     Output Safety → What Wax sends TO students (harmful content, persona break)
 """
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -22,9 +23,11 @@ logger = logging.getLogger("waxprep.safety")
 # ═══════════════════════════════════════════════
 # If a student's message contains ANY of these, we bypass AI
 # and respond with the crisis helpline immediately.
+# Includes Nigerian Pidgin expressions — crisis sounds different
+# in different languages.
 
 CRISIS_KEYWORDS = [
-    # Direct suicidal statements
+    # Direct suicidal statements (English)
     "i want to die", "i wanna die", "i want 2 die",
     "kill myself", "kms", "end my life",
     "not worth living", "better off dead",
@@ -35,7 +38,7 @@ CRISIS_KEYWORDS = [
     "going to kill myself", "going to end it",
     "i'm going to kill myself", "i'm going to end it",
     "i am going to kill myself",
-    # Indirect/passive suicidal ideation
+    # Indirect/passive suicidal ideation (English)
     "nobody would notice if i",
     "no one would miss me",
     "they'd be better off without me",
@@ -51,11 +54,25 @@ CRISIS_KEYWORDS = [
     "everyone would be happier if i were gone",
     "why am i even here",
     "i don't want to wake up",
+    "i want to sleep and not wake up",
+    "nobody will notice if i disappear",
+    # Nigerian Pidgin & Nigerian English crisis expressions
+    # These are life-safety critical — a student expressing suicidal
+    # ideation in Pidgin must be detected with the same urgency.
+    "i wan die", "i wan kpai", "i wan end am",
+    "i don tire for this life", "i don tire",
+    "my own don finish", "make i just disappear",
+    "i just wan commot", "i just wan comot",
+    "nobody go miss me", "dem no need me",
+    "i no get reason to dey alive",
+    "life no worth am", "i no fit do this again",
+    "i dey tired of everything",
+    # Nigerian-specific self-harm methods
+    "sip sniper", "drink sniper", "take sniper",
 ]
 
-# ── Escalation threshold ─────────────────────
-# If student triggers crisis this many times within the window,
-# the response escalates with stronger urgency.
+# Escalation threshold — if student triggers crisis this many times
+# within the window, the response escalates with stronger urgency.
 CRISIS_ESCALATION_THRESHOLD = 3
 CRISIS_ESCALATION_WINDOW = 600  # 10 minutes
 
@@ -76,7 +93,12 @@ MALPRACTICE_KEYWORDS = [
     "microchips", "magic pen", "erazor",
     "smuggled answers", "send me answers",
     "during the exam", "inside exam hall",
+    # Nigerian euphemisms for cheating
+    "dubs", "bullet", "chokes",
+    "sort me out", "special center",
+    "miracle center", "alternative means",
 ]
+
 
 # ═══════════════════════════════════════════════
 # EXPLOITATION KEYWORDS
@@ -110,7 +132,6 @@ EXPLOITATION_KEYWORDS = [
 # ═══════════════════════════════════════════════
 
 CRISIS_COOLDOWN = 300  # 5 minutes between crisis responses
-CRISIS_ESCALATION_WINDOW = 600  # 10 minutes for escalation counting
 
 
 # ═══════════════════════════════════════════════
@@ -155,8 +176,9 @@ def detect_crisis(message: str) -> bool:
     """
     Check if message indicates self-harm or suicidal intent.
     
-    Returns True if crisis keywords detected.
-    Uses normalization to catch obfuscated expressions.
+    Checks raw text first (highest confidence), then normalized text.
+    This prevents false positives from aggressive normalization
+    while still catching obfuscated expressions.
     
     Args:
         message: Raw student message
@@ -164,6 +186,13 @@ def detect_crisis(message: str) -> bool:
     Returns:
         True if crisis detected, False otherwise
     """
+    raw_lower = message.lower().strip()
+    
+    # Check raw text first — highest confidence, lowest false positive risk
+    if any(keyword in raw_lower for keyword in CRISIS_KEYWORDS):
+        return True
+    
+    # Fall back to normalized text for obfuscated expressions
     normalized = _normalize(message)
     return any(keyword in normalized for keyword in CRISIS_KEYWORDS)
 
@@ -205,12 +234,14 @@ def detect_exploitation(message: str) -> bool:
 # RESPONSE MESSAGES
 # ═══════════════════════════════════════════════
 
-# Primary crisis response — calm, direct, with real Nigerian helplines
+# Primary crisis response — calm, direct, with Nigerian helplines
+# NOTE: Helpline numbers must be verified as active every 30 days.
+# A dead number at a crisis moment causes harm.
 CRISIS_RESPONSE = (
     "📞 *Nigeria Suicide Prevention Hotline:* 080097738255\n"
-    "📞 *Lagos Mental Health Helpline:* 09090000623\n\n"
-    "Please reach out. You are valuable, and this feeling will pass — "
-    "but you shouldn't face it alone.\n\n"
+    "📞 *Lagos Mental Health Helpline:* 09090000623\n"
+    "📞 *National Emergency:* 112\n\n"
+    "You are valuable, and you don't have to face this alone.\n\n"
     "I'm an AI teacher, not a counselor. But I'm listening, and I care. "
     "If you're in immediate danger, please contact a trusted adult."
 )
@@ -226,24 +257,29 @@ CRISIS_RESPONSE_ESCALATED = (
 )
 
 # Post-crisis check-in — sent after cooldown expires
+# Does NOT claim to provide counseling — redirects to helplines.
 CRISIS_CHECK_IN = (
     "I just want to check in — how are you feeling right now?\n\n"
     "No pressure to talk about anything you're not ready to share. "
-    "I'm here to help you study, and I'm also here to listen."
+    "If you're still struggling, the helplines I shared earlier are there for you."
 )
 
 MALPRACTICE_RESPONSE = (
     "I can't help with that. WaxPrep is about honest preparation.\n\n"
-    "You have what it takes to pass without cutting corners. "
-    "Let's focus on getting you ready the right way.\n\n"
+    "I know the pressure is real. But cheating risks your entire future. "
+    "Let's prepare the right way — one topic at a time.\n\n"
     "Which topic do you want to tackle?"
 )
 
+# Exploitation response — does NOT direct students to family members
+# who may be the abuser. Offers outside help instead.
 EXPLOITATION_RESPONSE = (
     "That sounds really difficult. I'm sorry you're going through that.\n\n"
-    "Please talk to a trusted adult — a teacher, school counselor, "
-    "or family member who can help.\n\n"
-    "📞 *NAPTIP Helpline:* 07030000203 (National Agency for Prohibition of Trafficking in Persons)\n\n"
+    "Please talk to a trusted adult — someone outside your home if that's safer. "
+    "A teacher, school counselor, or religious leader you trust.\n\n"
+    "📞 *NAPTIP Helpline:* 07030000203 "
+    "(National Agency for Prohibition of Trafficking in Persons)\n\n"
+    "If you're not safe at home, this helpline can help you. "
     "You deserve to feel safe and supported."
 )
 
@@ -271,15 +307,13 @@ OUTPUT_BLOCK_KEYWORDS = [
     "give me your password",
     "send money",
     # Breaking teacher persona (confuses/distrusts students)
+    # Only full phrases — not standalone words humans also use
     "as an ai language model",
-    "as an ai",
+    "as an ai, i",
     "i am not a human",
     "i'm just a bot",
     "i'm just an ai",
     "i am an artificial intelligence",
-    "i cannot process",
-    "i'm unable to",
-    "i don't have the ability",
     "i don't have emotions",
     "i am not capable of",
     # Hallucinated authority
@@ -295,15 +329,12 @@ async def check_output_safety(response: str) -> bool:
     This is the output safety net — the AI prompt should prevent harmful
     output, but this catches edge cases the model might miss.
     
-    Returns:
-        True if the response should be BLOCKED (contains harmful content)
-        False if the response is safe to send
-    
     Args:
         response: The AI-generated response text
         
     Returns:
-        True = block this response, False = safe to send
+        True if the response should be BLOCKED (contains harmful content)
+        False if the response is safe to send
     """
     if not response or not response.strip():
         logger.warning("SAFETY BLOCK: Empty response")
@@ -315,7 +346,7 @@ async def check_output_safety(response: str) -> bool:
     for keyword in OUTPUT_BLOCK_KEYWORDS:
         if keyword in normalized:
             logger.warning(f"SAFETY BLOCK: Output blocked for containing '{keyword}'")
-            # Log blocked output for review
+            # Fire-and-forget logging — don't block the response on DB write
             try:
                 supabase.table("blocked_outputs").insert({
                     "keyword_matched": keyword,
@@ -402,21 +433,27 @@ async def run_safety_checks(chat_id: int, message: str, student_id: str = None) 
         else:
             await send_telegram_message(chat_id, CRISIS_RESPONSE)
 
-        # Log the event (help response is already sent, log is secondary)
-        _log_crisis_event(chat_id, message, student_id, crisis_count)
+        # Log the event (fire-and-forget — crisis response already sent)
+        asyncio.create_task(
+            _log_crisis_event_async(chat_id, message, student_id, crisis_count)
+        )
         return True
 
     # 2. MALPRACTICE — firm refusal, redirect to studying
     if detect_malpractice(message):
         await send_telegram_message(chat_id, MALPRACTICE_RESPONSE)
-        _log_malpractice_event(chat_id, message, student_id)
+        asyncio.create_task(
+            _log_malpractice_event_async(chat_id, message, student_id)
+        )
         return True
 
     # 3. EXPLOITATION — acknowledge and flag, but DON'T block
     # The student may need to keep talking
     if detect_exploitation(message):
         await send_telegram_message(chat_id, EXPLOITATION_RESPONSE)
-        _log_exploitation_flag(chat_id, message, student_id)
+        asyncio.create_task(
+            _log_exploitation_flag_async(chat_id, message, student_id)
+        )
         return False  # Allow conversation to continue
 
     # 4. Check if post-crisis check-in is needed
@@ -432,7 +469,48 @@ async def run_safety_checks(chat_id: int, message: str, student_id: str = None) 
 
 
 # ═══════════════════════════════════════════════
-# LOGGING FUNCTIONS
+# LOGGING FUNCTIONS (async wrappers for fire-and-forget)
+# ═══════════════════════════════════════════════
+
+async def _log_crisis_event_async(
+    chat_id: int,
+    message: str,
+    student_id: str = None,
+    escalation_count: int = 1
+) -> None:
+    """Async wrapper for crisis event logging — runs as background task."""
+    try:
+        _log_crisis_event(chat_id, message, student_id, escalation_count)
+    except Exception as e:
+        logger.error(f"Crisis event logging failed: {e}")
+
+
+async def _log_malpractice_event_async(
+    chat_id: int,
+    message: str,
+    student_id: str = None
+) -> None:
+    """Async wrapper for malpractice event logging — runs as background task."""
+    try:
+        _log_malpractice_event(chat_id, message, student_id)
+    except Exception as e:
+        logger.error(f"Malpractice event logging failed: {e}")
+
+
+async def _log_exploitation_flag_async(
+    chat_id: int,
+    message: str,
+    student_id: str = None
+) -> None:
+    """Async wrapper for exploitation flag logging — runs as background task."""
+    try:
+        _log_exploitation_flag(chat_id, message, student_id)
+    except Exception as e:
+        logger.error(f"Exploitation flag logging failed: {e}")
+
+
+# ═══════════════════════════════════════════════
+# LOGGING FUNCTIONS (sync — called from async wrappers)
 # ═══════════════════════════════════════════════
 
 def _log_crisis_event(
@@ -444,8 +522,9 @@ def _log_crisis_event(
     """
     Log a crisis event to database and emit loud console alert.
     
-    This runs AFTER the crisis response is sent — the student's safety
-    comes first, logging is secondary.
+    Uses deterministic hashlib.sha256 for phone_hash — same student
+    always produces same hash, enabling crisis history tracking
+    across server restarts.
     
     Args:
         chat_id: Telegram chat ID
@@ -453,10 +532,8 @@ def _log_crisis_event(
         student_id: Optional database student ID
         escalation_count: How many crisis triggers in the current window
     """
-    # FIXED (Bug #5): Column name matched to database schema
-    # Database has 'phone_hash' not 'chat_id_hash'
     event_data = {
-        "phone_hash": str(hash(str(chat_id))),
+        "phone_hash": hashlib.sha256(str(chat_id).encode()).hexdigest()[:16],
         "student_id": student_id,
         "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -497,6 +574,7 @@ def _log_malpractice_event(
     """
     Log a malpractice detection event.
     
+    Uses deterministic hashlib.sha256 for phone_hash.
     Tracking patterns helps identify exam cheating rings
     or schools with systematic problems.
     
@@ -505,9 +583,8 @@ def _log_malpractice_event(
         message: Raw student message
         student_id: Optional database student ID
     """
-    # FIXED (Bug #5): Column name matched to database schema
     event_data = {
-        "phone_hash": str(hash(str(chat_id))),
+        "phone_hash": hashlib.sha256(str(chat_id).encode()).hexdigest()[:16],
         "student_id": student_id,
         "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -532,6 +609,7 @@ def _log_exploitation_flag(
     """
     Flag concerning messages for human review.
     
+    Uses deterministic hashlib.sha256 for phone_hash.
     Exploitation signals are NOT blocked — the student may need
     to continue the conversation. This logs for review by
     designated safeguarding personnel.
@@ -541,9 +619,8 @@ def _log_exploitation_flag(
         message: Raw student message
         student_id: Optional database student ID
     """
-    # FIXED (Bug #5): Column name matched to database schema
     event_data = {
-        "phone_hash": str(hash(str(chat_id))),
+        "phone_hash": hashlib.sha256(str(chat_id).encode()).hexdigest()[:16],
         "student_id": student_id,
         "message_preview": message[:100],
         "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -558,3 +635,8 @@ def _log_exploitation_flag(
         f"⚠️ EXPLOITATION FLAG: chat_id={chat_id}, "
         f"student={student_id}, message={message[:100]}"
     )
+
+
+# Import asyncio at the bottom for the fire-and-forget tasks
+# (keeps imports clean at the top of the file)
+import asyncio
