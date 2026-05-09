@@ -6,15 +6,23 @@ This is the brain's foundation — everything else depends on this.
 Architecture:
     - StudentState enum: All possible states with documentation
     - ALLOWED_TRANSITIONS: Guards against impossible state jumps
-    - Dual persistence: Redis (fast read) + Database (durable write)
+    - Dual persistence: Supabase FIRST (durable source of truth), Redis SECOND (fast cache)
     - Session ENDED trigger: Automatically saves memory for the Teacher Voice
     
 Memory Flow:
     set_state("ended") → _on_session_ended() → save_session_summary() + save_student_memory()
-    Next login → _build_memory_context() → "Last time we did Biology - Diffusion. Scored 80%."
+    Next login → _build_memory_context() → "LAST SESSION: biology - diffusion."
+    (The context builder produces structured labels, not narrative text.)
+
+Score-based memory rules:
+    - Score >= 0.8: Mark as strong, remove from struggles
+    - Score < 0.5: Mark as struggling using real data
+    - No score data: Fall back to keyword auto-detection (with negation awareness)
+    - Score >= 0.9 AND completed: Mark as mastered
 """
 
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Dict, Any, List
 
@@ -24,14 +32,14 @@ logger = logging.getLogger("waxprep.state")
 
 
 class StudentState(Enum):
-    """Every possible state a student can be in."""
+    """All possible states a student can be in. IN_EXAM_MODE is reserved."""
     ONBOARDING = "onboarding"          # First time, setting up profile
     IDLE = "idle"                      # Between sessions, waiting
     GREETING = "greeting"              # Just opened the app, being welcomed
     IN_LESSON = "in_lesson"            # Actively learning a topic
     IN_PRACTICE = "in_practice"        # Doing practice questions
     STUCK = "stuck"                    # Failed 3+ times, needs intervention
-    IN_EXAM_MODE = "in_exam_mode"      # Close to exam, different behavior
+    IN_EXAM_MODE = "in_exam_mode"      # Reserved — not yet implemented
     ASKING_QUESTION = "asking_question" # Temporary detour from lesson
     PAUSED = "paused"                  # Student said "not now"
     CHATTING = "chatting"              # Non-learning conversation
@@ -101,7 +109,11 @@ ALLOWED_TRANSITIONS: Dict[StudentState, List[StudentState]] = {
         StudentState.GREETING,
     ],
     # IN_EXAM_MODE not yet implemented — reserved
-    StudentState.IN_EXAM_MODE: [],
+    # But exit paths exist so admin-forced entries don't brick students
+    StudentState.IN_EXAM_MODE: [
+        StudentState.IDLE,
+        StudentState.ENDED,
+    ],
 }
 
 
@@ -127,12 +139,16 @@ async def get_state(student_id: str) -> Optional[str]:
     Returns:
         State string (e.g., "in_lesson") or None
     """
+    # Basic validation to save a database round-trip
+    if not student_id or not student_id.strip():
+        logger.warning("get_state called with empty student_id")
+        return None
+    
     # Check Redis first
     key = f"student_state:{student_id}"
     try:
         cached = redis_client.get(key)
         if cached:
-            # Redis get() returns bytes — decode to string
             decoded = cached.decode("utf-8") if isinstance(cached, bytes) else cached
             if decoded:
                 return decoded
@@ -175,7 +191,7 @@ async def get_state(student_id: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Database get_state error for {student_id}: {e}")
 
-    return None  # Student not found
+    return None
 
 
 async def set_state(
@@ -188,7 +204,8 @@ async def set_state(
     Change a student's state. Returns True if successful.
     
     Validates the transition before saving.
-    Persists to both Redis (fast) and database (durable).
+    Persists to Supabase FIRST (durable source of truth), then Redis (fast cache).
+    If database write fails, Redis is NOT updated — prevents stale cache.
     
     If transitioning to ENDED, automatically saves a session summary
     and updates student memory for the Teacher Memory Voice.
@@ -241,16 +258,7 @@ async def set_state(
         + (f" | Reason: {reason}" if reason else "")
     )
 
-    # ── Save to Redis (fast path) ──
-    key = f"student_state:{student_id}"
-    redis_saved = False
-    try:
-        redis_client.setex(key, STATE_CACHE_TTL, new_state)
-        redis_saved = True
-    except Exception as e:
-        logger.error(f"Redis set_state error for {student_id}: {e}")
-
-    # ── Save to database (durable path) ──
+    # ── 1. Save to database FIRST (durable source of truth) ──
     db_saved = False
     try:
         supabase.table("students") \
@@ -261,11 +269,28 @@ async def set_state(
     except Exception as e:
         logger.error(f"Database set_state error for {student_id}: {e}")
 
+    # ── 2. Save to Redis SECOND (fast cache) ──
+    # Only cache if database write succeeded — prevents stale cache
+    key = f"student_state:{student_id}"
+    redis_saved = False
+    if db_saved:
+        try:
+            redis_client.setex(key, STATE_CACHE_TTL, new_state)
+            redis_saved = True
+        except Exception as e:
+            logger.error(f"Redis set_state error for {student_id}: {e}")
+            # Redis failure is non-critical — database has the truth
+    else:
+        logger.warning(
+            f"Skipping Redis cache for {student_id} — database write failed, "
+            f"don't want stale state in cache"
+        )
+
     # ── Warn if neither save succeeded ──
-    if not redis_saved and not db_saved:
+    if not db_saved and not redis_saved:
         logger.critical(
             f"set_state COMPLETELY FAILED for {student_id}: "
-            f"neither Redis nor database saved!"
+            f"neither database nor Redis saved!"
         )
         return False
 
@@ -294,7 +319,13 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
     Saves a session summary and updates persistent student memory
     so Wax remembers what happened next time the student returns.
     
-    This is the bridge between the state machine and the Memory Voice.
+    Memory rules (ordered by priority):
+    1. Score >= 0.8: Mark as strong, REMOVE from struggles
+    2. Score < 0.5: Mark as struggling using real data
+    3. No score data: Fall back to keyword auto-detection (with negation awareness)
+    4. Score >= 0.9 AND completed: Mark as mastered
+    
+    Score data ALWAYS wins over keyword guessing.
     
     Args:
         student_id: Student database ID
@@ -307,7 +338,6 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
         save_student_memory,
         get_history
     )
-    from datetime import datetime, timezone
 
     # ── Extract context ──
     subject = context.get("subject", "unknown")
@@ -317,9 +347,12 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
     struggled_with = list(context.get("struggled_with", []))
 
     # If no explicit struggles, try to detect from conversation
-    if not struggled_with:
+    # (Only runs if no score data available — score wins over keywords)
+    if not struggled_with and score is None:
         try:
-            recent_history = await get_history(student_id, limit=10)
+            recent_history = await get_history(student_id)
+            if recent_history:
+                recent_history = recent_history[-10:]
             struggle_keywords = [
                 "confused", "don't understand", "not sure",
                 "hard", "difficult", "struggling", "i don't get",
@@ -330,8 +363,18 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
                     content = msg.get("content", "").lower()
                     for keyword in struggle_keywords:
                         if keyword in content:
-                            if topic and topic not in struggled_with:
-                                struggled_with.append(topic)
+                            # Check for negation: "NOT hard", "isn't confusing",
+                            # "no longer struggling"
+                            idx = content.find(keyword)
+                            before = content[max(0, idx-15):idx]
+                            negated = any(neg in before for neg in [
+                                "not ", "isn't ", "wasn't ", "no longer ",
+                                "not as ", "don't ", "doesn't ", "arent ",
+                                "won't ",
+                            ])
+                            if not negated:
+                                if topic and topic not in struggled_with:
+                                    struggled_with.append(topic)
                             break
             if struggled_with:
                 logger.info(
@@ -360,37 +403,52 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
         logger.error(f"Failed to save session summary for {student_id}: {e}")
 
     # ── Update persistent student memory ──
-    # Build memory updates with clear, non-contradictory rules
+    # Score-based rules: real performance data ALWAYS wins over keyword guessing
     memory_updates: Dict[str, Any] = {}
 
-    # Rule 1: If they struggled (explicitly OR from detection), record it
-    if struggled_with:
-        memory_updates["struggles_with"] = struggled_with
-        logger.info(f"Memory: {student_id} struggles with {struggled_with}")
-
-    # Rule 2: If score is high, record as strength
-    # Only set strength if NOT also in struggles (prevents contradiction)
-    if score is not None and score >= 0.8 and topic not in struggled_with:
+    # Rule 1: Check score FIRST — it's the highest-quality signal
+    if score is not None and score >= 0.8:
+        # High score = strong. Remove from struggles if auto-detection added it.
         memory_updates["strong_in"] = [topic]
+        if topic in struggled_with:
+            struggled_with.remove(topic)
         logger.info(f"Memory: {student_id} is strong in {topic} (score: {score})")
-
-    # Rule 3: If score is very low, reinforce struggles
+    
     elif score is not None and score < 0.5:
+        # Low score = struggling. Confirm with real data.
         if topic not in struggled_with:
             struggled_with.append(topic)
         memory_updates["struggles_with"] = struggled_with
         logger.info(f"Memory: {student_id} scored low on {topic} (score: {score})")
-
-    # Rule 4: If score is very high AND completed, consider mastered
+    
+    else:
+        # No score data available — fall back to keyword detection
+        if struggled_with:
+            memory_updates["struggles_with"] = struggled_with
+            logger.info(
+                f"Memory: {student_id} struggles with {struggled_with} "
+                f"(from keywords)"
+            )
+    
+    # Rule 2: Mastery requires BOTH high score AND completion
     if completed and score is not None and score >= 0.9:
         memory_updates["topics_mastered"] = [topic]
+        # Also clear from struggles if they were there
+        if topic in struggled_with:
+            struggled_with.remove(topic)
+            memory_updates["struggles_with"] = struggled_with
         logger.info(f"Memory: {student_id} mastered {topic} (score: {score})")
 
-    # Rule 5: Increment session count (read current, add 1)
+    # Rule 3: Increment session count
+    # Pass the FINAL value (current + 1). save_student_memory will OVERWRITE,
+    # not add again — prevents double-increment.
     try:
         from database.conversations import get_student_memory
         existing_memory = await get_student_memory(student_id)
-        current_sessions = existing_memory.get("sessions_completed", 0) if existing_memory else 0
+        current_sessions = (
+            existing_memory.get("sessions_completed", 0)
+            if existing_memory else 0
+        )
         memory_updates["sessions_completed"] = current_sessions + 1
         logger.info(
             f"Memory: {student_id} session count: "
@@ -403,7 +461,10 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
     # ── Save memory ──
     try:
         await save_student_memory(student_id, memory_updates)
-        logger.info(f"Student memory updated for {student_id}: {list(memory_updates.keys())}")
+        logger.info(
+            f"Student memory updated for {student_id}: "
+            f"{list(memory_updates.keys())}"
+        )
     except Exception as e:
         logger.error(f"Failed to save student memory for {student_id}: {e}")
 
@@ -427,7 +488,11 @@ async def is_in_state(student_id: str, state: str) -> bool:
     return current == state
 
 
-async def force_state(student_id: str, new_state: str, admin_id: str = "unknown") -> bool:
+async def force_state(
+    student_id: str,
+    new_state: str,
+    admin_id: str = "unknown"
+) -> bool:
     """
     Force a state change without transition validation.
     
@@ -468,9 +533,7 @@ async def force_state(student_id: str, new_state: str, admin_id: str = "unknown"
             "action": "force_state",
             "target_student": student_id,
             "details": f"State forced to: {new_state}",
-            "performed_at": __import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc
-            ).isoformat(),
+            "performed_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
         logger.error(f"Failed to log admin action: {e}")
