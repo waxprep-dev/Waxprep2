@@ -804,11 +804,11 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
                     return subject
     trouble_subject = student.get("student_subject")
     if trouble_subject:
-        return trouble_subject    subjects = student.get("subjects", [])
+        return trouble_subject
+    subjects = student.get("subjects", [])
     if subjects and subjects[0]:
         return subjects[0]
     return None
-
 
 # ═══════════════════════════════════════════════
 # MEMORY CONTEXT BUILDER
