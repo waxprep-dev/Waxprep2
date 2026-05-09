@@ -12,6 +12,7 @@ Wax takes control. Doesn't ask again. Leads.
 
 Now with Session End Detection — natural endings like "I'm tired" or
 "I'm done" trigger formal session closure, saving memory for next time.
+Detects both English and Nigerian Pidgin expressions.
 
 Now with Confusion Detection — when a student is confused, Wax stops
 introducing new information, switches examples, and doesn't move forward
@@ -27,6 +28,9 @@ Now with Topic Coherence Check — when a student hops between topics without
 completing any, Wax gently guides them toward focus.
 
 Now with Hybrid Onboarding — AI-driven conversation with code-guided structure.
+
+Now with Session Priming — on first message after a gap, Wax already knows
+what happened last session before generating a response.
 """
 import asyncio
 import hashlib
@@ -61,12 +65,28 @@ PREFERENCE_KEYWORDS = [
 ]
 
 # ── Session end keywords ─────────────────────
+# Both English and Nigerian Pidgin expressions
 SESSION_END_KEYWORDS = [
+    # English
     "i'm tired", "i am tired", "i'm done", "i am done",
     "good night", "goodnight", "i need a break", "taking a break",
     "i'll be back", "i will be back", "bye", "goodbye",
     "see you later", "see you tomorrow", "i'm going to sleep",
     "i'm leaving", "i have to go", "gotta go", "gtg",
+    # Nigerian Pidgin session end expressions
+    "i don tire", "i don tire o", "my brain don full",
+    "make i rest small", "make i rest", "i wan sleep",
+    "i dey go", "e don do", "e don do me",
+    "i dey come", "make i chop", "make i eat",
+    "i go come back", "i dey go sleep",
+]
+
+# ── Nigerian time phrases (student stepping away briefly) ──
+NIGERIAN_TIME_PHRASES = [
+    "i'm coming", "i dey come", "make i chop", "make i eat",
+    "i wan eat", "let me eat first", "i dey go bathroom",
+    "one minute", "small time", "i dey come back",
+    "no dey far",
 ]
 
 # ── Subject name mapping ──────────────────────
@@ -137,6 +157,11 @@ TRACK_FALLBACKS: Dict[str, List[str]] = {
         "islamic_religious_studies", "geography", "visual_arts", "music",
         "french", "arabic", "yoruba", "igbo", "hausa",
     ],
+    "trade": [
+        "english", "mathematics", "fashion_design", "gsm_repairs",
+        "solar_installation", "livestock_farming", "beauty_cosmetology",
+        "horticulture", "computer_studies",
+    ],
     "unknown": ["english", "mathematics", "civic_education"],
 }
 
@@ -145,13 +170,19 @@ QUIZ_TTL_SECONDS = 1800
 MAX_QUIZ_HISTORY = 200
 JAMB_CHECK_COOLDOWN = 604800
 DEFERRAL_TTL = 3600
+SESSION_GAP_MINUTES = 60  # Time before treating a return as a new wake event
 
-# Understanding confirmation phrases
+# Understanding confirmation phrases (English + Pidgin)
 UNDERSTANDING_PHRASES = [
+    # English
     "you've got it", "exactly", "you worked that out",
     "you're right", "well done", "correct", "perfect",
     "that's it", "you got it", "you understand",
     "now you're getting it", "you're on a roll",
+    # Nigerian Pidgin
+    "you don sabi am", "na so e be", "you get am",
+    "e don enter", "correct guy", "correct girl",
+    "you dey try", "na im be that",
 ]
 
 
@@ -194,8 +225,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
-    # 5. Unregistered user — onboarding flow
-    # FIXED: Uses hybrid onboarding. Falls back to scripted if hybrid not deployed.
+    # Unregistered user — onboarding flow
     try:
         from telegram.onboarding_hybrid import handle_onboarding_hybrid
         from database.onboarding_state import get_onboarding_state
@@ -222,6 +252,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
+    # Check for JAMB ambition response in progress
     try:
         from database.onboarding_state import get_onboarding_state
         jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
@@ -231,10 +262,17 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
+    # Session end detection — English and Pidgin
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
+    # Nigerian time phrases — student stepping away briefly
+    if any(phrase in msg_lower for phrase in NIGERIAN_TIME_PHRASES):
+        await _handle_stepping_away(chat_id, student_id, name)
+        return
+
+    # Deferral vs preference routing
     is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
     is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
     
@@ -242,6 +280,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
+    # Quiz answer detection (single letter A-D)
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -252,11 +291,28 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         except Exception:
             pass
 
+    # Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
 
+    # Route to AI conversation
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
+
+
+# ═══════════════════════════════════════════════
+# STEPPING AWAY HANDLER (Nigerian time norms)
+# ═══════════════════════════════════════════════
+
+async def _handle_stepping_away(chat_id: int, student_id: str, name: str) -> None:
+    """Handle Nigerian time expressions — student is stepping away briefly."""
+    key = f"stepped_away:{student_id}"
+    try:
+        redis_client.setex(key, 3600, "1")  # 1-hour flag
+    except Exception:
+        pass
+    
+    await send_telegram_message(chat_id, "No wahala. I dey here.")
 
 
 # ═══════════════════════════════════════════════
@@ -267,7 +323,7 @@ async def _handle_session_end(
     chat_id: int, student: dict, text: str,
     student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle natural session endings."""
+    """Handle natural session endings with smart completion detection."""
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message, save_session_summary
@@ -307,22 +363,75 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
+    # Smart session completion detection — don't hard-code incomplete
+    session_completed = False
+    session_score = None
+    session_struggles = []
+
+    # Check recent conversation for mastery signals
+    for msg in reversed(conversation_history[-10:]):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "").lower()
+            if any(phrase in content for phrase in UNDERSTANDING_PHRASES):
+                session_completed = True
+                # Estimate score from ratio of correct to total answers
+                correct_count = sum(
+                    1 for m in conversation_history[-20:]
+                    if m.get("role") == "assistant" and
+                    any(p in m.get("content", "").lower() for p in UNDERSTANDING_PHRASES)
+                )
+                wrong_count = sum(
+                    1 for m in conversation_history[-20:]
+                    if m.get("role") == "assistant" and
+                    any(p in m.get("content", "").lower() for p in [
+                        "not quite", "not exactly", "close", "almost",
+                        "that's not",
+                    ])
+                )
+                total = correct_count + wrong_count
+                if total > 0:
+                    session_score = correct_count / total
+                break
+
+    # Auto-detect struggles from conversation
+    struggle_keywords = [
+        "confused", "don't understand", "struggling", "hard", "difficult"
+    ]
+    for msg in conversation_history[-10:]:
+        if msg.get("role") == "user":
+            content = msg.get("content", "").lower()
+            for kw in struggle_keywords:
+                if kw in content:
+                    # Check for negation: "NOT hard", "isn't confusing"
+                    idx = content.find(kw)
+                    before = content[max(0, idx-15):idx]
+                    negated = any(neg in before for neg in [
+                        "not ", "isn't ", "wasn't ", "no longer ",
+                        "not as ", "don't ",
+                    ])
+                    if not negated and session_topic and session_topic not in session_struggles:
+                        session_struggles.append(session_topic)
+                    break
+
+    session_context = {
+        "subject": recent_subject or "unknown",
+        "topic": session_topic or "discussed",
+        "completed": session_completed,
+        "score": session_score,
+        "struggled_with": session_struggles,
+    }
+
     try:
         await set_state(student_id, "ended",
             reason=f"Student ended session: {msg_lower[:50]}",
-            session_context={
-                "subject": recent_subject or "unknown",
-                "topic": session_topic or "discussed",
-                "completed": False, "score": None, "struggled_with": [],
-            })
+            session_context=session_context,
+        )
     except Exception:
         pass
 
     try:
         await save_session_summary(student_id, {
-            "subject": recent_subject or "unknown",
-            "topic": session_topic or "discussed",
-            "completed": False, "score": None, "struggled_with": [],
+            **session_context,
             "ended_at": datetime.now(timezone.utc).isoformat(),
         })
     except Exception:
@@ -458,7 +567,7 @@ async def _handle_jamb_ambition_response(
     from database.onboarding_state import clear_onboarding_state
 
     name = student.get("name", "Student").split()[0]
-    msg = text.strip()
+    msg = text.strip()[:100]  # Truncate to prevent injection
 
     try:
         await clear_onboarding_state("telegram", f"jamb_{student_id}")
@@ -577,6 +686,16 @@ async def _handle_ai_conversation(
         context_str = await _build_memory_context(student_id)
     except Exception:
         context_str = ""
+
+    # Session priming: if student was away, add wake context
+    is_waking = await _detect_session_gap(student_id)
+    if is_waking:
+        try:
+            wake_context = await _build_wake_context(student_id)
+            if wake_context:
+                context_str = wake_context + "\n\n" + context_str if context_str else wake_context
+        except Exception as e:
+            logger.error(f"Wake context build failed: {e}")
 
     _pending_model_update = None
 
@@ -723,7 +842,67 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
+    # JAMB check — trigger after AI response so it doesn't block
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
+
+
+# ═══════════════════════════════════════════════
+# SESSION PRIMING — wake detection
+# ═══════════════════════════════════════════════
+
+async def _detect_session_gap(student_id: str) -> bool:
+    """Check if enough time has passed to treat this as a new session wake."""
+    key = f"last_message_time:{student_id}"
+    try:
+        raw = redis_client.get(key)
+        if raw:
+            raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            last_time = datetime.fromisoformat(raw_str)
+            gap_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
+            return gap_minutes >= SESSION_GAP_MINUTES
+        # No previous timestamp — this is the first message ever or after expiry
+        return True
+    except Exception:
+        return False
+
+
+async def _build_wake_context(student_id: str) -> str:
+    """Build context for when a student returns after a gap."""
+    from database.conversations import get_session_summary, get_student_memory
+
+    parts = []
+    try:
+        last_session = await get_session_summary(student_id)
+        if last_session:
+            subject = last_session.get("subject", "")
+            topic = last_session.get("topic", "")
+            score = last_session.get("score")
+            struggles = last_session.get("struggled_with", [])
+            
+            if subject and subject != "unknown" and topic and topic != "discussed":
+                wake_line = f"STUDENT IS RETURNING. Last session: {subject} - {topic}."
+                if score is not None:
+                    wake_line += f" Scored {int(score * 100)}%."
+                if struggles:
+                    wake_line += f" Struggled with: {', '.join(struggles)}."
+                parts.append(wake_line)
+    except Exception:
+        pass
+
+    try:
+        memory = await get_student_memory(student_id)
+        if memory:
+            sessions_count = memory.get("sessions_completed", 0)
+            if sessions_count > 0:
+                parts.append(f"INFORMED GREETING: Acknowledge this is session #{sessions_count + 1}.")
+            
+            mastered = memory.get("topics_mastered", [])
+            if mastered:
+                parts.append(f"CELEBRATE: Student has mastered {len(mastered)} topics. Mention if natural.")
+    except Exception:
+        pass
+
+    return "WAKE CONTEXT:\n" + "\n".join(f"- {p}" for p in parts) if parts else ""
 
 
 # ═══════════════════════════════════════════════
@@ -753,6 +932,7 @@ def _extract_session_signals(
     if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
         signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
 
+    # Also extract signals from response — if student engaged with example-based teaching
     if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
         if any(word in resp_lower for word in ["example", "imagine", "think of"]):
             signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.1
@@ -790,9 +970,13 @@ def _extract_session_signals(
     elif pidgin_count >= 1:
         signals["communication"]["pidgin_mixed"] = 0.2
 
+    # Self-reported understanding — only as weak signal, not mastery
     if any(phrase in msg_lower for phrase in ["i understand", "i get it", "makes sense"]):
         if recent_subject and recent_subject != "unknown":
-            signals["competence"][f"{recent_subject}:discussed"] = {"score": 1.0, "level": "mastered"}
+            signals["competence"][f"{recent_subject}:discussed"] = {
+                "score": 0.6,  # Weak positive signal, not 1.0 mastery
+                "level": "in_progress"
+            }
 
     return signals
 
@@ -867,11 +1051,8 @@ async def _build_memory_context(student_id: str) -> str:
 # QUIZ ENGINE
 # ═══════════════════════════════════════════════
 
-_QUIZ_TRACKER: Dict[str, List[str]] = {}
-
-
 async def _load_questions(subject: str) -> List[Dict[str, Any]]:
-    """Load quiz questions for a subject."""
+    """Load quiz questions for a subject asynchronously."""
     cache_key = f"questions_cache:{subject}"
     try:
         cached = redis_client.get(cache_key)
@@ -883,7 +1064,11 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     questions: List[Dict[str, Any]] = []
     try:
         from database.client import supabase
-        result = supabase.table("questions").select("*").eq("subject", subject).limit(200).execute()
+        result = supabase.table("questions") \
+            .select("id, subject, question_text, question, correct_answer, options") \
+            .eq("subject", subject) \
+            .limit(200) \
+            .execute()
         if result.data:
             questions = result.data
     except Exception:
@@ -891,9 +1076,12 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
 
     if not questions:
         try:
-            json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jamb_questions_clean.json")
-            with open(json_path, "r", encoding="utf-8") as f:
-                questions = [q for q in json.load(f) if q.get("subject") == subject]
+            json_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "jamb_questions_clean.json"
+            )
+            # Use asyncio.to_thread for non-blocking file read
+            questions = await asyncio.to_thread(_read_questions_file, json_path, subject)
         except Exception:
             pass
 
@@ -903,6 +1091,12 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
     return questions
+
+
+def _read_questions_file(json_path: str, subject: str) -> List[Dict[str, Any]]:
+    """Read and filter questions from local JSON file (sync, called via to_thread)."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        return [q for q in json.load(f) if q.get("subject") == subject]
 
 
 async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "") -> None:
@@ -947,7 +1141,11 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     display_subject = db_subject.replace("_", " ").title()
     question_body = question.get("question_text", question.get("question", "Question loading..."))
     try:
-        await send_telegram_message(chat_id, f"📝 *{display_subject}*\n\n{question_body}\n\n_Tap your answer below:_", reply_markup=keyboard)
+        await send_telegram_message(
+            chat_id,
+            f"📝 *{display_subject}*\n\n{question_body}\n\n_Tap your answer below:_",
+            reply_markup=keyboard
+        )
     except Exception:
         try:
             redis_client.delete(quiz_key)
@@ -958,9 +1156,10 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_data: str) -> None:
     """Handle quiz button callbacks."""
     try:
-        await answer_callback_query(callback_query_id, text="")
+        await answer_callback_query(callback_query_id, text="✅")
     except Exception:
         pass
+
     try:
         from database.students import get_student_by_platform_id
         student = await get_student_by_platform_id("telegram", str(chat_id))
@@ -1016,7 +1215,7 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
 
 
 def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool) -> None:
-    """Log quiz answer to Redis."""
+    """Log quiz answer to Redis pipeline."""
     try:
         key = f"quiz_history:{student_id}"
         entry = json.dumps({
@@ -1026,8 +1225,8 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         pipe = redis_client.pipeline()
-        pipe.rpush(key, entry)
-        pipe.ltrim(key, -MAX_QUIZ_HISTORY, -1)
+        pipe.lpush(key, entry)
+        pipe.ltrim(key, 0, MAX_QUIZ_HISTORY - 1)
         pipe.expire(key, 86400 * 30)
         pipe.execute()
     except Exception:
@@ -1035,6 +1234,7 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
 
 
 def _validate_question(question: Dict[str, Any]) -> bool:
+    """Validate that a question has required fields."""
     if not question.get("question_text") and not question.get("question"):
         return False
     if not question.get("correct_answer"):
@@ -1043,6 +1243,7 @@ def _validate_question(question: Dict[str, Any]) -> bool:
 
 
 def _infer_track(subjects: List[str]) -> str:
+    """Infer the student's academic track from their subject combination."""
     if not subjects:
         return "unknown"
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
@@ -1062,21 +1263,48 @@ def _infer_track(subjects: List[str]) -> str:
 
 
 def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
+    """
+    Pick a subject using Redis-backed rotation tracking.
+    
+    Survives server restarts and works across multiple workers.
+    24-hour TTL means fresh rotation each day.
+    """
     if not subjects:
         return "mathematics"
-    recent = _QUIZ_TRACKER.get(student_id, [])
+    
+    tracker_key = f"quiz_rotation:{student_id}"
+    recent = []
+    
+    try:
+        raw = redis_client.get(tracker_key)
+        if raw:
+            raw_str = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            recent = json.loads(raw_str)
+    except Exception:
+        pass
+    
     available = [s for s in subjects if s not in recent]
     if not available:
         available = subjects
-        _QUIZ_TRACKER[student_id] = []
+        recent = []
+    
     chosen = random.choice(available)
-    _QUIZ_TRACKER.setdefault(student_id, []).append(chosen)
-    if len(_QUIZ_TRACKER[student_id]) > 3:
-        _QUIZ_TRACKER[student_id] = _QUIZ_TRACKER[student_id][-3:]
+    recent.append(chosen)
+    
+    # Keep only last 5 for rotation tracking
+    if len(recent) > 5:
+        recent = recent[-5:]
+    
+    try:
+        redis_client.setex(tracker_key, 86400, json.dumps(recent))
+    except Exception:
+        pass
+    
     return chosen
 
 
 async def warmup_question_cache() -> None:
+    """Pre-load question caches for common subjects on startup."""
     for subject in ["mathematics", "english", "physics", "chemistry", "biology", "government", "economics"]:
         try:
             await _load_questions(subject)
