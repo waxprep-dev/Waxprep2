@@ -68,36 +68,77 @@ SESSION_END_KEYWORDS = [
 ]
 
 # ── Subject name mapping ──────────────────────
+# FIXED: Expanded from 23 to 55+ entries covering all curriculum streams.
+# Core, Science, Commercial, Arts, Nigerian Languages, and Trade subjects.
 SUBJECT_MAP: Dict[str, str] = {
+    # ── Core/Compulsory ──
     "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
     "english": "english", "english_language": "english",
+    "civic_education": "civic_education", "civic": "civic_education",
+    "computer_studies": "computer_studies", "computer": "computer_studies", "ict": "computer_studies",
+    "data_processing": "data_processing", "data": "data_processing",
+    # ── Sciences ──
     "physics": "physics", "chemistry": "chemistry", "biology": "biology",
     "further_mathematics": "further_mathematics", "further mathematics": "further_mathematics",
     "agricultural_science": "agricultural_science", "agric": "agricultural_science",
-    "economics": "economics", "commerce": "commerce",
-    "accounting": "accounting", "accounts": "accounting",
+    "health_education": "health_education", "health": "health_education",
+    "physical_education": "physical_education", "physical": "physical_education", "phe": "physical_education",
+    "technical_drawing": "technical_drawing", "technical drawing": "technical_drawing",
+    "food_and_nutrition": "food_and_nutrition", "food & nutrition": "food_and_nutrition",
+    # ── Commercial/Business ──
+    "economics": "economics", "econs": "economics",
+    "commerce": "commerce",
+    "accounting": "accounting", "accounts": "accounting", "financial_accounting": "accounting",
     "business_studies": "business_studies", "business studies": "business_studies",
     "marketing": "marketing",
-    "government": "government",
+    "book_keeping": "book_keeping", "book keeping": "book_keeping",
+    "office_practice": "office_practice", "office practice": "office_practice",
+    "insurance": "insurance",
+    # ── Arts & Humanities ──
+    "government": "government", "govt": "government",
     "literature": "literature_in_english",
     "literature_in_english": "literature_in_english",
     "literature-in-english": "literature_in_english",
-    "civic_education": "civic_education", "civic education": "civic_education",
+    "history": "history",
     "christian_religious_studies": "crs", "crs": "crs",
-    "islamic_religious_studies": "irs", "irs": "irs",
-    "geography": "geography", "history": "history",
+    "islamic_religious_studies": "irs", "irs": "irs", "islamic": "irs",
+    "geography": "geography", "geo": "geography",
+    "visual_arts": "visual_arts", "visual arts": "visual_arts", "art": "visual_arts", "fine_art": "visual_arts",
+    "music": "music",
+    "french": "french",
+    "arabic": "arabic",
+    # ── Nigerian Languages ──
     "yoruba": "yoruba", "igbo": "igbo", "hausa": "hausa",
-    "food_and_nutrition": "food_and_nutrition", "food & nutrition": "food_and_nutrition",
-    "technical_drawing": "technical_drawing", "technical drawing": "technical_drawing",
-    "computer_studies": "computer_studies", "computer": "computer_studies", "ict": "computer_studies",
+    # ── Trade/Entrepreneurship ──
+    "fashion_design": "fashion_design", "fashion design": "fashion_design", "garment_making": "fashion_design",
+    "gsm_repairs": "gsm_repairs", "gsm repairs": "gsm_repairs", "computer_hardware": "gsm_repairs",
+    "solar_installation": "solar_installation", "solar installation": "solar_installation", "solar": "solar_installation",
+    "livestock_farming": "livestock_farming", "livestock farming": "livestock_farming",
+    "beauty_cosmetology": "beauty_cosmetology", "beauty": "beauty_cosmetology", "cosmetology": "beauty_cosmetology",
+    "horticulture": "horticulture", "crop_production": "horticulture",
 }
 
 # ── Fallback subject pools by track ───────────
+# FIXED: Expanded to include new curriculum subjects per track.
 TRACK_FALLBACKS: Dict[str, List[str]] = {
-    "science": ["english", "mathematics", "physics", "chemistry", "biology"],
-    "commercial": ["english", "mathematics", "economics", "commerce", "accounting"],
-    "arts": ["english", "mathematics", "government", "literature_in_english", "civic_education"],
-    "unknown": ["english", "mathematics"],
+    "science": [
+        "english", "mathematics", "physics", "chemistry", "biology",
+        "further_mathematics", "agricultural_science", "health_education",
+        "physical_education", "technical_drawing", "food_and_nutrition",
+        "computer_studies", "data_processing",
+    ],
+    "commercial": [
+        "english", "mathematics", "economics", "commerce", "accounting",
+        "business_studies", "marketing", "book_keeping", "office_practice",
+        "insurance", "data_processing", "computer_studies",
+    ],
+    "arts": [
+        "english", "mathematics", "government", "literature_in_english",
+        "civic_education", "history", "christian_religious_studies",
+        "islamic_religious_studies", "geography", "visual_arts", "music",
+        "french", "arabic", "yoruba", "igbo", "hausa",
+    ],
+    "unknown": ["english", "mathematics", "civic_education"],
 }
 
 # TTLs and limits
@@ -542,7 +583,6 @@ async def _handle_ai_conversation(
         except Exception as e:
             logger.error(f"Student model load failed: {e}", exc_info=True)
 
-    # ── Confusion Detection ──
     _pending_confusion_reset = False
 
     if _confusion_detector_available:
@@ -568,7 +608,6 @@ async def _handle_ai_conversation(
         except Exception as e:
             logger.error(f"Confusion detection failed: {e}", exc_info=True)
 
-    # ── Topic Coherence Check (NEW) ──
     if _coherence_detector_available:
         try:
             coherence = detect_topic_hopping(
@@ -765,8 +804,7 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
                     return subject
     trouble_subject = student.get("student_subject")
     if trouble_subject:
-        return trouble_subject
-    subjects = student.get("subjects", [])
+        return trouble_subject    subjects = student.get("subjects", [])
     if subjects and subjects[0]:
         return subjects[0]
     return None
@@ -997,15 +1035,22 @@ def _validate_question(question: Dict[str, Any]) -> bool:
 
 
 def _infer_track(subjects: List[str]) -> str:
+    # FIXED: Expanded to detect Trade subjects and new curriculum streams
     if not subjects:
         return "unknown"
     subject_set = {s.lower().replace(" ", "_") for s in subjects}
     if subject_set & {"physics", "chemistry", "biology", "further_mathematics", "agricultural_science"}:
         return "science"
-    if subject_set & {"accounting", "commerce", "business_studies", "marketing"}:
+    if subject_set & {"accounting", "commerce", "business_studies", "marketing", "book_keeping", "office_practice", "insurance"}:
         return "commercial"
-    if subject_set & {"literature_in_english", "government", "civic_education", "crs", "irs"}:
+    if subject_set & {"literature_in_english", "government", "civic_education", "crs", "irs", "history", "visual_arts", "music", "french", "arabic"}:
         return "arts"
+    if subject_set & {"fashion_design", "gsm_repairs", "solar_installation", "livestock_farming", "beauty_cosmetology", "horticulture"}:
+        return "trade"
+    if "economics" in subject_set and "government" in subject_set:
+        return "arts"
+    if "economics" in subject_set:
+        return "commercial"
     return "unknown"
 
 
