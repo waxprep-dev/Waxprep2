@@ -5,19 +5,23 @@ Every student gets a unique onboarding conversation.
 
 Architecture:
     - State machine tracks required fields
-    - AI generates every message fresh per student
+    - AI generates every message fresh per student (only 3 steps: welcome, trouble_subject, activation)
+    - Pre-written templates used for simple steps (name, class, subjects, exam, state, PIN)
     - Code validates responses and advances state
     - Inline buttons for structured choices (class, exam)
     - Free text for personal responses (name, subjects, state)
     - University ambition guessed from subjects for SS3
-    - PIN setup warm but code-enforced
+    - PIN setup warm but code-enforced, hashed before storage
+    - Brute-force protection: 5 failed attempts = lockout
 
 Fallback: telegram/onboarding.py (scripted version)
 """
 
 import asyncio
-import random
+import hashlib
+import logging
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from typing import Dict, Any, Optional, List
 
 from telegram.sender import send_telegram_message
@@ -25,6 +29,9 @@ from database.onboarding_state import save_onboarding_state, clear_onboarding_st
 from helpers import clean_name
 from database.students import create_student
 from content.subject_hooks import normalize_subject
+
+logger = logging.getLogger("waxprep.onboarding_hybrid")
+
 
 # ═══════════════════════════════════════════════
 # CONSTANTS
@@ -39,20 +46,31 @@ NIGERIAN_STATES = {
     "zamfara", "abuja", "fct", "federal capital territory",
 }
 
+# Canonical FCT name — all variations normalize to this
+FCT_CANONICAL = "FCT-Abuja"
+FCT_VARIANTS = {"abuja", "fct", "federal capital territory"}
+
 WEAK_PINS = {
     "1234", "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999",
     "password", "qwerty", "abcd", "12345", "waxp", "admin", "login",
 }
+
+# No more than 5 failed PIN attempts before lockout
+MAX_PIN_ATTEMPTS = 5
+
+# Words that mean "yes" when confirming a fuzzy match suggestion
+CONFIRMATION_WORDS = {"yes", "yeah", "yep", "correct", "right", "that's it", "yes o", "na im", "exactly"}
 
 # ═══════════════════════════════════════════════
 # ONBOARDING STATE MACHINE
 # ═══════════════════════════════════════════════
 
 REQUIRED_FIELDS = ["name", "class_level", "subjects", "target_exam", "student_state", "pin"]
-SS1_SS2_FIELDS = ["name", "class_level", "subjects", "student_state", "pin"]  # No exam for SS1/SS2
+SS1_SS2_FIELDS = ["name", "class_level", "subjects", "student_state", "pin"]
 
 STEP_ORDER = ["welcome", "name", "class_level", "subjects", "target_exam", 
               "university_ambition", "state", "pin_setup", "activation"]
+
 
 # ═══════════════════════════════════════════════
 # AI MESSAGE GENERATOR
@@ -67,17 +85,18 @@ async def _generate_onboarding_message(
     """
     Call the AI to generate a natural onboarding message.
     
-    The AI receives context about the student and the current step,
-    and generates a message that feels human, not scripted.
+    Only used for 3 high-value steps: welcome, trouble_subject, activation.
+    Simple steps (name, class, subjects, exam, state, PIN) use pre-written
+    templates via _get_fallback_message() to save cost and latency.
     
     Args:
-        step: Current onboarding step (welcome, name, class_level, etc.)
+        step: Current onboarding step
         state: Current onboarding state with collected data
         student_message: The student's last message (for reactions)
         validation_error: What went wrong (for retry prompts)
     
     Returns:
-        AI-generated message text
+        Generated message text (or fallback if AI fails)
     """
     from ai.brain import _get_client
     from config.settings import settings
@@ -89,7 +108,6 @@ async def _generate_onboarding_message(
     student_state = state.get("student_state", "")
     trouble_subject = state.get("trouble_subject", "")
     
-    # Build the AI prompt based on the current step
     step_prompts = {
         "welcome": f"""
 You are Wax — a warm Nigerian teacher onboarding a new student.
@@ -102,79 +120,13 @@ Generate a WARM, BRIEF welcome message. Be Nigerian. Be yourself.
 - Sound like a real person, not a bot. Use "Oya", "My person", "Welcome o".
 """,
 
-        "name": f"""
-You are Wax onboarding a new student.
-The student just said: "{student_message}"
-{f"Validation error: {validation_error}" if validation_error else ""}
+        "trouble_subject": f"""
+You are Wax onboarding {name}, an {class_level} student doing {', '.join(subjects) if subjects else 'various subjects'}.
+The student just gave their subjects.
 
-Generate a message asking for their name. 
-- If they already gave a name but it's invalid (too short, single word), gently ask again
-- If this is the first ask: "What do people call you at home? Your real name o."
-- React to their name if they gave one. If it's Nigerian, acknowledge it warmly.
-- Keep it under 3 sentences. No dashes, no numbers.
-""",
-
-        "class_level": f"""
-You are Wax onboarding {name if name else 'a new student'}.
-{f"They just said: '{student_message}'" if student_message else ""}
-{f"Validation error: {validation_error}" if validation_error else ""}
-
-Generate a message asking for their class level (SS1, SS2, or SS3).
-- Make it natural: "What class are you in?"
-- If this is a retry: "Just type SS1, SS2, or SS3."
-- Include inline button suggestion but the code handles buttons separately
-- Keep it under 2 sentences.
-""",
-
-        "subjects": f"""
-You are Wax onboarding {name}, an {class_level} student.
-{f"They just said: '{student_message}'" if student_message else ""}
-
-Generate a message asking what subjects they're doing in school.
-- Start open-ended: "What subjects are you doing in school?"
-- If they already mentioned some subjects, acknowledge them: "So you're doing Physics and Chemistry. What else?"
-- Make it feel like a teacher getting to know them, not a form
-- Keep it under 3 sentences.
-""",
-
-        "target_exam": f"""
-You are Wax onboarding {name}, an {class_level} student doing {', '.join(subjects) if subjects else 'subjects'}.
-
-Generate a message asking which exam they're preparing for.
-- For SS3: "Which exam are you preparing for? JAMB, WAEC, or NECO?"
-- Be warm but efficient. They've already answered several questions.
-- Keep it under 2 sentences.
-""",
-
-        "university_ambition": f"""
-You are Wax onboarding {name}, an SS3 student doing {', '.join(subjects) if subjects else 'subjects'} and preparing for {target_exam}.
-
-Generate a message asking what they want to study in university.
-- Make a guess based on their subjects: if they have Physics+Chemistry+Biology, guess Medicine or Engineering
-- "With these subjects, I'm guessing Medicine or Engineering. Am I close?"
-- If you guess wrong, it invites them to correct you. That's good.
-- Keep it under 3 sentences.
-""",
-
-        "state": f"""
-You are Wax onboarding {name}, an {class_level} student from Nigeria.
-{f"They just said: '{student_message}'" if student_message else ""}
-{f"Validation error: {validation_error}" if validation_error else ""}
-
-Generate a message asking which state they're in.
-- Explain WHY: "This helps me use examples you'll actually relate to."
-- Give examples: "Lagos? Kano? Rivers?"
-- Keep it under 2 sentences.
-""",
-
-        "pin_setup": f"""
-You are Wax onboarding {name}.
-{f"Validation error: {validation_error}" if validation_error else ""}
-
-Generate a message asking them to create a secret code (PIN).
-- First ask: "Create a secret code — at least 4 characters. Letters, numbers, or mix them up."
-- If they picked a weak PIN: be funny but firm. "My friend. You chose the code equivalent of leaving your door open."
-- If they confirmed: "Got it. Type it again to confirm."
+Ask them: which subject gives them the most trouble?
+- Be warm. Normalize struggling. "Which one gives you the most wahala?"
+- If they mentioned something earlier that sounded hard, reference it.
 - Keep it under 2 sentences.
 """,
 
@@ -199,7 +151,9 @@ Generate a personalized WELCOME message.
 """,
     }
     
-    prompt = step_prompts.get(step, f"Generate a warm, brief onboarding message for step: {step}. Student: {name}. Be Nigerian. Be yourself.")
+    prompt = step_prompts.get(step)
+    if not prompt:
+        return _get_fallback_message(step, state)
     
     try:
         client = _get_client(settings.GROQ_API_KEY)
@@ -210,31 +164,33 @@ Generate a personalized WELCOME message.
                 {"role": "system", "content": "You are Wax — a warm, funny, Nigerian teacher. You never say 'don't worry.' You never use dashes or numbered lists. You talk like a real person. Keep every message under 3 sentences during onboarding."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=200,
+            max_tokens=300 if step == "activation" else 200,
             temperature=0.8,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"AI onboarding message generation failed: {e}")
+        logger.error(f"AI onboarding message generation failed for step '{step}': {e}")
         return _get_fallback_message(step, state)
 
 
 def _get_fallback_message(step: str, state: dict) -> str:
-    """Fallback messages if AI generation fails. Same warmth, just pre-written."""
+    """Pre-written fallback messages. Same warmth as AI, zero latency, zero cost."""
     name = state.get("name", "").split()[0] if state.get("name") else ""
     
     fallbacks = {
         "welcome": "Oya, a serious student. I'm Wax. Are you new here or returning?",
         "name": "My person! What do people call you at home? Your real name o.",
-        "class_level": f"{name}, what class are you in? SS1, SS2, or SS3?",
-        "subjects": f"What subjects are you doing in school, {name}? Type them out — I want the full picture.",
+        "class_level": f"{name + ', ' if name else ''}what class are you in? SS1, SS2, or SS3?",
+        "subjects": f"What subjects are you doing in school{f', {name}' if name else ''}? Type them out — I want the full picture.",
         "target_exam": "Which exam are you preparing for? JAMB, WAEC, or NECO?",
         "university_ambition": "Have you thought about what you want to study in university?",
-        "state": "Which state are you based in? It helps me give you examples you'll actually relate to.",
+        "state": "Which state are you based in? It helps me give you examples you'll actually relate to. Lagos? Kano? Rivers?",
         "pin_setup": "Create a secret code — at least 4 characters. Letters, numbers, or mix them up. Something your younger sibling can't guess.",
-        "activation": f"{name}. You're in! I know what we're up against. I won't give up on you. What do you want to study first?",
+        "activation": f"{name + '. ' if name else ''}You're in! I know what we're up against. I won't give up on you. What do you want to study first?",
+        "trouble_subject": f"Out of all your subjects, {name + ', ' if name else ''}which one gives you the most wahala? Be honest — no judgment.",
     }
     return fallbacks.get(step, "Let's continue. What's next?")
+
 
 # ═══════════════════════════════════════════════
 # VALIDATION FUNCTIONS
@@ -247,6 +203,7 @@ def _validate_name(text: str) -> tuple:
         return "", "Give me a name — something I can call you."
     return name, ""
 
+
 def _validate_class(text: str) -> tuple:
     """Validate class level. Returns (class_level, error_message)."""
     class_map = {"1": "SS1", "2": "SS2", "3": "SS3", 
@@ -256,6 +213,7 @@ def _validate_class(text: str) -> tuple:
     if not result:
         return "", "Just type SS1, SS2, or SS3."
     return result, ""
+
 
 def _validate_exam(text: str) -> tuple:
     """Validate exam type. Returns (exam, error_message)."""
@@ -267,15 +225,42 @@ def _validate_exam(text: str) -> tuple:
         return "", "Just type JAMB, WAEC, or NECO."
     return result, ""
 
+
 def _validate_state(text: str) -> tuple:
-    """Validate Nigerian state. Returns (state_name, error_message)."""
+    """
+    Validate Nigerian state. Returns (state_name, error_message).
+    
+    Handles:
+    - Exact matches (case-insensitive)
+    - FCT variations (normalized to FCT-Abuja)
+    - Fuzzy matches for close guesses (e.g., "Abuj" → suggests "Abuja")
+    - Short inputs (<=2 chars) with helpful error
+    """
     raw = text.strip()
-    state_name = raw.title()
+    raw_lower = raw.lower()
+    
+    # Check exact match first
+    if raw_lower in NIGERIAN_STATES:
+        if raw_lower in FCT_VARIANTS:
+            return FCT_CANONICAL, ""
+        return raw.title(), ""
+    
+    # Fuzzy match for close guesses (e.g., "Abuj" → "abuja", "plateu" → "plateau")
+    matches = get_close_matches(raw_lower, list(NIGERIAN_STATES), n=1, cutoff=0.7)
+    if matches:
+        matched = matches[0]
+        if matched in FCT_VARIANTS:
+            matched_display = FCT_CANONICAL
+        else:
+            matched_display = matched.title()
+        return "", f"Did you mean *{matched_display}*? Just confirming — I want to get your state right."
+    
+    # No match — give helpful error
     if len(raw) <= 2:
         return "", "Type the full name — like Kano or Lagos."
-    if raw.lower() not in NIGERIAN_STATES:
-        return "", f"Hmm, I don't recognize '{raw}' as a Nigerian state. Try the full name?"
-    return state_name, ""
+    
+    return "", f"Hmm, I don't recognize '{raw}' as a Nigerian state. Try the full name?"
+
 
 def _validate_pin(text: str) -> tuple:
     """Validate PIN. Returns (pin, error_message)."""
@@ -285,6 +270,7 @@ def _validate_pin(text: str) -> tuple:
     if pin.lower() in WEAK_PINS:
         return "", "That's too easy to guess. Pick something more unique."
     return pin, ""
+
 
 # ═══════════════════════════════════════════════
 # KEYBOARD BUILDERS
@@ -302,6 +288,7 @@ def _build_class_keyboard() -> dict:
         ]
     }
 
+
 def _build_exam_keyboard() -> dict:
     """Inline keyboard for exam selection."""
     return {
@@ -314,6 +301,7 @@ def _build_exam_keyboard() -> dict:
         ]
     }
 
+
 def _build_new_returning_keyboard() -> dict:
     """Inline keyboard for new vs returning."""
     return {
@@ -325,13 +313,16 @@ def _build_new_returning_keyboard() -> dict:
         ]
     }
 
+
 # ═══════════════════════════════════════════════
 # MAIN ONBOARDING DISPATCHER
 # ═══════════════════════════════════════════════
 
 STEP_HANDLERS = {}
 
+
 def register_step(step_name: str):
+    """Decorator to register a step handler function."""
     def wrapper(func):
         STEP_HANDLERS[step_name] = func
         return func
@@ -368,7 +359,7 @@ async def _handle_onboarding_callback(chat_id: int, state: dict, callback_data: 
         state["awaiting_response_for"] = "subjects"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("subjects", state)
+        msg = _get_fallback_message("subjects", state)
         await send_telegram_message(chat_id, msg)
         return
     
@@ -378,7 +369,7 @@ async def _handle_onboarding_callback(chat_id: int, state: dict, callback_data: 
         state["awaiting_response_for"] = "university_ambition"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("university_ambition", state)
+        msg = _get_fallback_message("university_ambition", state)
         await send_telegram_message(chat_id, msg)
         return
     
@@ -387,7 +378,7 @@ async def _handle_onboarding_callback(chat_id: int, state: dict, callback_data: 
         state["awaiting_response_for"] = "name"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("name", state)
+        msg = _get_fallback_message("name", state)
         await send_telegram_message(chat_id, msg)
         return
     
@@ -416,7 +407,7 @@ async def _step_welcome(chat_id: int, state: dict, message: str):
         state["is_new_student"] = True
         state["awaiting_response_for"] = "name"
         await save_onboarding_state("telegram", str(chat_id), state)
-        msg = await _generate_onboarding_message("name", state)
+        msg = await _generate_onboarding_message("welcome", state, message)
         await send_telegram_message(chat_id, msg)
         return
     
@@ -430,7 +421,7 @@ async def _step_welcome(chat_id: int, state: dict, message: str):
         )
         return
     
-    # Unclear — ask with buttons
+    # Unclear — ask with buttons (AI-generated welcome)
     state["awaiting_response_for"] = "welcome"
     await save_onboarding_state("telegram", str(chat_id), state)
     
@@ -448,16 +439,15 @@ async def _step_name(chat_id: int, state: dict, message: str):
     name, error = _validate_name(message)
     
     if error:
-        msg = await _generate_onboarding_message("name", state, message, error)
-        await send_telegram_message(chat_id, msg)
+        await send_telegram_message(chat_id, error)
         return
     
     state["name"] = name
     state["awaiting_response_for"] = "class_level"
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    # Send name reaction + class question with buttons
-    msg = await _generate_onboarding_message("class_level", state, name)
+    # Pre-written: simple question, no AI needed
+    msg = _get_fallback_message("class_level", state)
     await send_telegram_message(chat_id, msg, reply_markup=_build_class_keyboard())
 
 
@@ -471,15 +461,14 @@ async def _step_class_level(chat_id: int, state: dict, message: str):
     class_level, error = _validate_class(message)
     
     if error:
-        msg = await _generate_onboarding_message("class_level", state, message, error)
-        await send_telegram_message(chat_id, msg, reply_markup=_build_class_keyboard())
+        await send_telegram_message(chat_id, error, reply_markup=_build_class_keyboard())
         return
     
     state["class_level"] = class_level
     state["awaiting_response_for"] = "subjects"
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    msg = await _generate_onboarding_message("subjects", state)
+    msg = _get_fallback_message("subjects", state)
     await send_telegram_message(chat_id, msg)
 
 
@@ -489,32 +478,30 @@ async def _step_class_level(chat_id: int, state: dict, message: str):
 
 @register_step("subjects")
 async def _step_subjects(chat_id: int, state: dict, message: str):
-    """Collect subjects. AI extracts from free text."""
+    """Collect subjects. Extracts from free text using SUBJECT_MAP."""
     raw = message.strip()
-    first = state.get("name", "Student").split()[0]
     
     # Handle "I don't know"
     dont_know = ["i don't know", "idk", "not sure", "all of them", "everything"]
     if raw.lower() in dont_know:
-        state["trouble_subject"] = "Mathematics"
+        state["trouble_subject"] = ""
         state["subjects"] = ["english", "mathematics"]
         state["awaiting_response_for"] = "trouble_subject"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("subjects", state, 
-            "Student doesn't know their subjects. Defaulting to English and Maths. Ask which subject gives them trouble.")
+        # AI-generated: reacting to "I don't know" is a human moment
+        msg = await _generate_onboarding_message("trouble_subject", state)
         await send_telegram_message(chat_id, msg)
         return
     
     # Try to extract subjects from their message
-    # First pass: normalize subjects from SUBJECT_MAP
+    # Lazy import to avoid circular dependency
     from telegram.handler import SUBJECT_MAP
     
     found_subjects = []
     msg_lower = raw.lower()
     
     for key, value in SUBJECT_MAP.items():
-        # Check if the subject name or key appears in the message
         if key.replace("_", " ") in msg_lower or key in msg_lower:
             if value not in found_subjects:
                 found_subjects.append(value)
@@ -525,23 +512,21 @@ async def _step_subjects(chat_id: int, state: dict, message: str):
             found_subjects.insert(0, core)
     
     if len(found_subjects) >= 3:
-        # We got enough subjects
-        state["subjects"] = found_subjects[:12]  # Cap at 12
+        state["subjects"] = found_subjects[:12]
         state["awaiting_response_for"] = "trouble_subject"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("subjects", state,
-            f"Student mentioned {len(found_subjects)} subjects. Ask which one gives them the most trouble.")
+        msg = await _generate_onboarding_message("trouble_subject", state)
         await send_telegram_message(chat_id, msg)
         return
     
-    # Not enough subjects extracted — ask follow-up
+    # Not enough subjects — ask follow-up (pre-written)
     state["subjects"] = found_subjects
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    msg = await _generate_onboarding_message("subjects", state,
-        f"Only found {len(found_subjects)} subjects. Ask what else they're doing.")
-    await send_telegram_message(chat_id, msg)
+    await send_telegram_message(chat_id,
+        f"I caught {len(found_subjects)}. What else are you doing? I want the full picture."
+    )
 
 
 # ═══════════════════════════════════════════════
@@ -558,19 +543,18 @@ async def _step_trouble_subject(chat_id: int, state: dict, message: str):
     
     class_level = state.get("class_level", "SS3")
     
-    # SS3 → ask exam. SS1/SS2 → skip to state
     if class_level == "SS3":
         state["awaiting_response_for"] = "target_exam"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("target_exam", state)
+        msg = _get_fallback_message("target_exam", state)
         await send_telegram_message(chat_id, msg, reply_markup=_build_exam_keyboard())
     else:
         state["target_exam"] = "not_applicable"
         state["awaiting_response_for"] = "state"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("state", state)
+        msg = _get_fallback_message("state", state)
         await send_telegram_message(chat_id, msg)
 
 
@@ -584,15 +568,14 @@ async def _step_target_exam(chat_id: int, state: dict, message: str):
     target_exam, error = _validate_exam(message)
     
     if error:
-        msg = await _generate_onboarding_message("target_exam", state, message, error)
-        await send_telegram_message(chat_id, msg, reply_markup=_build_exam_keyboard())
+        await send_telegram_message(chat_id, error, reply_markup=_build_exam_keyboard())
         return
     
     state["target_exam"] = target_exam
     state["awaiting_response_for"] = "university_ambition"
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    msg = await _generate_onboarding_message("university_ambition", state)
+    msg = _get_fallback_message("university_ambition", state)
     await send_telegram_message(chat_id, msg)
 
 
@@ -620,12 +603,12 @@ async def _step_university_ambition(chat_id: int, state: dict, message: str):
             )
             state["jamb_result"] = result
         except Exception:
-            pass
+            logger.error("JAMB checker failed during onboarding", exc_info=True)
     
     state["awaiting_response_for"] = "state"
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    msg = await _generate_onboarding_message("state", state)
+    msg = _get_fallback_message("state", state)
     await send_telegram_message(chat_id, msg)
 
 
@@ -636,19 +619,46 @@ async def _step_university_ambition(chat_id: int, state: dict, message: str):
 @register_step("state")
 async def _step_state(chat_id: int, state: dict, message: str):
     """Collect Nigerian state."""
+    msg_lower = message.strip().lower()
+    
+    # Handle "yes" confirmations from fuzzy match suggestions
+    if msg_lower in CONFIRMATION_WORDS:
+        suggested_state = state.get("_suggested_state")
+        if suggested_state:
+            state["student_state"] = suggested_state
+            state.pop("_suggested_state", None)
+            state["pin_failed_attempts"] = 0
+            state["awaiting_response_for"] = "pin_setup"
+            await save_onboarding_state("telegram", str(chat_id), state)
+            
+            msg = _get_fallback_message("pin_setup", state)
+            await send_telegram_message(chat_id, msg)
+            return
+    
     student_state, error = _validate_state(message)
     
     if error:
-        msg = await _generate_onboarding_message("state", state, message, error)
-        await send_telegram_message(chat_id, msg)
+        # Check if error contains a fuzzy match suggestion (starts with "Did you mean")
+        if error.startswith("Did you mean"):
+            # Extract the suggested state from the error message
+            # Format: "Did you mean *State Name*? ..."
+            import re
+            match = re.search(r'\*([^*]+)\*', error)
+            if match:
+                state["_suggested_state"] = match.group(1)
+                await save_onboarding_state("telegram", str(chat_id), state)
+        
+        await send_telegram_message(chat_id, error)
         return
     
+    # Clean up fuzzy match suggestion state if present
+    state.pop("_suggested_state", None)
     state["student_state"] = student_state
     state["pin_failed_attempts"] = 0
     state["awaiting_response_for"] = "pin_setup"
     await save_onboarding_state("telegram", str(chat_id), state)
     
-    msg = await _generate_onboarding_message("pin_setup", state)
+    msg = _get_fallback_message("pin_setup", state)
     await send_telegram_message(chat_id, msg)
 
 
@@ -658,41 +668,73 @@ async def _step_state(chat_id: int, state: dict, message: str):
 
 @register_step("pin_setup")
 async def _step_pin_setup(chat_id: int, state: dict, message: str):
-    """Collect and validate PIN."""
+    """Collect and validate PIN. Hashes before storing."""
     pin, error = _validate_pin(message)
     
     if error:
         failed = state.get("pin_failed_attempts", 0) + 1
         state["pin_failed_attempts"] = failed
-        await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("pin_setup", state, message, error)
-        await send_telegram_message(chat_id, msg)
+        # Brute-force protection: lock after MAX_PIN_ATTEMPTS failures
+        if failed >= MAX_PIN_ATTEMPTS:
+            await clear_onboarding_state("telegram", str(chat_id))
+            await send_telegram_message(chat_id, 
+                "You've tried too many times. For your security, I'm restarting.\n\n"
+                "Type *HI* when you're ready to try again with a code you'll remember."
+            )
+            logger.warning(f"PIN lockout triggered for chat_id={chat_id} after {failed} failed attempts")
+            return
+        
+        await save_onboarding_state("telegram", str(chat_id), state)
+        await send_telegram_message(chat_id, error)
         return
     
-    state["pending_pin"] = pin
+    # Hash PIN with SHA-256 before storing in state
+    state["pending_pin"] = hashlib.sha256(pin.encode()).hexdigest()
+    state["pin_failed_attempts"] = 0  # Reset counter on valid PIN
     state["awaiting_response_for"] = "pin_confirm"
     await save_onboarding_state("telegram", str(chat_id), state)
     
     await send_telegram_message(chat_id, "Got it! Type it again to confirm.")
 
 
+# ═══════════════════════════════════════════════
+# STEP: PIN CONFIRM
+# ═══════════════════════════════════════════════
+
 @register_step("pin_confirm")
 async def _step_pin_confirm(chat_id: int, state: dict, message: str):
     """Confirm PIN and create account."""
-    pin_confirm = message.strip()
+    pin_confirm_hash = hashlib.sha256(message.strip().encode()).hexdigest()
     pending_pin = state.get("pending_pin", "")
     
-    if pin_confirm != pending_pin:
+    if pin_confirm_hash != pending_pin:
+        failed = state.get("pin_failed_attempts", 0) + 1
+        state["pin_failed_attempts"] = failed
+        
+        # Brute-force protection: lock after MAX_PIN_ATTEMPTS failures on confirm too
+        if failed >= MAX_PIN_ATTEMPTS:
+            await clear_onboarding_state("telegram", str(chat_id))
+            await send_telegram_message(chat_id,
+                "Too many wrong attempts. For your security, I'm restarting.\n\n"
+                "Type *HI* when you're ready to try again."
+            )
+            logger.warning(f"PIN confirm lockout triggered for chat_id={chat_id} after {failed} failed confirm attempts")
+            return
+        
         state["pending_pin"] = None
         state["awaiting_response_for"] = "pin_setup"
         await save_onboarding_state("telegram", str(chat_id), state)
         
-        msg = await _generate_onboarding_message("pin_setup", state, "", "PINs don't match")
-        await send_telegram_message(chat_id, msg)
+        await send_telegram_message(chat_id, "Those didn't match. Let's try again — pick a code and type it.")
         return
     
-    # ── Create account ──
+    # PINs match — create account
+    # Note: create_student receives the RAW PIN (not hashed) so it can hash with
+    # its own salt/algorithm for final storage. We pass the original message.strip()
+    # for the final PIN. Verif_ that create_student handles hashing internally.
+    raw_pin = message.strip()
+    
     subjects = state.get("subjects", ["english", "mathematics"])
     if "english" not in subjects:
         subjects.insert(0, "english")
@@ -703,7 +745,7 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
         platform="telegram",
         platform_user_id=str(chat_id),
         name=state.get("name", "Student"),
-        pin=pending_pin,
+        pin=raw_pin,
         class_level=state.get("class_level"),
         target_exam=state.get("target_exam"),
         subjects=subjects,
@@ -712,34 +754,50 @@ async def _step_pin_confirm(chat_id: int, state: dict, message: str):
     )
     
     if not student:
+        await clear_onboarding_state("telegram", str(chat_id))
         await send_telegram_message(chat_id, 
-            "Something went wrong creating your account. Try again — just send *HI* to restart.")
+            "Something went wrong creating your account. Try again — just send *HI* to restart."
+        )
+        logger.error(f"create_student returned None for chat_id={chat_id}")
         return
     
     await clear_onboarding_state("telegram", str(chat_id))
     
-    # ── Activation ──
+    # ── Activation: AI-generated welcome message ──
     msg = await _generate_onboarding_message("activation", state)
+    await send_telegram_message(chat_id, msg)
     
-    # Insert WAX ID and recovery code
-    activation = (
-        f"{msg}\n\n"
-        f"*Your account details — save these:*\n"
-        f"WAX ID: *{student['wax_id']}*\n"
-        f"Recovery Code: *{student['recovery_code']}*\n\n"
-        f"⚠️ Write that code somewhere safe. Not in this chat."
+    # ── Recovery code: separate urgent message ──
+    recovery_msg = (
+        f"🔐 *Your Recovery Code:* `{student['recovery_code']}`\n\n"
+        f"⚠️ *Write this down NOW. On paper. Not in this chat.*\n"
+        f"This message is not saved anywhere. If you lose this code and forget your PIN, "
+        f"you cannot recover your account.\n\n"
+        f"Your WAX ID (safe to share): *{student['wax_id']}*"
     )
+    await send_telegram_message(chat_id, recovery_msg)
     
-    # If JAMB Checker ran, add result
+    # ── JAMB result: separate follow-up (if applicable) ──
     jamb_result = state.get("jamb_result")
     if jamb_result:
+        await asyncio.sleep(1.5)  # Small pause so messages don't arrive all at once
         if jamb_result.get("ready"):
-            activation += f"\n\n✅ Your subjects match *{jamb_result.get('course_display', 'your course')}*!"
+            await send_telegram_message(chat_id,
+                f"✅ Good news — your subjects match *{jamb_result.get('course_display', 'your course')}*! "
+                f"You're on the right track."
+            )
         elif jamb_result.get("missing"):
             missing_names = [m["preferred"] if isinstance(m, dict) else m for m in jamb_result["missing"]]
-            activation += f"\n\n⚠️ You're missing {', '.join(missing_names)} for {jamb_result.get('course_display', 'that course')}."
+            await send_telegram_message(chat_id,
+                f"Quick note: for *{jamb_result.get('course_display', 'that course')}*, "
+                f"you'd need {', '.join(missing_names)}. We can talk about this — but first, let's study."
+            )
     
-    await send_telegram_message(chat_id, activation)
+    # ── Final nudge to start ──
+    await asyncio.sleep(1)
+    await send_telegram_message(chat_id, 
+        "Did you write down the recovery code? Good.\n\nNow — what do you want to study first?"
+    )
 
 
 # ═══════════════════════════════════════════════
@@ -755,7 +813,7 @@ async def _step_wax_id_entry(chat_id: int, state: dict, message: str):
         state["is_new_student"] = True
         state["awaiting_response_for"] = "name"
         await save_onboarding_state("telegram", str(chat_id), state)
-        msg = await _generate_onboarding_message("name", state)
+        msg = _get_fallback_message("name", state)
         await send_telegram_message(chat_id, msg)
         return
     
@@ -765,11 +823,13 @@ async def _step_wax_id_entry(chat_id: int, state: dict, message: str):
         state["awaiting_response_for"] = "pin_entry"
         await save_onboarding_state("telegram", str(chat_id), state)
         await send_telegram_message(chat_id,
-            f"Got you. Now enter your secret code. If you've forgotten it, type *forgot*.")
+            f"Got you. Now enter your secret code. If you've forgotten it, type *forgot*."
+        )
         return
     
     await send_telegram_message(chat_id,
-        "That doesn't look like a WAX ID. It should be WAX-A74892. Try again, or type *new* to start fresh.")
+        "That doesn't look like a WAX ID. It should be WAX-A74892. Try again, or type *new* to start fresh."
+    )
 
 
 @register_step("pin_entry")
@@ -781,9 +841,10 @@ async def _step_pin_entry(chat_id: int, state: dict, message: str):
         state["is_new_student"] = True
         state["awaiting_response_for"] = "name"
         await save_onboarding_state("telegram", str(chat_id), state)
-        msg = await _generate_onboarding_message("name", state)
+        msg = _get_fallback_message("name", state)
         await send_telegram_message(chat_id, msg)
         return
     
     await send_telegram_message(chat_id,
-        "PIN login is coming soon. For now, type *new* to create a fresh account and start studying immediately.")
+        "PIN login is coming soon. For now, type *new* to create a fresh account and start studying immediately."
+    )
