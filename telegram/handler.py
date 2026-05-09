@@ -196,7 +196,7 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         return
 
     try:
-        from telegram.onboarding import handle_onboarding
+        from telegram.onboarding_hybrid import handle_onboarding_hybrid as handle_onboarding
         from database.onboarding_state import get_onboarding_state
         state = await get_onboarding_state("telegram", str(chat_id))
     except Exception:
