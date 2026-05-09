@@ -4,26 +4,32 @@ Calls the Groq API with Wax's system prompt and returns the response.
 Includes post-processing enforcement layer for critical rules.
 
 Multi-Key Rotation:
-    Rotates through GROQ_API_KEYS on rate limit errors.
+    Rotates through GROQ_API_KEYS on rate limit errors using random
+    starting index (no race conditions under concurrent load).
     Each key has 100,000 tokens/day on Groq free tier.
-    With 3 keys = 300,000 tokens/day = ~30 active students.
+    With 3 keys = 300,000 tokens/day.
 
 Response Cache:
     Caches AI responses for common knowledge questions in Redis.
     Normalizes questions so "What is Osmosis??" and "what is osmosis"
-    hit the same cache. 7-day TTL. Cuts token costs by ~80%.
+    hit the same cache. Split into 3 tiers by class level (JSS, SS1-2, SS3)
+    so students only get difficulty-appropriate responses.
+    7-day TTL. Cuts token costs by ~80%.
     Only caches knowledge questions — not greetings, quizzes, or personal messages.
+    Cache version prefix allows instant invalidation on prompt/model changes.
 
 Domain Boundary Enforcement:
     After the AI generates a response, checks it against the Student Model's
     avoided domains. If the response contains words from a domain the student
     has explicitly rejected, strips the violating sentences entirely.
-    Falls back to safe alternatives if the entire response is compromised.
+    Falls back to warm Nigerian-voice alternatives if the entire response
+    is compromised.
 """
 
 import asyncio
 import hashlib
 import logging
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -35,48 +41,36 @@ logger = logging.getLogger("waxprep.ai_brain")
 
 # Cache for Groq clients — one per API key
 _clients = {}
-# Track which key to try next (simple round-robin)
-_current_key_index = 0
+
+# Client TTL: recreate clients after 1 hour to pick up key changes
+_CLIENT_TTL_SECONDS = 3600
+_client_timestamps = {}
 
 
 def _get_client(api_key: str = None) -> Groq:
     """
     Get or create a Groq client for a specific API key.
     
+    Clients are recreated after 1 hour to allow key rotation
+    without server restart.
+    
     Args:
         api_key: Specific API key to use. If None, uses default.
         
     Returns:
-        Groq client instance
+        Groq client instance with 30-second timeout
     """
     key = api_key or settings.GROQ_API_KEY
     
-    if key not in _clients:
-        _clients[key] = Groq(api_key=key)
+    now = time.time()
+    if key in _clients and key in _client_timestamps:
+        if now - _client_timestamps[key] < _CLIENT_TTL_SECONDS:
+            return _clients[key]
+    
+    _clients[key] = Groq(api_key=key, timeout=30.0)
+    _client_timestamps[key] = now
     
     return _clients[key]
-
-
-def _next_key() -> str:
-    """
-    Get the next API key in rotation.
-    
-    Uses module-level counter for simple round-robin.
-    Thread-safe enough for async — worst case two requests use same key.
-    
-    Returns:
-        API key string
-    """
-    global _current_key_index
-    keys = settings.GROQ_API_KEYS
-    
-    if not keys or not keys[0]:
-        return ""
-    
-    key = keys[_current_key_index % len(keys)]
-    _current_key_index += 1
-    
-    return key
 
 
 # ═══════════════════════════════════════════════
@@ -86,13 +80,41 @@ def _next_key() -> str:
 # Cache TTL: 7 days for teaching responses
 CACHE_TTL = 604800  # 7 days in seconds
 
+# Cache version: increment when system prompt or model changes
+# to instantly invalidate all old cached responses
+CACHE_VERSION = "v2"
+
+
+def _get_class_tier(class_level: str) -> str:
+    """
+    Convert class level to cache tier to avoid cross-contamination.
+    
+    Splits students into 3 tiers so SS3 students don't get JSS1-level
+    cached responses and vice versa.
+    
+    Args:
+        class_level: e.g., "SS3", "JSS1", "SS2"
+        
+    Returns:
+        Cache tier string: "jss", "ss1-2", or "ss3"
+    """
+    if not class_level:
+        return "ss3"
+    cl = class_level.upper()
+    if "JSS" in cl:
+        return "jss"
+    if cl in ("SS1", "SS2"):
+        return "ss1-2"
+    return "ss3"
+
 
 def _normalize_for_cache(text: str) -> str:
     """
     Normalize a student's question into a consistent cache key.
     
-    Strips punctuation, extra spaces, and converts to lowercase
-    so "What is Osmosis??" and "what is osmosis" produce the same key.
+    Strips punctuation, extra spaces, underscores, and converts to
+    lowercase so "What is Osmosis??" and "what_is_osmosis" produce
+    the same key.
     
     Args:
         text: Raw student message
@@ -101,9 +123,32 @@ def _normalize_for_cache(text: str) -> str:
         Normalized cache key string
     """
     text = text.lower().strip()
-    text = re.sub(r'[^\w\s]', '', text)
+    # Strip punctuation and underscores
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    # Collapse whitespace
     text = " ".join(text.split())
     return text
+
+
+def _build_cache_key(message: str, class_level: str = "SS3") -> str:
+    """
+    Build a tiered cache key.
+    
+    Uses MD5 hash of normalized message for fixed-length keys,
+    includes cache version for instant invalidation, and class
+    tier to prevent cross-contamination between levels.
+    
+    Args:
+        message: Raw student message
+        class_level: Student's class level for tier selection
+        
+    Returns:
+        Redis cache key string
+    """
+    tier = _get_class_tier(class_level)
+    normalized = _normalize_for_cache(message)
+    hashed = hashlib.md5(normalized.encode()).hexdigest()
+    return f"response_cache:{CACHE_VERSION}:{tier}:{hashed}"
 
 
 def _is_cacheable(message: str) -> bool:
@@ -121,6 +166,7 @@ def _is_cacheable(message: str) -> bool:
     """
     msg_lower = message.lower().strip()
     
+    # Skip greetings, commands, and personal messages
     skip_patterns = [
         "hi", "hello", "hey", "good morning", "good evening",
         "how are you", "what's up", "thank", "bye", "ok", "okay",
@@ -132,36 +178,51 @@ def _is_cacheable(message: str) -> bool:
         if pattern in msg_lower:
             return False
     
+    # Too short to be a knowledge question
     if len(msg_lower.split()) < 2:
         return False
     
+    # Skip personal messages
     personal_indicators = [" i ", " my ", " me ", " i'm ", " i've ", " my name"]
     for indicator in personal_indicators:
         if indicator in f" {msg_lower} ":
             return False
     
+    # Match knowledge question patterns
     knowledge_patterns = [
         "what", "how", "explain", "define", "why",
         "describe", "difference between", "compare",
-        "tell me about", "meaning of",
+        "tell me about", "meaning of", "can you explain",
+        "help me understand",
     ]
     
     for pattern in knowledge_patterns:
         if msg_lower.startswith(pattern) or pattern in msg_lower:
             return True
     
+    # Long messages that don't match above patterns are probably
+    # still knowledge-related (e.g., "break down respiration for me")
     if len(msg_lower) > 30:
         return True
     
     return False
 
 
-async def _get_cached_response(message: str) -> str | None:
-    """Check if a cached response exists for this message."""
+async def _get_cached_response(message: str, class_level: str = "SS3") -> str | None:
+    """
+    Check if a cached response exists for this message.
+    
+    Args:
+        message: Raw student message
+        class_level: Student's class level for tier matching
+        
+    Returns:
+        Cached response string or None
+    """
     try:
         from database.client import redis_client
         
-        cache_key = f"response_cache:{_normalize_for_cache(message)}"
+        cache_key = _build_cache_key(message, class_level)
         cached = redis_client.get(cache_key)
         
         if cached:
@@ -174,12 +235,19 @@ async def _get_cached_response(message: str) -> str | None:
     return None
 
 
-async def _cache_response(message: str, response: str) -> None:
-    """Store an AI response in the cache for future use."""
+async def _cache_response(message: str, response: str, class_level: str = "SS3") -> None:
+    """
+    Store an AI response in the cache for future use.
+    
+    Args:
+        message: Raw student message
+        response: AI-generated response to cache
+        class_level: Student's class level for tier placement
+    """
     try:
         from database.client import redis_client
         
-        cache_key = f"response_cache:{_normalize_for_cache(message)}"
+        cache_key = _build_cache_key(message, class_level)
         redis_client.setex(cache_key, CACHE_TTL, response)
         logger.debug(f"Cache SAVED: {message[:50]}...")
     except Exception as e:
@@ -290,22 +358,40 @@ def enforce_length(response: str, max_chars: int = 400) -> str:
 
 
 def clean_banned_phrases(response: str) -> str:
-    """Remove banned phrases from the response."""
-    banned = [
-        ("don't worry", "I hear you"),
-        ("dont worry", "I hear you"),
-        ("Don't worry", "I hear you"),
-        ("do not worry", "I hear you"),
-    ]
+    """
+    Remove banned phrases using case-insensitive regex matching.
     
-    for phrase, replacement in banned:
-        response = response.replace(phrase, replacement)
+    Catches ALL variations: "don't worry", "DON'T WORRY", "Don't Worry",
+    "don't-worry", "do not worry", etc.
     
+    Replacement: "let's take it step by step" — works in more contexts
+    than the old replacement "I hear you" which created nonsense sentences.
+    """
+    # Catch "don't worry" and "dont worry" (all cases)
+    response = re.sub(
+        r"don'?t\s+worry",
+        "let's take it step by step",
+        response,
+        flags=re.IGNORECASE
+    )
+    # Catch "do not worry" (all cases)
+    response = re.sub(
+        r"do\s+not\s+worry",
+        "let's take it step by step",
+        response,
+        flags=re.IGNORECASE
+    )
     return response
 
 
 def enforce_nigerian_example(response: str) -> str:
-    """If the response is teaching and has no Nigerian reference, log a warning."""
+    """
+    Check if teaching response has Nigerian references.
+    
+    Logs a warning if missing but does NOT modify the response.
+    The warning is a monitoring signal — if this fires too often,
+    the system prompt needs adjustment.
+    """
     nigerian_terms = [
         "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
         "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
@@ -346,7 +432,8 @@ async def enforce_domain_boundaries(
     
     If the student has explicitly rejected a domain and the AI's response
     contains words from that domain, strips the violating sentences entirely.
-    Falls back to safe alternatives if the entire response is compromised.
+    Falls back to warm Nigerian-voice alternatives if the entire response
+    is compromised.
     
     Args:
         response: The AI-generated response text
@@ -408,20 +495,19 @@ async def enforce_domain_boundaries(
                 else:
                     logger.debug(f"Stripped violating sentence: {sentence[:80]}...")
             
-            # If everything was stripped, provide a safe fallback
+            # If everything was stripped, provide a WARM fallback
+            # No square brackets. No robot voice. Just Wax being honest.
             if not clean_sentences or len(" ".join(clean_sentences)) < 15:
                 preferred = student_model.get_preferred_domains()[:2]
                 if preferred:
                     preferred_str = ", ".join(preferred)
                     return (
-                        f"Let me try a different example. "
-                        f"[Response regenerated to respect your preferences. "
-                        f"Preferred domains: {preferred_str}]"
+                        f"Ah, my bad — I used an example you've asked me to avoid. "
+                        f"Let me try again with {preferred_str} instead."
                     )
                 else:
                     return (
-                        f"Let me try explaining without that example. "
-                        f"[Response adjusted to avoid examples you've asked me not to use.]"
+                        f"My bad, let me take a different approach without that example."
                     )
             
             response = " ".join(clean_sentences)
@@ -447,7 +533,8 @@ async def think(
     """
     Main AI thinking function.
     
-    Multi-key rotation, response caching, and domain boundary enforcement.
+    Multi-key rotation with random starting index (no race conditions),
+    tiered response caching, and domain boundary enforcement.
     
     Args:
         message: The student's latest message
@@ -460,17 +547,18 @@ async def think(
     Returns:
         Wax's response as a string (post-processed for rule compliance)
     """
-    global _current_key_index
-
     conversation_history = conversation_history or []
     student_id = student.get('id', 'unknown')
     name = student.get('name', 'Student').split()[0]
+    class_level = student.get('class_level', 'SS3')
 
+    # Build system prompt
     if is_practice:
         system_prompt = get_lite_prompt(student, recent_subject, context_str)
     else:
         system_prompt = get_wax_system_prompt(student, recent_subject, context_str)
 
+    # Build message list for AI
     messages = [{"role": "system", "content": system_prompt}]
 
     history_limit = 10 if is_practice else 20
@@ -484,22 +572,27 @@ async def think(
 
     messages.append({"role": "user", "content": message})
 
-    # Check response cache
+    # Check response cache (tiered by class level)
     if _is_cacheable(message):
-        cached_response = await _get_cached_response(message)
+        cached_response = await _get_cached_response(message, class_level)
         if cached_response:
             return cached_response
 
     # Call Groq with multi-key rotation
+    # Random starting index avoids race conditions under concurrent load
     raw_response = None
     keys = settings.GROQ_API_KEYS
-    max_retries = len(keys) * 3
     
-    start_index = _current_key_index % len(keys) if keys else 0
+    if not keys or not keys[0]:
+        logger.error(f"No Groq API keys configured. AI cannot function.")
+        return f"I had a small technical hiccup, {name}. Can you ask me again?"
+    
+    max_retries = len(keys) * 3
+    start_index = random.randint(0, len(keys) - 1)
     
     for attempt in range(max_retries):
         key_index = (start_index + attempt) % len(keys)
-        api_key = keys[key_index] if keys else ""
+        api_key = keys[key_index]
         
         try:
             client = _get_client(api_key)
@@ -515,7 +608,6 @@ async def think(
             result = response.choices[0].message.content
             if result and len(result.strip()) > 5:
                 raw_response = result.strip()
-                _current_key_index = (key_index + 1) % len(keys)
                 break
             
             logger.warning(f"Groq returned empty/short response for student {student_id}")
@@ -544,17 +636,20 @@ async def think(
                     await asyncio.sleep(0.5)
 
     if not raw_response:
-        _log_ai_failure(student_id, "ALL_KEYS_EXHAUSTED", "All API keys rate limited")
+        _log_ai_failure(student_id, "ALL_KEYS_EXHAUSTED", "All API keys exhausted or failed")
+        # Stable fallback selection using MD5 instead of unstable hash()
         fallbacks = [
             f"I had a small technical hiccup, {name}. Can you ask me again?",
             f"Ah, my brain lagged for a second, {name}. Try me one more time?",
             f"Sorry, {name} — something glitched. What were you saying?",
         ]
-        return fallbacks[hash(str(student_id)) % len(fallbacks)]
+        hash_val = int(hashlib.md5(str(student_id).encode()).hexdigest()[:8], 16)
+        return fallbacks[hash_val % len(fallbacks)]
 
-    # Post-processing
+    # Post-processing enforcement
     cleaned_response = enforce_rules(raw_response)
     
+    # If enforcement made the response too short, use gentler enforcement
     if len(cleaned_response) < 20 and len(raw_response) > 20:
         cleaned_response = clean_banned_phrases(raw_response)
         cleaned_response = enforce_length(cleaned_response, max_chars=500)
@@ -567,15 +662,15 @@ async def think(
     except Exception as e:
         logger.error(f"Domain enforcement failed: {e}", exc_info=True)
     
-    # Cache response
+    # Cache response (tiered by class level)
     if _is_cacheable(message):
-        await _cache_response(message, cleaned_response)
+        await _cache_response(message, cleaned_response, class_level)
     
     return cleaned_response
 
 
 def _log_ai_failure(student_id: str, error_type: str, error_message: str):
-    """Log AI failures for monitoring."""
+    """Log AI failures for monitoring and alerting."""
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.critical(
         f"AI_FAILURE | {timestamp} | student={student_id} | "
