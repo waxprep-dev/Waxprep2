@@ -4,11 +4,15 @@ FastAPI server with Telegram + WhatsApp webhooks.
 
 Webhook Architecture:
     /webhook/telegram (POST)
+        ├── Degraded mode check → rejects if infrastructure is down
+        ├── Secret token validation → required, fails closed
         ├── callback_query → handle_quiz_callback()  [button taps]
         └── message → process_telegram_message()      [text messages]
+            └── Transient errors → 503 (Telegram retries)
+            └── Permanent errors → 200 (no retry)
     
     /webhook/whatsapp (GET)  → Verification handshake
-    /webhook/whatsapp (POST) → Message processing
+    /webhook/whatsapp (POST) → 501 Not Implemented (coming soon)
 
 Cold Start Prevention:
     Use UptimeRobot (free) to ping /health every 5 minutes.
@@ -18,6 +22,7 @@ Cold Start Prevention:
 
 import asyncio
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -43,27 +48,34 @@ async def lifespan(app: FastAPI):
     Startup:
     - Validates Supabase connection
     - Validates Redis connection
-    - Logs readiness state
+    - Validates Telegram token
+    - Validates Groq API key (warns if missing)
+    - Sets app.state.healthy based on all checks
+    
+    If BOTH Supabase AND Redis fail, the app will refuse to start.
+    If only one fails, it enters degraded mode — /health reflects true status
+    but the webhook will reject messages with 503 until recovery.
     
     Shutdown:
     - Cleanup connections
     - Log shutdown
-    
-    Note: Startup failures are logged but don't prevent app start.
-    The app enters "degraded mode" — /health reflects true status.
     """
     logger.info("=" * 50)
     logger.info("WaxPrep v2 starting up...")
     startup_ok = True
+    supabase_failed = False
+    redis_failed = False
 
     # Test Supabase
     try:
         from database.client import supabase
         result = supabase.table("system_config").select("config_key").limit(1).execute()
         logger.info(f"✅ Supabase connected (rows: {len(result.data)})")
+        app.state.supabase_ok = True
     except Exception as e:
         logger.critical(f"❌ Supabase connection FAILED: {e}")
         app.state.supabase_ok = False
+        supabase_failed = True
         startup_ok = False
 
     # Test Redis
@@ -71,12 +83,25 @@ async def lifespan(app: FastAPI):
         from database.client import redis_client
         if redis_client.ping():
             logger.info("✅ Redis connected")
+            app.state.redis_ok = True
         else:
             raise Exception("Redis ping returned False")
     except Exception as e:
         logger.critical(f"❌ Redis connection FAILED: {e}")
         app.state.redis_ok = False
+        redis_failed = True
         startup_ok = False
+
+    # If BOTH critical infrastructure failed, refuse to start
+    if supabase_failed and redis_failed:
+        logger.critical(
+            "❌ Both Supabase AND Redis are unavailable. "
+            "Application cannot function. Shutting down."
+        )
+        raise RuntimeError(
+            "Critical infrastructure unavailable — Supabase and Redis both failed. "
+            "Check credentials and network connectivity."
+        )
 
     # Test Telegram bot token (syntax check, not actual API call)
     try:
@@ -84,11 +109,38 @@ async def lifespan(app: FastAPI):
         token = settings.TELEGRAM_BOT_TOKEN
         if token and len(token) > 20:
             logger.info(f"✅ Telegram token configured (length: {len(token)})")
+            app.state.telegram_ok = True
         else:
             logger.warning("⚠️ Telegram token appears invalid (too short)")
+            app.state.telegram_ok = False
     except Exception as e:
         logger.critical(f"❌ Telegram token check FAILED: {e}")
+        app.state.telegram_ok = False
         startup_ok = False
+
+    # Test Groq API key availability (warn but don't fail)
+    try:
+        groq_keys = settings.GROQ_API_KEYS
+        if groq_keys and groq_keys[0]:
+            logger.info(f"✅ Groq API keys configured ({len(groq_keys)} key(s))")
+            app.state.groq_ok = True
+        else:
+            logger.warning("⚠️ No Groq API keys configured — AI responses will fail")
+            app.state.groq_ok = False
+    except Exception as e:
+        logger.warning(f"⚠️ Groq key check failed: {e}")
+        app.state.groq_ok = False
+
+    # Check webhook secret in production
+    if os.getenv("ENVIRONMENT", "development") == "production":
+        webhook_secret = settings.TELEGRAM_WEBHOOK_SECRET
+        if not webhook_secret:
+            logger.critical(
+                "❌ TELEGRAM_WEBHOOK_SECRET is not set in production! "
+                "Webhook is UNPROTECTED. Set this immediately."
+            )
+        else:
+            logger.info("✅ Telegram webhook secret configured")
 
     # Store overall health
     app.state.healthy = startup_ok
@@ -114,15 +166,19 @@ app = FastAPI(
     title="WaxPrep v2",
     version="2.0.0",
     lifespan=lifespan,
-    docs_url="/docs" if __import__("os").getenv("ENV") != "production" else None,
+    docs_url="/docs" if os.getenv("ENVIRONMENT", "development") != "production" else None,
 )
 
 # ── CORS (for future web dashboard) ──────────
+# In production, restrict to the actual dashboard domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=[
+        "https://waxprep.com",
+        "https://app.waxprep.com",
+    ] if os.getenv("ENVIRONMENT", "development") == "production" else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -177,8 +233,10 @@ async def health_check():
     Returns true health status, not just "ok".
     """
     healthy = getattr(app.state, "healthy", False)
-    supabase_ok = getattr(app.state, "supabase_ok", True)
-    redis_ok = getattr(app.state, "redis_ok", True)
+    supabase_ok = getattr(app.state, "supabase_ok", False)
+    redis_ok = getattr(app.state, "redis_ok", False)
+    telegram_ok = getattr(app.state, "telegram_ok", False)
+    groq_ok = getattr(app.state, "groq_ok", False)
     
     status_code = 200 if healthy else 503
     
@@ -190,6 +248,8 @@ async def health_check():
             "checks": {
                 "supabase": "ok" if supabase_ok else "failed",
                 "redis": "ok" if redis_ok else "failed",
+                "telegram_token": "ok" if telegram_ok else "invalid",
+                "groq_api": "ok" if groq_ok else "missing",
             }
         },
         status_code=status_code
@@ -197,7 +257,7 @@ async def health_check():
 
 
 # ═══════════════════════════════════════════════
-# TEST ENDPOINT
+# TEST ENDPOINT (development only)
 # ═══════════════════════════════════════════════
 
 @app.get("/test-onboarding")
@@ -205,10 +265,23 @@ async def test_onboarding():
     """
     Run quick onboarding tests and return results directly.
     
-    No timeout, no WebSocket — plain JSON response.
+    Only available in development mode.
     Useful for CI/CD and manual browser testing.
     """
-    from tests.test_onboarding import run_quick_tests
+    if os.getenv("ENVIRONMENT", "development") == "production":
+        return JSONResponse(
+            {"status": "error", "message": "Test endpoint disabled in production"},
+            status_code=403
+        )
+    
+    try:
+        from tests.test_onboarding import run_quick_tests
+    except ImportError as e:
+        logger.error(f"Test module import failed: {e}")
+        return JSONResponse(
+            {"status": "error", "message": "Test module not available"},
+            status_code=500
+        )
     
     logger.info("Running onboarding tests...")
     results = await run_quick_tests()
@@ -243,24 +316,43 @@ async def telegram_webhook(request: Request):
     2. message — User sent a text message
        → Routed to process_telegram_message()
     
-    Security: Validates Telegram secret token header (if configured).
+    Security:
+    - Secret token validation is REQUIRED. Fails closed if not configured.
+    - Degraded mode check: rejects messages if infrastructure is down.
     """
     request_id = getattr(request.state, "request_id", "unknown")
 
-    # ── Validate secret token (anti-spoofing) ──
-    try:
-        from config.settings import settings
-        secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        expected_secret = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", None)
-        
-        if expected_secret and secret_header != expected_secret:
-            logger.warning(
-                f"[{request_id}] Telegram webhook rejected: invalid secret token"
-            )
-            return JSONResponse({"status": "forbidden"}, status_code=403)
-    except Exception as e:
-        logger.error(f"[{request_id}] Secret validation error: {e}")
-        # Don't block on config errors — log and continue
+    # ── Check if app is healthy enough to process messages ──
+    if not getattr(app.state, "healthy", True):
+        logger.warning(
+            f"[{request_id}] App is DEGRADED — rejecting message to allow recovery"
+        )
+        return JSONResponse(
+            {"status": "degraded", "message": "Service temporarily unavailable"},
+            status_code=503
+        )
+
+    # ── Validate secret token (anti-spoofing) — REQUIRED ──
+    from config.settings import settings
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    expected_secret = settings.TELEGRAM_WEBHOOK_SECRET
+    
+    if not expected_secret:
+        # Secret is not configured. Fail closed — reject all requests.
+        logger.critical(
+            f"[{request_id}] TELEGRAM_WEBHOOK_SECRET is not configured! "
+            f"Webhook is UNPROTECTED. Set this immediately."
+        )
+        return JSONResponse(
+            {"status": "error", "message": "Server configuration error"},
+            status_code=500
+        )
+    
+    if secret_header != expected_secret:
+        logger.warning(
+            f"[{request_id}] Telegram webhook rejected: invalid secret token"
+        )
+        return JSONResponse({"status": "forbidden"}, status_code=403)
 
     # ── Parse request body ──
     try:
@@ -328,13 +420,28 @@ async def telegram_webhook(request: Request):
         logger.info(f"[{request_id}] Message processed successfully")
         return JSONResponse({"status": "ok"})
     except Exception as e:
+        error_str = str(e).lower()
         logger.error(
             f"[{request_id}] Message processing failed: {e}",
             exc_info=True
         )
-        # Return 200 anyway — prevents Telegram retry spam
-        # The error is logged for debugging
-        return JSONResponse({"status": "error", "request_id": request_id})
+        
+        # Differentiate: transient errors → 503 (Telegram will retry)
+        # Permanent errors → 200 (don't retry — it won't help)
+        is_transient = any(phrase in error_str for phrase in [
+            "timeout", "connection", "network", "temporary",
+            "rate limit", "too many requests", "unavailable"
+        ])
+        
+        if is_transient:
+            return JSONResponse(
+                {"status": "error", "request_id": request_id},
+                status_code=503
+            )
+        else:
+            return JSONResponse(
+                {"status": "error", "request_id": request_id}
+            )  # Default 200 — permanent error, don't retry
 
 
 # ═══════════════════════════════════════════════
@@ -362,43 +469,43 @@ async def whatsapp_verify(request: Request):
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
-    logger.info(f"WhatsApp verification: mode={mode}, token={'***' if token else 'None'}")
+    logger.info(
+        f"WhatsApp verification: mode={mode}, "
+        f"token={'***' if token else 'None'}"
+    )
 
     if mode == "subscribe" and token == settings.WHATSAPP_VERIFY_TOKEN:
         logger.info("WhatsApp webhook verified successfully")
         return Response(content=str(challenge), media_type="text/plain")
     
-    logger.warning(f"WhatsApp verification FAILED: mode={mode}, token_match={token == settings.WHATSAPP_VERIFY_TOKEN}")
+    logger.warning(
+        f"WhatsApp verification FAILED: mode={mode}, "
+        f"token_match={token == settings.WHATSAPP_VERIFY_TOKEN}"
+    )
     return JSONResponse({"status": "forbidden"}, status_code=403)
 
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     """
-    Receives messages from WhatsApp and processes them.
+    WhatsApp message processing — NOT YET IMPLEMENTED.
     
-    TODO: Implement WhatsApp message processing.
-    For now, returns 200 to acknowledge receipt.
-    
-    Future: Route to same handler as Telegram (multi-platform support).
+    Returns 501 Not Implemented to prevent unauthorized use.
+    This endpoint will be activated when WhatsApp integration is complete
+    with proper authentication (X-Hub-Signature-256 validation).
     """
     request_id = getattr(request.state, "request_id", "unknown")
-
-    try:
-        body = await request.json()
-        logger.info(f"[{request_id}] WhatsApp message received: {str(body)[:200]}")
-        
-        # TODO: Extract phone number and message text
-        # TODO: Lookup or create student by WhatsApp phone number
-        # TODO: Route to process_telegram_message() or equivalent
-        
-        return JSONResponse({
-            "status": "ok",
+    logger.warning(
+        f"[{request_id}] WhatsApp webhook called but not implemented — "
+        f"returning 501"
+    )
+    return JSONResponse(
+        {
+            "status": "not_implemented",
             "message": "WhatsApp integration coming soon"
-        })
-    except Exception as e:
-        logger.error(f"[{request_id}] WhatsApp webhook error: {e}", exc_info=True)
-        return JSONResponse({"status": "error"}, status_code=500)
+        },
+        status_code=501
+    )
 
 
 # ═══════════════════════════════════════════════
@@ -408,6 +515,10 @@ async def whatsapp_webhook(request: Request):
 def _safe_get(dictionary: dict, *keys, default=None):
     """
     Safely traverse nested dictionaries without raising KeyError.
+    
+    Correctly handles None values — if a key exists but its value is None,
+    traversal continues (unlike the old implementation which treated None
+    the same as a missing key).
     
     Example:
         _safe_get(body, "callback_query", "message", "chat", "id")
@@ -424,9 +535,9 @@ def _safe_get(dictionary: dict, *keys, default=None):
     for key in keys:
         if not isinstance(dictionary, dict):
             return default
-        dictionary = dictionary.get(key, default)
-        if dictionary is default:
+        if key not in dictionary:
             return default
+        dictionary = dictionary[key]
     return dictionary
 
 
@@ -435,15 +546,17 @@ def _safe_get(dictionary: dict, *keys, default=None):
 # ═══════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import os
-    debug_mode = os.getenv("ENV", "development") != "production"
+    debug_mode = os.getenv("ENVIRONMENT", "development") != "production"
     
-    logger.info(f"Starting WaxPrep in {'development' if debug_mode else 'production'} mode")
+    logger.info(
+        f"Starting WaxPrep in "
+        f"{'development' if debug_mode else 'production'} mode"
+    )
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8080)),
         reload=debug_mode,
-        log_level="info" if not debug_mode else "debug",
+        log_level="debug" if debug_mode else "info",
     )
