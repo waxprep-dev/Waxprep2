@@ -251,9 +251,12 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             student=new_student,
             conversation_history=[],
             recent_subject=None,
-            context_str="This is a new student. You don't know anything about them yet. "
-                         "Introduce yourself warmly. Ask their name naturally when it feels right. "
-                         "Don't interrogate. Just welcome them and let the conversation flow.",
+            context_str="This is a new student. You don't know anything about them yet — "
+                         "no name, no class, no subjects. Introduce yourself ONCE briefly as Wax, "
+                         "their teacher. Then focus on getting to know them naturally. "
+                         "Ask ONE question at a time. Don't repeat your introduction. "
+                         "Don't say 'I'm Wax, your teacher' more than once. "
+                         "Respond to what they actually say. Follow the conversation where it leads.",
             is_practice=False,
         )
         
