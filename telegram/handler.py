@@ -4,31 +4,9 @@ Processes incoming Telegram messages. Routes new students to a warm AI conversat
 registered users to the AI brain. Handles quiz commands and answers.
 Supports callback queries (inline keyboard) AND text-based answers.
 
-Now with JAMB Subject Checker — Wax proactively brings up university
-ambition at natural moments after trust is built.
-
-Now with Deferral Handler — when a student says "anything" or "you pick,"
-Wax takes control. Doesn't ask again. Leads.
-
-Now with Session End Detection — natural endings like "I'm tired" or
-"I'm done" trigger formal session closure, saving memory for next time.
-Detects both English and Nigerian Pidgin expressions.
-
-Now with Confusion Detection — when a student is confused, Wax stops
-introducing new information, switches examples, and doesn't move forward
-until the student confirms understanding.
-
-Now with Student Model — Wax learns HOW each student learns. Teaching style,
-example domains, communication style, and competence map adapt over time.
-
-Now with Preference Detection — statements like "I don't like market examples"
-or "I prefer short definitions" are routed to AI, not intercepted by deferral.
-
-Now with Topic Coherence Check — when a student hops between topics without
-completing any, Wax gently guides them toward focus.
-
-Now with Session Priming — on first message after a gap, Wax already knows
-what happened last session before generating a response.
+Now with Observation Extraction — Wax learns from every conversation.
+Observations extracted progressively (every 5 messages) and at session end.
+Content-addressable deduplication prevents duplicates.
 """
 import asyncio
 import hashlib
@@ -52,6 +30,12 @@ DEFERRAL_KEYWORDS = [
     "anything", "you pick", "any one", "whatever",
     "up to you", "choose for me", "i don't know what to study",
     "i don't care", "surprise me",
+    # Topic change requests ARE deferrals
+    "let's change topic", "change topic", "let's move on",
+    "next topic", "something else", "new topic",
+    "i'm tired of this", "this one is boring",
+    "let's do something else", "switch topic",
+    "suggest something", "suggest a topic",
 ]
 
 # ── Preference keywords ───────────────────────
@@ -89,13 +73,11 @@ NIGERIAN_TIME_PHRASES = [
 
 # ── Subject name mapping ──────────────────────
 SUBJECT_MAP: Dict[str, str] = {
-    # ── Core/Compulsory ──
     "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
     "english": "english", "english_language": "english",
     "civic_education": "civic_education", "civic": "civic_education",
     "computer_studies": "computer_studies", "computer": "computer_studies", "ict": "computer_studies",
     "data_processing": "data_processing", "data": "data_processing",
-    # ── Sciences ──
     "physics": "physics", "chemistry": "chemistry", "biology": "biology",
     "further_mathematics": "further_mathematics", "further mathematics": "further_mathematics",
     "agricultural_science": "agricultural_science", "agric": "agricultural_science",
@@ -103,7 +85,6 @@ SUBJECT_MAP: Dict[str, str] = {
     "physical_education": "physical_education", "physical": "physical_education", "phe": "physical_education",
     "technical_drawing": "technical_drawing", "technical drawing": "technical_drawing",
     "food_and_nutrition": "food_and_nutrition", "food & nutrition": "food_and_nutrition",
-    # ── Commercial/Business ──
     "economics": "economics", "econs": "economics",
     "commerce": "commerce",
     "accounting": "accounting", "accounts": "accounting", "financial_accounting": "accounting",
@@ -112,7 +93,6 @@ SUBJECT_MAP: Dict[str, str] = {
     "book_keeping": "book_keeping", "book keeping": "book_keeping",
     "office_practice": "office_practice", "office practice": "office_practice",
     "insurance": "insurance",
-    # ── Arts & Humanities ──
     "government": "government", "govt": "government",
     "literature": "literature_in_english",
     "literature_in_english": "literature_in_english",
@@ -125,9 +105,7 @@ SUBJECT_MAP: Dict[str, str] = {
     "music": "music",
     "french": "french",
     "arabic": "arabic",
-    # ── Nigerian Languages ──
     "yoruba": "yoruba", "igbo": "igbo", "hausa": "hausa",
-    # ── Trade/Entrepreneurship ──
     "fashion_design": "fashion_design", "fashion design": "fashion_design", "garment_making": "fashion_design",
     "gsm_repairs": "gsm_repairs", "gsm repairs": "gsm_repairs", "computer_hardware": "gsm_repairs",
     "solar_installation": "solar_installation", "solar installation": "solar_installation", "solar": "solar_installation",
@@ -168,16 +146,15 @@ QUIZ_TTL_SECONDS = 1800
 MAX_QUIZ_HISTORY = 200
 JAMB_CHECK_COOLDOWN = 604800
 DEFERRAL_TTL = 3600
-SESSION_GAP_MINUTES = 60  # Time before treating a return as a new wake event
+SESSION_GAP_MINUTES = 60
+PROGRESSIVE_EXTRACTION_INTERVAL = 5  # Extract observations every N user messages
 
 # Understanding confirmation phrases (English + Pidgin)
 UNDERSTANDING_PHRASES = [
-    # English
     "you've got it", "exactly", "you worked that out",
     "you're right", "well done", "correct", "perfect",
     "that's it", "you got it", "you understand",
     "now you're getting it", "you're on a roll",
-    # Nigerian Pidgin
     "you don sabi am", "na so e be", "you get am",
     "e don enter", "correct guy", "correct girl",
     "you dey try", "na im be that",
@@ -223,12 +200,11 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
-    # Unregistered user — direct AI conversation, no onboarding pipeline
+    # Unregistered user — direct AI conversation
     try:
         from ai.brain import think
         from database.conversations import save_message, get_history
         
-        # Create a minimal student dict so the AI has something to work with
         new_student = {
             "id": f"temp_{chat_id}",
             "name": "Student",
@@ -239,20 +215,16 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             "current_streak": 0,
         }
         
-        # Save the user's message
         try:
             await save_message(new_student["id"], "user", text)
         except Exception:
             pass
         
-        # Load existing conversation history for this temp student
-        # so Wax remembers the conversation within the session
         try:
             conversation_history = await get_history(new_student["id"])
         except Exception:
             conversation_history = []
         
-        # Generate AI response with actual conversation history
         response = await think(
             message=text,
             student=new_student,
@@ -264,7 +236,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             is_practice=False,
         )
         
-        # Save Wax's response
         try:
             await save_message(new_student["id"], "assistant", response)
         except Exception:
@@ -283,7 +254,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
 
-    # Check for JAMB ambition response in progress
     try:
         from database.onboarding_state import get_onboarding_state
         jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
@@ -293,17 +263,15 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     except Exception:
         pass
 
-    # Session end detection — English and Pidgin
+    # Session end detection MUST run before AI processing
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
-    # Nigerian time phrases — student stepping away briefly
     if any(phrase in msg_lower for phrase in NIGERIAN_TIME_PHRASES):
         await _handle_stepping_away(chat_id, student_id, name)
         return
 
-    # Deferral vs preference routing
     is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
     is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
     
@@ -311,7 +279,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
-    # Quiz answer detection (single letter A-D)
     cleaned = text.strip().upper()
     if cleaned in ("A", "B", "C", "D") and len(cleaned) == 1:
         quiz_key = f"active_quiz:{student_id}"
@@ -322,27 +289,24 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         except Exception:
             pass
 
-    # Quiz trigger
     if any(trigger in msg_lower for trigger in QUIZ_TRIGGERS):
         await _start_quiz(chat_id, student, text)
         return
 
-    # Route to AI conversation
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
 # ═══════════════════════════════════════════════
-# STEPPING AWAY HANDLER (Nigerian time norms)
+# STEPPING AWAY HANDLER
 # ═══════════════════════════════════════════════
 
 async def _handle_stepping_away(chat_id: int, student_id: str, name: str) -> None:
-    """Handle Nigerian time expressions — student is stepping away briefly."""
+    """Handle Nigerian time expressions."""
     key = f"stepped_away:{student_id}"
     try:
-        redis_client.setex(key, 3600, "1")  # 1-hour flag
+        redis_client.setex(key, 3600, "1")
     except Exception:
         pass
-    
     await send_telegram_message(chat_id, "No wahala. I dey here.")
 
 
@@ -354,7 +318,7 @@ async def _handle_session_end(
     chat_id: int, student: dict, text: str,
     student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle natural session endings with smart completion detection."""
+    """Handle natural session endings with observation extraction."""
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message, save_session_summary
@@ -394,18 +358,16 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
-    # Smart session completion detection — don't hard-code incomplete
+    # Smart session completion detection
     session_completed = False
     session_score = None
     session_struggles = []
 
-    # Check recent conversation for mastery signals
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "").lower()
             if any(phrase in content for phrase in UNDERSTANDING_PHRASES):
                 session_completed = True
-                # Estimate score from ratio of correct to total answers
                 correct_count = sum(
                     1 for m in conversation_history[-20:]
                     if m.get("role") == "assistant" and
@@ -415,8 +377,7 @@ async def _handle_session_end(
                     1 for m in conversation_history[-20:]
                     if m.get("role") == "assistant" and
                     any(p in m.get("content", "").lower() for p in [
-                        "not quite", "not exactly", "close", "almost",
-                        "that's not",
+                        "not quite", "not exactly", "close", "almost", "that's not",
                     ])
                 )
                 total = correct_count + wrong_count
@@ -424,21 +385,16 @@ async def _handle_session_end(
                     session_score = correct_count / total
                 break
 
-    # Auto-detect struggles from conversation
-    struggle_keywords = [
-        "confused", "don't understand", "struggling", "hard", "difficult"
-    ]
+    struggle_keywords = ["confused", "don't understand", "struggling", "hard", "difficult"]
     for msg in conversation_history[-10:]:
         if msg.get("role") == "user":
             content = msg.get("content", "").lower()
             for kw in struggle_keywords:
                 if kw in content:
-                    # Check for negation: "NOT hard", "isn't confusing"
                     idx = content.find(kw)
                     before = content[max(0, idx-15):idx]
                     negated = any(neg in before for neg in [
-                        "not ", "isn't ", "wasn't ", "no longer ",
-                        "not as ", "don't ",
+                        "not ", "isn't ", "wasn't ", "no longer ", "not as ", "don't ",
                     ])
                     if not negated and session_topic and session_topic not in session_struggles:
                         session_struggles.append(session_topic)
@@ -467,6 +423,29 @@ async def _handle_session_end(
         })
     except Exception:
         pass
+
+    # ============================================================
+    # SESSION-END OBSERVATION EXTRACTION (full pass with SMART model)
+    # ============================================================
+    if not student_id.startswith("temp_"):
+        asyncio.ensure_future(
+            _run_session_end_extraction(student_id, conversation_history)
+        )
+
+
+async def _run_session_end_extraction(student_id: str, conversation_history: List[Dict]) -> None:
+    """Run full observation extraction at session end. Background task."""
+    try:
+        from brain.observations import extract_and_save_observations
+        saved = await extract_and_save_observations(
+            student_id=student_id,
+            conversation_history=conversation_history,
+            is_session_end=True,
+        )
+        if saved > 0:
+            logger.info(f"Session-end extraction saved {saved} observation(s) for {student_id}")
+    except Exception as e:
+        logger.error(f"Session-end extraction failed for {student_id}: {e}")
 
 
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
@@ -509,7 +488,7 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
 async def _handle_deferral(
     chat_id: int, student: dict, student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle when a student defers."""
+    """Handle when a student defers or asks to change topic."""
     from database.conversations import save_message
 
     trouble_subject = student.get("student_subject")
@@ -598,7 +577,7 @@ async def _handle_jamb_ambition_response(
     from database.onboarding_state import clear_onboarding_state
 
     name = student.get("name", "Student").split()[0]
-    msg = text.strip()[:100]  # Truncate to prevent injection
+    msg = text.strip()[:100]
 
     try:
         await clear_onboarding_state("telegram", f"jamb_{student_id}")
@@ -664,7 +643,7 @@ async def _handle_jamb_ambition_response(
 
 
 # ═══════════════════════════════════════════════
-# AI CONVERSATION HANDLER
+# AI CONVERSATION HANDLER (with observation extraction)
 # ═══════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -674,7 +653,7 @@ async def _handle_ai_conversation(
     student_id: str,
     name: str
 ) -> None:
-    """Process a student message through the AI brain."""
+    """Process a student message through the AI brain with progressive observation extraction."""
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
@@ -718,8 +697,7 @@ async def _handle_ai_conversation(
     except Exception:
         context_str = ""
 
-    # Session priming: if student was away, add wake context
-    # Skip for temporary students — they don't have proper sessions yet
+    # Session priming: skip for temp students
     if not student_id.startswith("temp_"):
         is_waking = await _detect_session_gap(student_id)
         if is_waking:
@@ -875,15 +853,40 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # Update last message timestamp for session gap detection
+    # Update last message timestamp
     try:
         timestamp_key = f"last_message_time:{student_id}"
         redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
 
+    # ============================================================
+    # PROGRESSIVE OBSERVATION EXTRACTION (every 5 user messages)
+    # ============================================================
+    if not student_id.startswith("temp_"):
+        user_msg_count = sum(1 for m in conversation_history[-20:] if m.get("role") == "user")
+        if user_msg_count > 0 and user_msg_count % PROGRESSIVE_EXTRACTION_INTERVAL == 0:
+            asyncio.ensure_future(
+                _run_progressive_extraction(student_id, conversation_history[-30:])
+            )
+
     # JAMB check — trigger after AI response so it doesn't block
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
+
+
+async def _run_progressive_extraction(student_id: str, conversation_history: List[Dict]) -> None:
+    """Run lightweight observation extraction mid-conversation. Background task."""
+    try:
+        from brain.observations import extract_and_save_observations
+        saved = await extract_and_save_observations(
+            student_id=student_id,
+            conversation_history=conversation_history,
+            is_session_end=False,
+        )
+        if saved > 0:
+            logger.debug(f"Progressive extraction saved {saved} observation(s) for {student_id}")
+    except Exception as e:
+        logger.error(f"Progressive extraction failed for {student_id}: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -900,7 +903,6 @@ async def _detect_session_gap(student_id: str) -> bool:
             last_time = datetime.fromisoformat(raw_str)
             gap_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
             return gap_minutes >= SESSION_GAP_MINUTES
-        # No previous timestamp — this is the first message ever or after expiry
         return True
     except Exception:
         return False
@@ -935,7 +937,6 @@ async def _build_wake_context(student_id: str) -> str:
             sessions_count = memory.get("sessions_completed", 0)
             if sessions_count > 0:
                 parts.append(f"INFORMED GREETING: Acknowledge this is session #{sessions_count + 1}.")
-            
             mastered = memory.get("topics_mastered", [])
             if mastered:
                 parts.append(f"CELEBRATE: Student has mastered {len(mastered)} topics. Mention if natural.")
@@ -972,7 +973,6 @@ def _extract_session_signals(
     if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
         signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
 
-    # Also extract signals from response — if student engaged with example-based teaching
     if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
         if any(word in resp_lower for word in ["example", "imagine", "think of"]):
             signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.1
@@ -1010,11 +1010,10 @@ def _extract_session_signals(
     elif pidgin_count >= 1:
         signals["communication"]["pidgin_mixed"] = 0.2
 
-    # Self-reported understanding — only as weak signal, not mastery
     if any(phrase in msg_lower for phrase in ["i understand", "i get it", "makes sense"]):
         if recent_subject and recent_subject != "unknown":
             signals["competence"][f"{recent_subject}:discussed"] = {
-                "score": 0.6,  # Weak positive signal, not 1.0 mastery
+                "score": 0.6,
                 "level": "in_progress"
             }
 
@@ -1120,7 +1119,6 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
                 os.path.dirname(os.path.abspath(__file__)),
                 "..", "jamb_questions_clean.json"
             )
-            # Use asyncio.to_thread for non-blocking file read
             questions = await asyncio.to_thread(_read_questions_file, json_path, subject)
         except Exception:
             pass
@@ -1134,7 +1132,7 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
 
 
 def _read_questions_file(json_path: str, subject: str) -> List[Dict[str, Any]]:
-    """Read and filter questions from local JSON file (sync, called via to_thread)."""
+    """Read and filter questions from local JSON file."""
     with open(json_path, "r", encoding="utf-8") as f:
         return [q for q in json.load(f) if q.get("subject") == subject]
 
@@ -1303,12 +1301,7 @@ def _infer_track(subjects: List[str]) -> str:
 
 
 def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
-    """
-    Pick a subject using Redis-backed rotation tracking.
-    
-    Survives server restarts and works across multiple workers.
-    24-hour TTL means fresh rotation each day.
-    """
+    """Pick a subject using Redis-backed rotation tracking."""
     if not subjects:
         return "mathematics"
     
@@ -1331,7 +1324,6 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
     chosen = random.choice(available)
     recent.append(chosen)
     
-    # Keep only last 5 for rotation tracking
     if len(recent) > 5:
         recent = recent[-5:]
     
