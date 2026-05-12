@@ -719,14 +719,16 @@ async def _handle_ai_conversation(
         context_str = ""
 
     # Session priming: if student was away, add wake context
-    is_waking = await _detect_session_gap(student_id)
-    if is_waking:
-        try:
-            wake_context = await _build_wake_context(student_id)
-            if wake_context:
-                context_str = wake_context + "\n\n" + context_str if context_str else wake_context
-        except Exception as e:
-            logger.error(f"Wake context build failed: {e}")
+    # Skip for temporary students — they don't have proper sessions yet
+    if not student_id.startswith("temp_"):
+        is_waking = await _detect_session_gap(student_id)
+        if is_waking:
+            try:
+                wake_context = await _build_wake_context(student_id)
+                if wake_context:
+                    context_str = wake_context + "\n\n" + context_str if context_str else wake_context
+            except Exception as e:
+                logger.error(f"Wake context build failed: {e}")
 
     _pending_model_update = None
 
@@ -870,6 +872,13 @@ async def _handle_ai_conversation(
             await set_state(student_id, "chatting", reason="First message")
         elif current_state == "paused":
             await set_state(student_id, "chatting", reason="Returned from pause")
+    except Exception:
+        pass
+
+    # Update last message timestamp for session gap detection
+    try:
+        timestamp_key = f"last_message_time:{student_id}"
+        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
 
