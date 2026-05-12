@@ -1,6 +1,6 @@
 """
 WaxPrep v2 — Telegram Message Handler
-Processes incoming Telegram messages. Routes anonymous users to onboarding,
+Processes incoming Telegram messages. Routes new students to a warm AI conversation,
 registered users to the AI brain. Handles quiz commands and answers.
 Supports callback queries (inline keyboard) AND text-based answers.
 
@@ -26,8 +26,6 @@ or "I prefer short definitions" are routed to AI, not intercepted by deferral.
 
 Now with Topic Coherence Check — when a student hops between topics without
 completing any, Wax gently guides them toward focus.
-
-Now with Hybrid Onboarding — AI-driven conversation with code-guided structure.
 
 Now with Session Priming — on first message after a gap, Wax already knows
 what happened last session before generating a response.
@@ -225,25 +223,51 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
-    # Unregistered user — onboarding flow
+    # Unregistered user — direct AI conversation, no onboarding pipeline
     try:
-        from telegram.onboarding_hybrid import handle_onboarding_hybrid
-        from database.onboarding_state import get_onboarding_state
-        state = await get_onboarding_state("telegram", str(chat_id))
-        await handle_onboarding_hybrid(chat_id, state, text)
-    except ImportError:
-        # Hybrid not available — fall back to scripted onboarding
+        from ai.brain import think
+        from database.conversations import save_message
+        
+        # Create a minimal student dict so the AI has something to work with
+        new_student = {
+            "id": f"temp_{chat_id}",
+            "name": "Student",
+            "class_level": "unknown",
+            "subjects": [],
+            "state": "Nigeria",
+            "language_preference": "english",
+            "current_streak": 0,
+        }
+        
+        # Save the user's message
         try:
-            from telegram.onboarding import handle_onboarding
-            from database.onboarding_state import get_onboarding_state
-            state = await get_onboarding_state("telegram", str(chat_id))
-            await handle_onboarding(chat_id, state, text)
-        except Exception as e:
-            logger.error(f"Onboarding handler failed: {e}", exc_info=True)
-            await send_telegram_message(chat_id, "Something went wrong. Type *HI* to start again.")
+            await save_message(new_student["id"], "user", text)
+        except Exception:
+            pass
+        
+        # Generate AI response
+        response = await think(
+            message=text,
+            student=new_student,
+            conversation_history=[],
+            recent_subject=None,
+            context_str="This is a new student. You don't know anything about them yet. "
+                         "Introduce yourself warmly. Ask their name naturally when it feels right. "
+                         "Don't interrogate. Just welcome them and let the conversation flow.",
+            is_practice=False,
+        )
+        
+        # Save Wax's response
+        try:
+            await save_message(new_student["id"], "assistant", response)
+        except Exception:
+            pass
+        
+        await send_telegram_message(chat_id, response)
+        
     except Exception as e:
-        logger.error(f"Onboarding handler failed: {e}", exc_info=True)
-        await send_telegram_message(chat_id, "Something went wrong. Type *HI* to start again.")
+        logger.error(f"New student handler failed: {e}", exc_info=True)
+        await send_telegram_message(chat_id, "Hey. I'm Wax. What's your name?")
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
