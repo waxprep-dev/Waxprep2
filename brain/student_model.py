@@ -17,6 +17,7 @@ Architecture:
     - Confidence scoring on every inference
     - Gradual adaptation over 5 sessions (single session ≠ flip)
     - Domain decay: preferred domains fade after ~15-20 sessions without reinforcement
+    - Temp students: Redis only, no Supabase (avoids UUID errors)
 
 Privacy:
     - Encrypt sensitive fields before storage
@@ -557,12 +558,31 @@ async def load_student_model(student_id: str) -> StudentModel:
     """
     Load a student's model from Redis, fallback to Supabase.
     
+    Temporary students (temp_*) are Redis-only — no Supabase query
+    to avoid UUID format errors.
+    
     On Supabase fallback, repopulates Redis cache.
     Type conversion is handled by StudentModel.from_dict.
     """
     model = StudentModel(student_id)
     
-    # Try Redis first
+    # ── Temporary students: Redis only ──
+    if student_id.startswith("temp_"):
+        try:
+            from database.client import redis_client
+            raw = redis_client.hgetall(model.redis_key)
+            if raw:
+                data = {}
+                for key, value in raw.items():
+                    key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                    value_str = value.decode("utf-8") if isinstance(value, bytes) else value
+                    data[key_str] = value_str
+                model = StudentModel.from_dict(student_id, data)
+        except Exception as e:
+            logger.debug(f"Redis model load for temp student {student_id}: {e}")
+        return model
+    
+    # ── Registered students: Redis first, Supabase fallback ──
     try:
         from database.client import redis_client
         
@@ -617,7 +637,7 @@ async def load_student_model(student_id: str) -> StudentModel:
 async def save_student_model(model: StudentModel) -> bool:
     """
     Save a student's model to Redis atomically.
-    Syncs to Supabase asynchronously.
+    Syncs to Supabase asynchronously (registered students only).
     
     Note: total_sessions is managed by brain/state.py's _on_session_ended
     via save_student_memory. total_interactions counts every model save.
@@ -648,8 +668,9 @@ async def save_student_model(model: StudentModel) -> bool:
         redis_client.hset(model.redis_key, mapping=flat_data)
         redis_client.expire(model.redis_key, 2592000)  # 30 days
         
-        # Sync to Supabase asynchronously (non-blocking)
-        asyncio.ensure_future(_sync_to_supabase(model, data))
+        # Sync to Supabase asynchronously (registered students only)
+        if not model.student_id.startswith("temp_"):
+            asyncio.ensure_future(_sync_to_supabase(model, data))
         
         return True
         
@@ -664,7 +685,11 @@ async def _sync_to_supabase(model: StudentModel, data: Dict[str, Any]) -> None:
     
     Builds upsert dict dynamically from ALL serialized fields.
     No field is left behind — full durable backup.
+    Skipped for temporary students.
     """
+    if model.student_id.startswith("temp_"):
+        return
+    
     try:
         from database.client import supabase
         
@@ -688,7 +713,9 @@ async def delete_student_model(student_id: str) -> None:
         from database.client import redis_client, supabase
         
         redis_client.delete(f"student_model:{student_id}")
-        supabase.table("student_models").delete().eq("student_id", student_id).execute()
+        
+        if not student_id.startswith("temp_"):
+            supabase.table("student_models").delete().eq("student_id", student_id).execute()
         
     except Exception as e:
         logger.error(f"Model deletion failed for {student_id}: {e}")
