@@ -792,6 +792,9 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
+    # Natural pause before account offer so goodbye and offer are separate messages
+    await asyncio.sleep(1.5)
+
     session_completed = False
     session_score = None
     session_struggles = []
