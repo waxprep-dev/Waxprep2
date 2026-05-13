@@ -206,38 +206,57 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
-    # Unregistered user — direct AI conversation
+    # ═══════════════════════════════════════════════
+    # UNREGISTERED USER — temp student flow
+    # ═══════════════════════════════════════════════
+    temp_id = f"temp_{chat_id}"
+    new_student = {
+        "id": temp_id,
+        "name": "Student",
+        "class_level": "unknown",
+        "subjects": [],
+        "state": "Nigeria",
+        "language_preference": "english",
+        "current_streak": 0,
+    }
+
+    # Load any existing history and recover name so the AI doesn't forget
+    try:
+        from database.conversations import get_history
+        conversation_history = await get_history(temp_id)
+    except Exception:
+        conversation_history = []
+
+    if conversation_history:
+        recovered_name = _extract_name_from_history(conversation_history)
+        if recovered_name:
+            new_student["name"] = recovered_name
+            logger.info(f"Recovered name for {temp_id}: {recovered_name}")
+
+        # Route through the full handler stack so temp students get session-end
+        # detection, deferrals, quizzes, account offers, and observation extraction
+        await _handle_registered_student(chat_id, new_student, text)
+        return
+
+    # ── First conversation for this temp student ──
     try:
         from ai.brain import think
-        from database.conversations import save_message, get_history
-        
-        new_student = {
-            "id": f"temp_{chat_id}",
-            "name": "Student",
-            "class_level": "unknown",
-            "subjects": [],
-            "state": "Nigeria",
-            "language_preference": "english",
-            "current_streak": 0,
-        }
-        
+        from database.conversations import save_message
+
+        await save_message(temp_id, "user", text)
+
         try:
-            await save_message(new_student["id"], "user", text)
-        except Exception:
-            pass
-        
-        try:
-            conversation_history = await get_history(new_student["id"])
+            conversation_history = await get_history(temp_id)
         except Exception:
             conversation_history = []
-        
+
         context_str = (
             "This is a new student. You don't know anything about them yet. "
             "Introduce yourself warmly. Ask their name naturally when it feels right. "
             "Don't interrogate. Just welcome them and let the conversation flow. "
             "NEVER say 'Welcome back' to a new student. This is their first conversation."
         )
-        
+
         response = await think(
             message=text,
             student=new_student,
@@ -246,40 +265,38 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             context_str=context_str,
             is_practice=False,
         )
-        
+
         response = _sanitize_wake_phrases(response, is_temp=True)
-        
+
         try:
-            await save_message(new_student["id"], "assistant", response)
+            await save_message(temp_id, "assistant", response)
         except Exception:
             pass
-        
+
         await send_telegram_message(chat_id, response)
 
-        # Name extraction for early conversation continuity
+        # Name extraction — current message first, then scan recent history
+        extracted_name = _extract_name_from_message(text)
+        if not extracted_name and conversation_history:
+            extracted_name = _extract_name_from_history(conversation_history[-5:])
+
+        if extracted_name:
+            new_student["name"] = extracted_name
+            try:
+                await save_message(
+                    temp_id,
+                    "system",
+                    f"Student introduced themselves as {extracted_name}."
+                )
+            except Exception:
+                pass
+
         try:
-            history = await get_history(new_student["id"])
-            if len(history) <= 5 and new_student.get("name") == "Student":
-                extracted_name = _extract_name_from_message(text)
-                if extracted_name:
-                    new_student["name"] = extracted_name
-                    try:
-                        await save_message(
-                            new_student["id"],
-                            "system",
-                            f"Student introduced themselves as {extracted_name}."
-                        )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        
-        try:
-            timestamp_key = f"last_message_time:{new_student['id']}"
+            timestamp_key = f"last_message_time:{temp_id}"
             redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
-        
+
     except Exception as e:
         logger.error(f"New student handler failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "Hey. I'm Wax. What's your name?")
@@ -297,6 +314,23 @@ def _extract_name_from_message(text: str) -> Optional[str]:
             name = match.group(1)
             if name.lower() not in ("not", "good", "fine", "ok", "okay", "sure", "new", "student", "done", "tired"):
                 return name[0].upper() + name[1:].lower() if len(name) > 1 else name.upper()
+    return None
+
+
+def _extract_name_from_history(conversation_history: List[Dict]) -> Optional[str]:
+    """Scan conversation history for student name introductions."""
+    if not conversation_history:
+        return None
+    for msg in reversed(conversation_history):
+        if msg.get("role") == "user":
+            name = _extract_name_from_message(msg.get("content", ""))
+            if name:
+                return name
+        elif msg.get("role") == "system":
+            content = msg.get("content", "")
+            match = re.search(r"Student introduced themselves as ([A-Za-z]+)", content)
+            if match:
+                return match.group(1)
     return None
 
 
