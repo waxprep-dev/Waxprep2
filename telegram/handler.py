@@ -419,6 +419,8 @@ async def _maybe_offer_account_creation(
     current_state: str
 ) -> bool:
     """Check if we should offer account creation and send the offer if so."""
+    logger.info(f"ACCOUNT OFFER CHECK: student_id={student_id}, temp={student_id.startswith('temp_')}")
+    
     if not should_offer_account_creation(conversation_history, student_id, current_state):
         return False
     
