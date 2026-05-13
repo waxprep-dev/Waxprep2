@@ -7,6 +7,7 @@ Architecture:
     - StudentState enum: All possible states with documentation
     - ALLOWED_TRANSITIONS: Guards against impossible state jumps
     - Dual persistence: Supabase FIRST (durable source of truth), Redis SECOND (fast cache)
+    - Temp students: Redis only, default state "chatting", no Supabase calls
     - Session ENDED trigger: Automatically saves memory for the Teacher Voice
     
 Memory Flow:
@@ -130,6 +131,7 @@ async def get_state(student_id: str) -> Optional[str]:
     Get the current state for a student.
     
     Returns None if the student doesn't exist.
+    Temp students use Redis only — no Supabase queries.
     Checks Redis first (fast), falls back to database (durable).
     On database fallback, repopulates Redis cache.
     
@@ -144,6 +146,21 @@ async def get_state(student_id: str) -> Optional[str]:
         logger.warning("get_state called with empty student_id")
         return None
     
+    # ── Temp students: Redis only, default "chatting" ──
+    if student_id.startswith("temp_"):
+        key = f"student_state:{student_id}"
+        try:
+            cached = redis_client.get(key)
+            if cached:
+                decoded = cached.decode("utf-8") if isinstance(cached, bytes) else cached
+                if decoded:
+                    return decoded
+        except Exception as e:
+            logger.error(f"Redis get_state error for temp student {student_id}: {e}")
+        # Default state for temp students — they're always chatting
+        return StudentState.CHATTING.value
+    
+    # ── Registered students: Redis first, Supabase fallback ──
     # Check Redis first
     key = f"student_state:{student_id}"
     try:
@@ -204,11 +221,11 @@ async def set_state(
     Change a student's state. Returns True if successful.
     
     Validates the transition before saving.
-    Persists to Supabase FIRST (durable source of truth), then Redis (fast cache).
-    If database write fails, Redis is NOT updated — prevents stale cache.
+    Temp students: Redis only, no Supabase calls, no session memory.
+    Registered students: Persists to Supabase FIRST, then Redis.
     
     If transitioning to ENDED, automatically saves a session summary
-    and updates student memory for the Teacher Memory Voice.
+    and updates student memory for the Teacher Memory Voice (registered only).
     
     Args:
         student_id: Student's database ID
@@ -221,6 +238,49 @@ async def set_state(
     Returns:
         True if state was changed successfully, False otherwise
     """
+    is_temp = student_id.startswith("temp_")
+    
+    # ── Temp students: Redis only ──
+    if is_temp:
+        current_state_str = await get_state(student_id)
+        if not current_state_str:
+            current_state_str = StudentState.CHATTING.value
+        
+        try:
+            current_state = StudentState(current_state_str)
+        except ValueError:
+            current_state = StudentState.CHATTING
+        
+        try:
+            target_state = StudentState(new_state)
+        except ValueError:
+            logger.error(f"set_state failed: invalid target state '{new_state}'")
+            return False
+        
+        # Validate transition
+        allowed = ALLOWED_TRANSITIONS.get(current_state, [])
+        if target_state not in allowed:
+            logger.warning(
+                f"State transition blocked: {current_state.value} → {new_state} "
+                f"(allowed from {current_state.value}: {[s.value for s in allowed]})"
+            )
+            return False
+        
+        # Save to Redis only
+        key = f"student_state:{student_id}"
+        try:
+            redis_client.setex(key, STATE_CACHE_TTL, new_state)
+            logger.info(
+                f"STATE TRANSITION (temp): {student_id}: "
+                f"{current_state.value} → {new_state}"
+                + (f" | Reason: {reason}" if reason else "")
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Redis set_state error for temp {student_id}: {e}")
+            return False
+    
+    # ── Registered students: full persistence ──
     current_state_str = await get_state(student_id)
     if not current_state_str:
         logger.warning(f"set_state failed: student {student_id} not found")
@@ -332,6 +392,10 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
         context: Session details with optional keys:
             subject, topic, completed, score, struggled_with
     """
+    # Skip for temp students — no persistent memory to save
+    if student_id.startswith("temp_"):
+        return
+    
     # Import here to avoid circular dependency at module level
     from database.conversations import (
         save_session_summary,
