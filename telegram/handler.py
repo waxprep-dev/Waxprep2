@@ -148,7 +148,7 @@ JAMB_CHECK_COOLDOWN = 604800
 DEFERRAL_TTL = 3600
 SESSION_GAP_MINUTES = 60
 PROGRESSIVE_EXTRACTION_INTERVAL = 5
-ACCOUNT_OFFER_COOLDOWN = 86400  # 24 hours between account offers
+ACCOUNT_OFFER_COOLDOWN = 86400
 
 # Understanding confirmation phrases (English + Pidgin)
 UNDERSTANDING_PHRASES = [
@@ -183,15 +183,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         return
 
     logger.debug(f"Processing message from chat_id={chat_id}: {text[:100]}...")
-
-    try:
-        from admin.commands import handle_admin_command
-        if await handle_admin_command(chat_id, text):
-            return
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.error(f"Admin handler error: {e}", exc_info=True)
 
     try:
         from brain.safety import run_safety_checks
@@ -337,20 +328,10 @@ def should_offer_account_creation(
     1. Trust demonstrated: 5+ substantive exchanges
     2. Value received: At least one confirmed learning moment
     3. Loss is visible: Continuity concern OR natural session end
-    
-    Args:
-        conversation_history: Recent messages
-        student_id: Student's ID (must be temp_)
-        current_state: Current session state
-        
-    Returns:
-        True if account creation should be offered
     """
-    # Only for temp students
     if not student_id.startswith("temp_"):
         return False
     
-    # Don't offer if we recently offered and they declined
     cooldown_key = f"account_offer_cooldown:{student_id}"
     try:
         if redis_client.exists(cooldown_key):
@@ -358,7 +339,6 @@ def should_offer_account_creation(
     except Exception:
         pass
     
-    # Don't offer if account creation is already in progress
     in_progress_key = f"account_creation_in_progress:{student_id}"
     try:
         if redis_client.exists(in_progress_key):
@@ -369,7 +349,6 @@ def should_offer_account_creation(
     if not conversation_history:
         return False
     
-    # Condition 1: Trust demonstrated (5+ substantive exchanges)
     user_messages = [m for m in conversation_history if m.get("role") == "user"]
     substantive = [
         m for m in user_messages
@@ -382,7 +361,6 @@ def should_offer_account_creation(
     if len(substantive) < 5:
         return False
     
-    # Condition 2: At least one confirmed learning moment
     assistant_messages = [m for m in conversation_history if m.get("role") == "assistant"]
     had_breakthrough = False
     
@@ -394,14 +372,12 @@ def should_offer_account_creation(
             "you understand", "now you're getting", "perfect",
             "that's it",
         ]):
-            # Find the next user message after this assistant message
             try:
                 msg_index = conversation_history.index(msg)
                 if msg_index >= 0 and msg_index + 1 < len(conversation_history):
                     next_msg = conversation_history[msg_index + 1]
                     if next_msg.get("role") == "user":
                         next_content = next_msg.get("content", "").lower()
-                        # Positive response: not dismissive, not confused
                         if not any(word in next_content for word in [
                             "whatever", "i guess", "if you say", "i don't",
                             "not really", "not sure", "maybe",
@@ -414,7 +390,6 @@ def should_offer_account_creation(
     if not had_breakthrough:
         return False
     
-    # Condition 3: Continuity concern OR natural session end
     last_few_user = [m.get("content", "").lower() for m in user_messages[-5:]]
     has_continuity_concern = any(
         phrase in msg
@@ -443,24 +418,17 @@ async def _maybe_offer_account_creation(
     conversation_history: List[Dict],
     current_state: str
 ) -> bool:
-    """
-    Check if we should offer account creation and send the offer if so.
-    
-    Returns True if the offer was sent (caller should not continue processing).
-    """
+    """Check if we should offer account creation and send the offer if so."""
     if not should_offer_account_creation(conversation_history, student_id, current_state):
         return False
     
-    # Set cooldown so we don't offer again for 24 hours
     try:
         redis_client.setex(f"account_offer_cooldown:{student_id}", ACCOUNT_OFFER_COOLDOWN, "1")
     except Exception:
         pass
     
-    # Get the student's name if we have it
     name = student.get("name", "Student").split()[0]
     if name == "Student":
-        # Try to extract name from conversation
         for msg in reversed(conversation_history):
             if msg.get("role") == "user":
                 extracted = _extract_name_from_message(msg.get("content", ""))
@@ -468,12 +436,10 @@ async def _maybe_offer_account_creation(
                     name = extracted
                     break
     
-    # Determine the right offer wording based on context
     if current_state == "ended" or any(
         phrase in conversation_history[-1].get("content", "").lower()
         for phrase in SESSION_END_KEYWORDS
     ):
-        # Session is ending — urgency about losing progress
         offer_message = (
             f"{name}, real quick before you go. All this we worked on today? "
             f"Right now, it's going to disappear when you close this chat. "
@@ -481,7 +447,6 @@ async def _maybe_offer_account_creation(
             f"Want me to fix that? Takes about 10 seconds. Just say *yes*."
         )
     else:
-        # Continuity concern — student asked about remembering
         offer_message = (
             f"{name}, you asked if I'll remember everything. Right now, I won't. "
             f"No account means I start fresh every time.\n\n"
@@ -490,7 +455,6 @@ async def _maybe_offer_account_creation(
     
     await send_telegram_message(chat_id, offer_message)
     
-    # Set flag that we're waiting for account creation response
     try:
         redis_client.setex(f"account_creation_offered:{student_id}", 3600, "1")
     except Exception:
@@ -509,14 +473,9 @@ async def _handle_account_creation_response(
     text: str,
     conversation_history: List[Dict]
 ) -> bool:
-    """
-    Handle a student's response to the account creation offer.
-    
-    Returns True if the message was handled (should not continue to AI).
-    """
+    """Handle a student's response to the account creation offer."""
     msg_lower = text.strip().lower()
     
-    # Positive responses — student wants to create account
     positive_responses = [
         "yes", "yeah", "yep", "sure", "ok", "okay", "yes o",
         "create", "create it", "let's do it", "do it", "go ahead",
@@ -524,13 +483,11 @@ async def _handle_account_creation_response(
     ]
     
     if any(msg_lower == resp or msg_lower.startswith(resp) for resp in positive_responses):
-        # Set in-progress flag
         try:
             redis_client.setex(f"account_creation_in_progress:{student_id}", 600, "1")
         except Exception:
             pass
         
-        # Clear the offered flag
         try:
             redis_client.delete(f"account_creation_offered:{student_id}")
         except Exception:
@@ -542,20 +499,17 @@ async def _handle_account_creation_response(
         )
         return True
     
-    # Negative responses — student declines
     negative_responses = [
         "no", "nope", "nah", "not now", "later", "maybe later",
         "no thanks", "i'm good", "no o",
     ]
     
     if any(msg_lower == resp or msg_lower.startswith(resp) for resp in negative_responses):
-        # Clear the offered flag
         try:
             redis_client.delete(f"account_creation_offered:{student_id}")
         except Exception:
             pass
         
-        # Cooldown already set by _maybe_offer_account_creation
         await send_telegram_message(
             chat_id,
             "No wahala. We'll keep studying — I'm not going anywhere. "
@@ -572,11 +526,7 @@ async def _handle_pin_submission(
     text: str,
     conversation_history: List[Dict]
 ) -> bool:
-    """
-    Handle a student's PIN submission during account creation.
-    
-    Returns True if the message was handled (should not continue to AI).
-    """
+    """Handle a student's PIN submission during account creation."""
     in_progress_key = f"account_creation_in_progress:{student_id}"
     try:
         if not redis_client.exists(in_progress_key):
@@ -586,7 +536,6 @@ async def _handle_pin_submission(
     
     pin = text.strip()
     
-    # Validate PIN length
     if len(pin) < 4:
         await send_telegram_message(
             chat_id,
@@ -594,10 +543,8 @@ async def _handle_pin_submission(
         )
         return True
     
-    # Hash the PIN
     pin_hash = hashlib.sha256(pin.encode()).hexdigest()
     
-    # Try to create the account
     try:
         from database.students import create_student
         
@@ -614,7 +561,6 @@ async def _handle_pin_submission(
         )
         
         if not student:
-            # Account creation failed — see failure flow
             await _handle_account_creation_failure(chat_id, student_id)
             return True
         
@@ -623,19 +569,16 @@ async def _handle_pin_submission(
             await _handle_account_creation_failure(chat_id, student_id)
             return True
         
-        # Migrate all temp data to permanent ID
         from database.migrations import migrate_temp_to_permanent
         migration_results = await migrate_temp_to_permanent(student_id, permanent_id)
         
         if not migration_results.get("conversation_history"):
-            # Critical migration failed
             logger.critical(
                 f"Conversation migration failed for {student_id} → {permanent_id}"
             )
             await _handle_account_creation_failure(chat_id, student_id)
             return True
         
-        # Clear all account creation flags
         try:
             redis_client.delete(f"account_creation_in_progress:{student_id}")
             redis_client.delete(f"account_creation_offered:{student_id}")
@@ -643,10 +586,8 @@ async def _handle_pin_submission(
         except Exception:
             pass
         
-        # Get the student's name
         name = student.get("name", "Student").split()[0]
         
-        # Send activation message
         await send_telegram_message(
             chat_id,
             f"You're in, {name}. 🎉\n\n"
@@ -656,7 +597,6 @@ async def _handle_pin_submission(
             f"What do you want to study first?"
         )
         
-        # Send recovery code as separate urgent message after a brief pause
         await asyncio.sleep(1.5)
         await send_telegram_message(
             chat_id,
@@ -666,7 +606,6 @@ async def _handle_pin_submission(
             f"I can't recover it for you."
         )
         
-        # Follow-up confirmation
         await asyncio.sleep(1.5)
         await send_telegram_message(
             chat_id,
@@ -698,13 +637,10 @@ async def _handle_account_creation_failure(chat_id: int, student_id: str) -> Non
     
     logger.error(f"Account creation failed for {student_id}")
     
-    # Clear in-progress flag but keep everything else
     try:
         redis_client.delete(f"account_creation_in_progress:{student_id}")
     except Exception:
         pass
-    
-    # The temp data is untouched — nothing has been deleted
     
     await send_telegram_message(
         chat_id,
@@ -720,15 +656,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
     msg_lower = text.strip().lower()
-
-    try:
-        from database.onboarding_state import get_onboarding_state
-        jamb_state = await get_onboarding_state("telegram", f"jamb_{student_id}")
-        if jamb_state and jamb_state.get("awaiting_response_for") == "jamb_ambition":
-            await _handle_jamb_ambition_response(chat_id, student, text, student_id, jamb_state)
-            return
-    except Exception:
-        pass
 
     if any(phrase in msg_lower for phrase in SESSION_END_KEYWORDS):
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
@@ -1011,120 +938,6 @@ async def _handle_deferral(
 
 
 # ═══════════════════════════════════════════════
-# JAMB AMBITION HANDLER
-# ═══════════════════════════════════════════════
-
-async def _maybe_trigger_jamb_check(
-    student_id: str, student: dict, chat_id: int, current_state: str
-) -> bool:
-    """Check if it's the right moment for JAMB conversation."""
-    from database.conversations import get_student_memory
-
-    if current_state not in ("idle", "chatting", "ended", "paused"):
-        return False
-    cooldown_key = f"jamb_check_cooldown:{student_id}"
-    try:
-        if redis_client.get(cooldown_key):
-            return False
-    except Exception:
-        pass
-    try:
-        memory = await get_student_memory(student_id)
-    except Exception:
-        memory = {}
-    if memory.get("sessions_completed", 0) < 1:
-        return False
-    if student.get("university_ambition"):
-        return False
-
-    name = student.get("name", "Student").split()[0]
-    await send_telegram_message(chat_id,
-        f"{name}, real quick before you go. I've been teaching you and you're "
-        f"making progress. But I want to make sure I'm preparing you for the "
-        f"right thing.\n\nHave you thought about what you want to study in "
-        f"university? No pressure if you haven't figured it out yet."
-    )
-    try:
-        redis_client.setex(cooldown_key, JAMB_CHECK_COOLDOWN, "1")
-    except Exception:
-        pass
-    return True
-
-
-async def _handle_jamb_ambition_response(
-    chat_id: int, student: dict, text: str, student_id: str, jamb_state: dict
-) -> None:
-    """Process student's response to university ambition question."""
-    from content.jamb_checker import check_jamb_readiness, resolve_course
-    from database.onboarding_state import clear_onboarding_state
-
-    name = student.get("name", "Student").split()[0]
-    msg = text.strip()[:100]
-
-    try:
-        await clear_onboarding_state("telegram", f"jamb_{student_id}")
-    except Exception:
-        pass
-
-    dont_know = ["not sure", "i don't know", "i dont know", "idk", "haven't thought", "not yet", "undecided"]
-    if msg.lower() in dont_know or any(phrase in msg.lower() for phrase in dont_know):
-        await send_telegram_message(chat_id,
-            f"No wahala. Plenty of SS3 students are still figuring it out. "
-            f"As we keep studying, I'll pay attention to what you're naturally "
-            f"good at. After a few more sessions, I might have suggestions."
-        )
-        return
-
-    course_key = resolve_course(msg)
-    if not course_key:
-        await send_telegram_message(chat_id,
-            f"I don't have data for '{msg}' yet. Can you try a different course name?"
-        )
-        return
-
-    result = check_jamb_readiness(
-        student_subjects=student.get("subjects", []),
-        desired_course=msg
-    )
-
-    if result.get("error"):
-        await send_telegram_message(chat_id, result.get("message", "I couldn't check that course."))
-        return
-
-    if result["ready"]:
-        have_list = "\n".join([f"✅ {s}" for s in result["have"]])
-        await send_telegram_message(chat_id,
-            f"{name}! Your subjects line up perfectly for {result['course_display']}.\n\n"
-            f"{have_list}\n\nYou're on track."
-        )
-        return
-
-    missing_list = []
-    for m in result["missing"]:
-        if isinstance(m, dict):
-            alt_text = " or ".join(m.get("alternatives", []))
-            missing_list.append(f"❌ {m['preferred']}" + (f" (or {alt_text})" if alt_text else ""))
-        else:
-            missing_list.append(f"❌ {m}")
-
-    alternatives = result.get("alternatives", [])
-    message = (
-        f"{name}, I need to be straight with you. {result['course_display']} "
-        f"requires specific subjects — and you're missing some.\n\n"
-        f"What you have:\n" + "\n".join([f"✅ {s}" for s in result["have"]]) + "\n\n"
-        f"What's missing:\n" + "\n".join(missing_list)
-    )
-    message += (
-        f"\n\nAnd {name}? This doesn't mean you're not smart enough. "
-        f"It means nobody told you earlier — and that's not your fault."
-    )
-    if alternatives:
-        alt_names = [a["display"] for a in alternatives[:3]]
-        message += f"\n\nBut you're already on track for {', '.join(alt_names)} with your current subjects."
-    await send_telegram_message(chat_id, message)
-
-
-# ═══════════════════════════════════════════════
 # AI CONVERSATION HANDLER
 # ═══════════════════════════════════════════════
 
@@ -1139,14 +952,6 @@ async def _handle_ai_conversation(
     from ai.brain import think
     from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
-
-    try:
-        from brain.detectors import detect_confusion, reset_confusion_count, detect_topic_hopping
-        _confusion_detector_available = True
-        _coherence_detector_available = True
-    except ImportError:
-        _confusion_detector_available = False
-        _coherence_detector_available = False
 
     try:
         from brain.student_model import load_student_model, save_student_model
@@ -1196,7 +1001,6 @@ async def _handle_ai_conversation(
     # Account creation flow for temp students
     if is_temp:
         try:
-            # Check if student is responding to an account creation offer
             if redis_client.exists(f"account_creation_offered:{student_id}"):
                 handled = await _handle_account_creation_response(
                     chat_id=chat_id,
@@ -1206,7 +1010,6 @@ async def _handle_ai_conversation(
                 )
                 if handled:
                     return
-            # Check if student is submitting a PIN
             elif redis_client.exists(f"account_creation_in_progress:{student_id}"):
                 handled = await _handle_pin_submission(
                     chat_id=chat_id,
@@ -1249,50 +1052,6 @@ async def _handle_ai_conversation(
         except Exception as e:
             logger.error(f"Student model load failed: {e}", exc_info=True)
 
-    _pending_confusion_reset = False
-
-    if _confusion_detector_available:
-        try:
-            same_topic_wrong = 0
-            for msg in conversation_history[-6:]:
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "")
-                    if any(phrase in content.lower() for phrase in [
-                        "not quite", "not exactly", "close", "almost",
-                        "that's not", "incorrect", "not right",
-                    ]):
-                        same_topic_wrong += 1
-
-            confusion = await detect_confusion(
-                message=text, student_id=student_id,
-                topic=current_topic, same_topic_wrong_count=same_topic_wrong,
-            )
-
-            if confusion["confused"]:
-                context_str = confusion["context_instruction"] + "\n\n" + context_str if context_str else confusion["context_instruction"]
-                _pending_confusion_reset = True
-        except Exception as e:
-            logger.error(f"Confusion detection failed: {e}", exc_info=True)
-
-    if _coherence_detector_available:
-        try:
-            coherence = detect_topic_hopping(
-                conversation_history=conversation_history,
-                current_message=text,
-                student_id=student_id,
-            )
-
-            if coherence["hopping"]:
-                context_str = coherence["context_instruction"] + "\n\n" + context_str if context_str else coherence["context_instruction"]
-                logger.info(
-                    f"Topic hopping detected for {student_id}: "
-                    f"{coherence['count']} topics, stage={coherence['stage']}"
-                )
-                if _pending_model_update is not None:
-                    _pending_model_update.recent_topics = coherence["topics"]
-        except Exception as e:
-            logger.error(f"Topic coherence check failed: {e}", exc_info=True)
-
     is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
 
     try:
@@ -1326,13 +1085,6 @@ async def _handle_ai_conversation(
         await send_telegram_message(chat_id, response)
     except Exception:
         pass
-
-    if _pending_confusion_reset and _confusion_detector_available:
-        try:
-            if any(phrase in response.lower() for phrase in UNDERSTANDING_PHRASES):
-                await reset_confusion_count(student_id, current_topic)
-        except Exception:
-            pass
 
     try:
         from database.conversations import save_session_summary
@@ -1403,8 +1155,6 @@ async def _handle_ai_conversation(
             )
         except Exception as e:
             logger.error(f"Account offer check failed: {e}")
-
-    await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
 
 
 # ═══════════════════════════════════════════════
