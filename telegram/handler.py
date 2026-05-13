@@ -1070,8 +1070,6 @@ def _strip_wake_context(context_str: str) -> str:
             continue
         if "MEMORY CONTEXT" in upper or "LAST SESSION" in upper:
             skip_block = False
-        in upper or "LAST SESSION" in upper:
-            skip_block = False
         if not skip_block:
             filtered.append(line)
     
