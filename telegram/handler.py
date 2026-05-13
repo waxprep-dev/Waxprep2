@@ -428,24 +428,19 @@ async def _handle_session_end(
     # SESSION-END OBSERVATION EXTRACTION (full pass with SMART model)
     # ============================================================
     if not student_id.startswith("temp_"):
-        asyncio.ensure_future(
-            _run_session_end_extraction(student_id, conversation_history)
-        )
-
-
-async def _run_session_end_extraction(student_id: str, conversation_history: List[Dict]) -> None:
-    """Run full observation extraction at session end. Background task."""
-    try:
-        from brain.observations import extract_and_save_observations
-        saved = await extract_and_save_observations(
-            student_id=student_id,
-            conversation_history=conversation_history,
-            is_session_end=True,
-        )
-        if saved > 0:
-            logger.info(f"Session-end extraction saved {saved} observation(s) for {student_id}")
-    except Exception as e:
-        logger.error(f"Session-end extraction failed for {student_id}: {e}")
+        try:
+            from brain.observations import extract_and_save_observations
+            asyncio.ensure_future(
+                extract_and_save_observations(
+                    student_id=student_id,
+                    conversation_history=conversation_history,
+                    is_session_end=True,
+                )
+            )
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.error(f"Session-end extraction trigger failed: {e}")
 
 
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
@@ -708,6 +703,26 @@ async def _handle_ai_conversation(
             except Exception as e:
                 logger.error(f"Wake context build failed: {e}")
 
+    # ============================================================
+    # PROGRESSIVE OBSERVATION EXTRACTION (every 5 user messages)
+    # ============================================================
+    if not student_id.startswith("temp_"):
+        try:
+            from brain.observations import extract_and_save_observations
+            user_msg_count = sum(1 for m in conversation_history[-20:] if m.get("role") == "user")
+            if user_msg_count > 0 and user_msg_count % PROGRESSIVE_EXTRACTION_INTERVAL == 0:
+                asyncio.ensure_future(
+                    extract_and_save_observations(
+                        student_id=student_id,
+                        conversation_history=conversation_history[-30:],
+                        is_session_end=False,
+                    )
+                )
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.error(f"Progressive extraction trigger failed: {e}")
+
     _pending_model_update = None
 
     if _student_model_available:
@@ -860,33 +875,8 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # ============================================================
-    # PROGRESSIVE OBSERVATION EXTRACTION (every 5 user messages)
-    # ============================================================
-    if not student_id.startswith("temp_"):
-        user_msg_count = sum(1 for m in conversation_history[-20:] if m.get("role") == "user")
-        if user_msg_count > 0 and user_msg_count % PROGRESSIVE_EXTRACTION_INTERVAL == 0:
-            asyncio.ensure_future(
-                _run_progressive_extraction(student_id, conversation_history[-30:])
-            )
-
     # JAMB check — trigger after AI response so it doesn't block
     await _maybe_trigger_jamb_check(student_id, student, chat_id, current_state)
-
-
-async def _run_progressive_extraction(student_id: str, conversation_history: List[Dict]) -> None:
-    """Run lightweight observation extraction mid-conversation. Background task."""
-    try:
-        from brain.observations import extract_and_save_observations
-        saved = await extract_and_save_observations(
-            student_id=student_id,
-            conversation_history=conversation_history,
-            is_session_end=False,
-        )
-        if saved > 0:
-            logger.debug(f"Progressive extraction saved {saved} observation(s) for {student_id}")
-    except Exception as e:
-        logger.error(f"Progressive extraction failed for {student_id}: {e}")
 
 
 # ═══════════════════════════════════════════════
