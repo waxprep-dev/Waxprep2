@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -242,10 +243,54 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             pass
         
         await send_telegram_message(chat_id, response)
+
+        # ============================================================
+        # NAME EXTRACTION FIX — prevents amnesia in early messages
+        # ============================================================
+        try:
+            history = await get_history(new_student["id"])
+            if len(history) <= 5 and new_student.get("name") == "Student":
+                extracted_name = _extract_name_from_message(text)
+                if extracted_name:
+                    new_student["name"] = extracted_name
+                    # Persist the name into the conversation metadata so the
+                    # brain sees it on the next turn even though the student
+                    # is not yet registered in the database.
+                    try:
+                        await save_message(
+                            new_student["id"],
+                            "system",
+                            f"Student introduced themselves as {extracted_name}."
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         
     except Exception as e:
         logger.error(f"New student handler failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "Hey. I'm Wax. What's your name?")
+
+
+def _extract_name_from_message(text: str) -> Optional[str]:
+    """Try to extract a name from a student's message."""
+    msg = text.strip()
+
+    # Pattern: "my name is X", "call me X", "I'm X", "am X", "you can call me X"
+    patterns = [
+        r"(?:my\s+name\s+is|call\s+me|i'?m|am|you\s+can\s+call\s+me)\s+([A-Za-z]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, msg, re.IGNORECASE)
+        if match:
+            name = match.group(1)
+            # Filter out common non-name responses
+            if name.lower() not in ("not", "good", "fine", "ok", "okay", "sure", "new", "student", "done", "tired"):
+                # Capitalize first letter
+                return name[0].upper() + name[1:].lower() if len(name) > 1 else name.upper()
+
+    return None
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
