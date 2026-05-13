@@ -161,6 +161,12 @@ UNDERSTANDING_PHRASES = [
     "you dey try", "na im be that",
 ]
 
+# Wake phrases that should NEVER appear for temp students
+WAKE_PHRASES = [
+    "welcome back", "you're back", "you returned", "welcome back,",
+    "STUDENT IS RETURNING", "INFORMED GREETING", "CELEBRATE:",
+]
+
 
 async def process_telegram_message(chat_id: int, text: str) -> None:
     """Entry point for all Telegram text messages."""
@@ -226,16 +232,27 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         except Exception:
             conversation_history = []
         
+        # ============================================================
+        # CRITICAL: Never allow wake context for temporary students
+        # ============================================================
+        context_str = (
+            "This is a new student. You don't know anything about them yet. "
+            "Introduce yourself warmly. Ask their name naturally when it feels right. "
+            "Don't interrogate. Just welcome them and let the conversation flow. "
+            "NEVER say 'Welcome back' to a new student. This is their first conversation."
+        )
+        
         response = await think(
             message=text,
             student=new_student,
             conversation_history=conversation_history,
             recent_subject=None,
-            context_str="This is a new student. You don't know anything about them yet. "
-                         "Introduce yourself warmly. Ask their name naturally when it feels right. "
-                         "Don't interrogate. Just welcome them and let the conversation flow.",
+            context_str=context_str,
             is_practice=False,
         )
+        
+        # Sanitize: strip any accidental wake phrases from AI output
+        response = _sanitize_wake_phrases(response, is_temp=True)
         
         try:
             await save_message(new_student["id"], "assistant", response)
@@ -267,6 +284,14 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         except Exception:
             pass
         
+        # Update timestamp for temp students too — prevents gap detection
+        # if they transition to registered or if any code checks the gap
+        try:
+            timestamp_key = f"last_message_time:{new_student['id']}"
+            redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+        
     except Exception as e:
         logger.error(f"New student handler failed: {e}", exc_info=True)
         await send_telegram_message(chat_id, "Hey. I'm Wax. What's your name?")
@@ -291,6 +316,22 @@ def _extract_name_from_message(text: str) -> Optional[str]:
                 return name[0].upper() + name[1:].lower() if len(name) > 1 else name.upper()
 
     return None
+
+
+def _sanitize_wake_phrases(text: str, is_temp: bool = False) -> str:
+    """Remove wake/session-reset phrases from AI responses."""
+    if not is_temp:
+        return text
+    
+    sanitized = text
+    for phrase in WAKE_PHRASES:
+        # Case-insensitive replacement
+        sanitized = re.sub(re.escape(phrase), "", sanitized, flags=re.IGNORECASE)
+    
+    # Clean up double spaces or empty lines left behind
+    sanitized = re.sub(r'\s+', ' ', sanitized)
+    sanitized = re    sanitized = re.sub(r'\n\s*\n', '\n\n', sanitized)
+    return sanitized.strip()
 
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
@@ -352,6 +393,14 @@ async def _handle_stepping_away(chat_id: int, student_id: str, name: str) -> Non
         redis_client.setex(key, 3600, "1")
     except Exception:
         pass
+    
+    # Update timestamp so next message doesn't look like a gap
+    try:
+        timestamp_key = f"last_message_time:{student_id}"
+        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
+    except Exception:
+        pass
+        
     await send_telegram_message(chat_id, "No wahala. I dey here.")
 
 
@@ -565,6 +614,13 @@ async def _handle_deferral(
     except Exception:
         pass
 
+    # Update timestamp so next message doesn't look like a gap
+    try:
+        timestamp_key = f"last_message_time:{student_id}"
+        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
+    except Exception:
+        pass
+
     await send_telegram_message(chat_id, response)
 
 
@@ -737,8 +793,9 @@ async def _handle_ai_conversation(
     except Exception:
         context_str = ""
 
-    # Session priming: skip for temp students
-    if not student_id.startswith("temp_"):
+    # Session priming: skip for temp students (belt-and-suspenders guard)
+    is_temp = student_id.startswith("temp_")
+    if not is_temp:
         is_waking = await _detect_session_gap(student_id)
         if is_waking:
             try:
@@ -747,11 +804,14 @@ async def _handle_ai_conversation(
                     context_str = wake_context + "\n\n" + context_str if context_str else wake_context
             except Exception as e:
                 logger.error(f"Wake context build failed: {e}")
+    else:
+        # Explicitly strip any wake content that might leak through
+        context_str = _strip_wake_context(context_str)
 
     # ============================================================
     # PROGRESSIVE OBSERVATION EXTRACTION (every 5 user messages)
     # ============================================================
-    if not student_id.startswith("temp_"):
+    if not is_temp:
         try:
             from brain.observations import extract_and_save_observations
             user_msg_count = sum(1 for m in conversation_history[-20:] if m.get("role") == "user")
@@ -836,6 +896,10 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
+
+    # Sanitize wake phrases for temp students (belt-and-suspenders)
+    if is_temp:
+        response = _sanitize_wake_phrases(response, is_temp=True)
 
     try:
         from brain.safety import check_output_safety
@@ -930,6 +994,10 @@ async def _handle_ai_conversation(
 
 async def _detect_session_gap(student_id: str) -> bool:
     """Check if enough time has passed to treat this as a new session wake."""
+    # NEVER treat temp students as having a session gap
+    if student_id.startswith("temp_"):
+        return False
+        
     key = f"last_message_time:{student_id}"
     try:
         raw = redis_client.get(key)
@@ -938,13 +1006,18 @@ async def _detect_session_gap(student_id: str) -> bool:
             last_time = datetime.fromisoformat(raw_str)
             gap_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
             return gap_minutes >= SESSION_GAP_MINUTES
-        return True
+        # No timestamp = first message, not a wake
+        return False
     except Exception:
         return False
 
 
 async def _build_wake_context(student_id: str) -> str:
     """Build context for when a student returns after a gap."""
+    # Safety guard: never build wake context for temp students
+    if student_id.startswith("temp_"):
+        return ""
+        
     from database.conversations import get_session_summary, get_student_memory
 
     parts = []
@@ -979,6 +1052,30 @@ async def _build_wake_context(student_id: str) -> str:
         pass
 
     return "WAKE CONTEXT:\n" + "\n".join(f"- {p}" for p in parts) if parts else ""
+
+
+def _strip_wake_context(context_str: str) -> str:
+    """Remove any wake context markers from a context string."""
+    if not context_str:
+        return ""
+    
+    lines = context_str.split("\n")
+    filtered = []
+    skip_block = False
+    
+    for line in lines:
+        upper = line.upper()
+        if "WAKE CONTEXT" in upper or "STUDENT IS RETURNING" in upper:
+            skip_block = True
+            continue
+        if "MEMORY CONTEXT" in upper or "LAST SESSION" in upper:
+            skip_block = False
+        in upper or "LAST SESSION" in upper:
+            skip_block = False
+        if not skip_block:
+            filtered.append(line)
+    
+    return "\n".join(filtered).strip()
 
 
 # ═══════════════════════════════════════════════
@@ -1082,6 +1179,10 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
 
 async def _build_memory_context(student_id: str) -> str:
     """Build memory context for the AI prompt."""
+    # Safety: no memory context for temp students (they have no persistent memory)
+    if student_id.startswith("temp_"):
+        return ""
+        
     from database.conversations import get_session_summary, get_student_memory
 
     context_parts: List[str] = []
@@ -1283,6 +1384,13 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     response += "\n\nType *quiz* for another question!"
     try:
         await send_telegram_message(chat_id, response)
+    except Exception:
+        pass
+
+    # Update timestamp after quiz interaction
+    try:
+        timestamp_key = f"last_message_time:{student_id}"
+        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
 
