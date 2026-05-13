@@ -330,7 +330,7 @@ def _sanitize_wake_phrases(text: str, is_temp: bool = False) -> str:
     
     # Clean up double spaces or empty lines left behind
     sanitized = re.sub(r'\s+', ' ', sanitized)
-    sanitized = re    sanitized = re.sub(r'\n\s*\n', '\n\n', sanitized)
+    sanitized = re.sub(r'\n\s*\n', '\n\n', sanitized)
     return sanitized.strip()
 
 
