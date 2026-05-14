@@ -211,13 +211,26 @@ async def extract_observations_from_conversation(
         
         result_text = response.choices[0].message.content.strip()
         
-        # Parse JSON response
-        # Handle cases where the AI wraps JSON in markdown
-        if result_text.startswith("```"):
-            result_text = result_text.split("```")[1]
-            if result_text.startswith("json"):
-                result_text = result_text[4:]
+        # Parse JSON response — robust extraction
+        # Strip markdown code blocks if present
         result_text = result_text.strip()
+        if "```" in result_text:
+            parts = result_text.split("```")
+            if len(parts) >= 2:
+                result_text = parts[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+                result_text = result_text.strip()
+        
+        # Try to extract JSON array if there's extra text before/after
+        start_idx = result_text.find("[")
+        end_idx = result_text.rfind("]")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            result_text = result_text[start_idx:end_idx + 1]
+        
+        # If empty brackets, return empty list
+        if result_text.strip() in ("[]", ""):
+            return []
         
         observations = json.loads(result_text)
         
