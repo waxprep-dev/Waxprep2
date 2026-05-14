@@ -500,10 +500,22 @@ def enforce_nigerian_example(response: str, state: str = None) -> str:
     return response
 
 
+def enforce_paragraphs(response: str, max_paragraphs: int = 3) -> str:
+    """
+    If response exceeds max paragraphs, keep only the first N.
+    Splits on double newlines for true paragraph breaks.
+    """
+    paragraphs = [p.strip() for p in response.split('\n\n') if p.strip()]
+    if len(paragraphs) > max_paragraphs:
+        return '\n\n'.join(paragraphs[:max_paragraphs])
+    return response
+
+
 def enforce_rules(response: str, state: str = None) -> str:
     """Run all post-processing enforcement rules."""
     response = clean_banned_phrases(response)
     response = enforce_one_question(response)
+    response = enforce_paragraphs(response, max_paragraphs=3)
     response = enforce_length(response, max_chars=400)
     response = enforce_nigerian_example(response, state=state)
     return response
@@ -692,7 +704,7 @@ async def think(
                 client.chat.completions.create,
                 model=settings.GROQ_SMART_MODEL,
                 messages=messages,
-                max_tokens=500,
+                max_tokens=400,
                 temperature=0.75,
             )
             
