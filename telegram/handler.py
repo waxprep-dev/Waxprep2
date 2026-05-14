@@ -477,16 +477,17 @@ async def _maybe_offer_account_creation(
         for phrase in SESSION_END_KEYWORDS
     ):
         offer_message = (
-            f"{name}, real quick before you go. All this we worked on today? "
-            f"Right now, it's going to disappear when you close this chat. "
-            f"No account, no memory. I don't want that.\n\n"
-            f"Want me to fix that? Takes about 10 seconds. Just say *yes*."
+            f"{name}, before you go — everything we did today? "
+            f"Once you close this chat, it's gone. I won't remember any of it tomorrow.\n\n"
+            f"If you want me to remember you next time, just say *yes*. "
+            f"Takes 10 seconds."
         )
     else:
         offer_message = (
-            f"{name}, you asked if I'll remember everything. Right now, I won't. "
-            f"No account means I start fresh every time.\n\n"
-            f"Want to change that? Takes about 10 seconds. Just say *yes*."
+            f"{name}, you asked if I'll remember everything. "
+            f"Truth is, without an account, I start fresh every time you open this chat.\n\n"
+            f"If you want me to remember you — your name, your subjects, your progress — "
+            f"just say *yes*. Takes 10 seconds."
         )
     
     await send_telegram_message(chat_id, offer_message)
