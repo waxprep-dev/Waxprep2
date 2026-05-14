@@ -79,7 +79,7 @@ def get_wax_system_prompt(student: dict, recent_subject: str = None,
     state = student.get('state', '')
     if not state:
         state = 'Nigeria'
-    language = student.get('language_preference', 'english')
+    language = student.get('language_preference', 'english').lower()
     subjects_str = ', '.join(subjects) if subjects else ''
     
     safe_context = sanitize_context(context_str)
