@@ -587,7 +587,7 @@ async def _handle_pin_submission(
         
         student = await create_student(
             platform="telegram",
-            platform_user_id=chat_id.split("_")[-1] if "_" in str(chat_id) else str(chat_id),
+            platform_user_id=str(chat_id).split("_")[-1] if "_" in str(chat_id) else str(chat_id),
             name=_extract_name_from_history(conversation_history) or "Student",
             pin=pin,
             class_level="unknown",
