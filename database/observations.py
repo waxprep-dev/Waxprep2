@@ -597,18 +597,21 @@ async def export_observations(student_id: str) -> Dict:
 async def _sync_observation_to_supabase(observation: Dict) -> None:
     """Sync a single observation to Supabase. Non-blocking background task."""
     try:
-        supabase.table("observations").upsert({
-            "student_id": observation["student_id"],
-            "normalized_key": observation["normalized_key"],
-            "category": observation["category"],
-            "fact": observation["fact"],
-            "confidence": observation["confidence"],
-            "source": observation["source"],
-            "first_seen": observation["first_seen"],
-            "last_updated": observation["last_updated"],
-            "times_observed": observation["times_observed"],
-            "active": observation["active"],
-            "deleted": observation.get("deleted", False),
-        }).execute()
+        supabase.table("observations").upsert(
+            {
+                "student_id": observation["student_id"],
+                "normalized_key": observation["normalized_key"],
+                "category": observation["category"],
+                "fact": observation["fact"],
+                "confidence": observation["confidence"],
+                "source": observation["source"],
+                "first_seen": observation["first_seen"],
+                "last_updated": observation["last_updated"],
+                "times_observed": observation["times_observed"],
+                "active": observation["active"],
+                "deleted": observation.get("deleted", False),
+            },
+            on_conflict="student_id,normalized_key"
+        ).execute()
     except Exception as e:
         logger.error(f"Supabase sync failed for observation: {e}")
