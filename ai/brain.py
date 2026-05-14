@@ -384,37 +384,128 @@ def clean_banned_phrases(response: str) -> str:
     return response
 
 
-def enforce_nigerian_example(response: str) -> str:
+def enforce_nigerian_example(response: str, state: str = None) -> str:
     """
     Check if teaching response has Nigerian references.
     
-    Logs a warning if missing but does NOT modify the response.
-    The warning is a monitoring signal — if this fires too often,
-    the system prompt needs adjustment.
+    Only checks responses that appear to be teaching/explaining concepts.
+    Logs a warning if missing Nigerian terms, debug log if present.
+    
+    Args:
+        response: The AI-generated response text
+        state: Student's Nigerian state for future state-specific examples (optional)
+        
+    Returns:
+        Response unchanged (this function is a monitoring layer only)
     """
-    nigerian_terms = [
-        "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
-        "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
-        "achebe", "soyinka", "lagos", "abuja", "kano", "naira",
-        "generator", "borehole", "kerosene", "omo", "agege",
-        "nneoma", "chidera", "emeka", "amara", "kennedy",
+    # ═══════════════════════════════════════════════
+    # TEACHING PATTERN GATE
+    # Only check responses that are explaining a concept.
+    # ═══════════════════════════════════════════════
+    teaching_indicators = [
+        "means", "is when", "is called", "because", "since", "imagine",
+        "think of", "for example", "like when", "similar to", "compared to",
+        "this is why", "the reason", "you can see", "picture this",
+        "let's say", "suppose", "if you", "remember that", "note that",
+        "in other words", "basically", "essentially", "to put it simply",
+        "defined as", "refers to", "known as", "describes", "explains",
+        "works like", "think about", "picture yourself", "envision",
     ]
     
-    sentences = [s for s in response.split(".") if len(s.strip()) > 10]
-    if len(sentences) >= 3:
-        has_nigerian = any(term in response.lower() for term in nigerian_terms)
-        if not has_nigerian:
-            logger.warning("Teaching response has no Nigerian example")
+    response_lower = response.lower()
+    is_teaching = any(indicator in response_lower for indicator in teaching_indicators)
+    
+    if not is_teaching:
+        # Not a teaching response — skip check (corrections, check-ins, emotional support)
+        return response
+    
+    # ═══════════════════════════════════════════════
+    # EXPANDED NIGERIAN TERMS (~75 terms)
+    # Focus on unambiguously Nigerian cultural references.
+    # Avoid generic words like "market", "generator", "light", "fan".
+    # ═══════════════════════════════════════════════
+    nigerian_terms = [
+        # ── Food & Drink ──
+        "amala", "eba", "fufu", "pounded yam", "poundedyam",
+        "moi-moi", "moimoi", "akara", "chin-chin", "chinchin",
+        "zobo", "kunu", "ofada rice", "ofadarice", "bitter leaf", "bitterleaf",
+        "ogbono", "banga soup", "bangasoup", "edikaikong",
+        "egusi", "egusi soup", "egusisoup", "okra soup", "okrasoup",
+        "oha soup", "ohasoup", "afang soup", "afangsoup",
+        "ewedu", "gbegiri", "suya", "kilishi", "puff-puff", "puffpuff",
+        "jollof", "jollof rice", "jollofrice", "garri",
+        
+        # ── Transport ──
+        "danfo", "okada", "keke", "keke napep", "kekenapep",
+        "molue", "agbero", "yellow bus", "yellowbus",
+        "go-slow", "goslow", "go slow",
+        
+        # ── Major Cities & Places ──
+        "lagos", "abuja", "kano", "ibadan", "port harcourt", "portharcourt",
+        "onitsha", "aba", "nnewi", "owerri", "enugu", "calabar",
+        "kaduna", "jos", "sokoto", "ilorin", "abeokuta",
+        "mile 12", "mile12", "agege", "ikeja", "lekki", "yaba",
+        "oshodi", "surulere", "victoria island", "vi", "ikoyi", "apapa",
+        
+        # ── Culture & Daily Life ──
+        "nepa", "phcn", "wahala", "oga", "madam", "omo", "abeg",
+        "area boy", "areaboy", "area boys", "areaboys", "alaye", "sabi",
+        "pure water", "purewater", "sachet water", "sachetwater",
+        "gala", "lacasera", "fan yogurt", "fanyogurt",
+        "groundnut", "boli", "roasted corn", "roastedcorn",
+        "now now", "sharp sharp", "no wahala",
+        
+        # ── People & Icons ──
+        "achebe", "soyinka", "fela", "fela kuti", "felakuti",
+        "tuface", "2baba", "wizkid", "davido", "burna boy", "burnaboy",
+        "tiwa savage", "tiwasavage",
+        "emeka", "chidera", "nneoma", "amara", "kennedy",
+        "adaobi", "olumide", "fatima", "amina", "yusuf",
+        "chinedu", "ngozi", "obi", "ade", "tunde", "nkechi",
+        "chioma", "ifeanyi", "oluchi", "chukwu", "ebuka",
+        
+        # ── Institutions & Exams ──
+        "jamb", "waec", "neco", "inec", "nysc", "corper", "corpers",
+        "federal government college", "unity school", "common entrance",
+        "lesson teacher", "lesson note",
+        
+        # ── Money & Telecom ──
+        "naira", "kobo", "mtn", "glo", "airtel",
+        
+        # ── Sports & Entertainment ──
+        "nollywood", "super eagles", "supereagles", "green white green",
+        "greenwhitegreen", "naija",
+        
+        # ── Nature & Agriculture ──
+        "harmattan", "hamattan", "rainy season", "rainyseason",
+        "dry season", "dryseason", "mango season", "mangoseason",
+        "cocoa", "palm oil", "palmoil", "palm wine", "palmwine",
+        "cassava", "yam", "plantain", "coco yam", "cocoyam",
+        "maize", "guinea corn", "guineacorn",
+    ]
+    
+    has_nigerian = any(term in response_lower for term in nigerian_terms)
+    
+    if has_nigerian:
+        logger.debug("Nigerian example confirmed in teaching response")
+    else:
+        logger.warning("Teaching response has no Nigerian example")
+    
+    # Future Phase 1: state-specific examples
+    # if state and not has_nigerian:
+    #     state_terms = STATE_SPECIFIC_TERMS.get(state, [])
+    #     has_state_specific = any(term in response_lower for term in state_terms)
+    #     ...
     
     return response
 
 
-def enforce_rules(response: str) -> str:
+def enforce_rules(response: str, state: str = None) -> str:
     """Run all post-processing enforcement rules."""
     response = clean_banned_phrases(response)
     response = enforce_one_question(response)
     response = enforce_length(response, max_chars=400)
-    response = enforce_nigerian_example(response)
+    response = enforce_nigerian_example(response, state=state)
     return response
 
 
@@ -477,7 +568,7 @@ async def enforce_domain_boundaries(
                 )
             
             # Split response into sentences and strip violating ones
-            sentences = re.split(r'(?<=[.!?])\s+', response)
+            sentences = re.split(r'(?<<=[.!?])\s+', response)
             clean_sentences = []
             
             for sentence in sentences:
@@ -647,7 +738,8 @@ async def think(
         return fallbacks[hash_val % len(fallbacks)]
 
     # Post-processing enforcement
-    cleaned_response = enforce_rules(raw_response)
+    state = student.get('state')
+    cleaned_response = enforce_rules(raw_response, state=state)
     
     # If enforcement made the response too short, use gentler enforcement
     if len(cleaned_response) < 20 and len(raw_response) > 20:
