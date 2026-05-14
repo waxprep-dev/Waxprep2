@@ -68,7 +68,7 @@ _SERIALIZED_FIELDS = [
     "last_formality_score", "abrupt_shift_detected",
     "competence_map", "last_quiz_scores",
     "recent_topics",
-    "total_sessions", "total_interactions", "last_updated", "model_version",
+    "total_sessions", "total_interactions", "model_version",
 ]
 
 _JSON_FIELDS = {
@@ -494,12 +494,15 @@ class StudentModel:
                     value = value.lower() == "true"
                 elif not isinstance(value, bool):
                     value = bool(value)
-                    
-            elif field == "last_updated":
-                if value and not isinstance(value, str):
-                    value = str(value)
             
             setattr(model, field, value)
+        
+        # Handle last_updated separately (excluded from _SERIALIZED_FIELDS for Supabase compatibility)
+        if "last_updated" in data:
+            value = data["last_updated"]
+            if value and not isinstance(value, str):
+                value = str(value)
+            model.last_updated = value
         
         return model
     
@@ -663,6 +666,9 @@ async def save_student_model(model: StudentModel) -> bool:
                 flat_data[key] = str(value)
             else:
                 flat_data[key] = str(value)
+        
+        # Preserve last_updated in Redis (excluded from _SERIALIZED_FIELDS for Supabase compatibility)
+        flat_data["last_updated"] = model.last_updated or ""
         
         # Atomic multi-field update — no partial reads possible
         redis_client.hset(model.redis_key, mapping=flat_data)
