@@ -71,7 +71,8 @@ def get_wax_system_prompt(student: dict, recent_subject: str = None,
     Returns:
         Complete system prompt string
     """
-    name = student.get('name', 'Student').split()[0]
+    raw_name = student.get('name', 'Student').strip()
+    name = raw_name.split()[0] if raw_name else 'Student'
     class_level = student.get('class_level', 'SS3')
     target_exam = student.get('target_exam', 'JAMB')
     subjects = student.get('subjects', [])
