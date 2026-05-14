@@ -623,34 +623,27 @@ async def _handle_pin_submission(
         except Exception:
             pass
         
-        name = student.get("name", "Student").split()[0]
-        
+        name = student.get("name", "Student")
+        raw_name = name.strip()
+        display_name = raw_name.split()[0] if raw_name else "Student"
+
         await send_telegram_message(
             chat_id,
-            f"You're in, {name}. 🎉\n\n"
+            f"You're in, {display_name}. 🎉\n\n"
             f"Your WAX ID: *{student['wax_id']}*\n\n"
-            f"Now. Everything we talked about today? It's all here. "
-            f"I remember all of it.\n\n"
-            f"What do you want to study first?"
+            f"Everything we talked about today? It's all here. I remember all of it."
         )
-        
-        await asyncio.sleep(1.5)
+
+        await asyncio.sleep(2)
+
         await send_telegram_message(
             chat_id,
-            f"🔐 One thing. Write this down. On paper. Not in this chat.\n\n"
+            f"One more thing — write this down. On paper. Not in this chat.\n\n"
             f"Recovery Code: *{student['recovery_code']}*\n\n"
-            f"If you forget your code, this is the only way back. "
-            f"I can't recover it for you."
+            f"If you lose it, I can't get it back for you. That's the only copy."
         )
-        
-        await asyncio.sleep(1.5)
-        await send_telegram_message(
-            chat_id,
-            "Got it written down? Good.\n\n"
-            "Now. What do you want to study first?"
-        )
-        
-        logger.info(f"Account created: {student_id} → {permanent_id} ({name})")
+
+        logger.info(f"Account created: {student_id} → {permanent_id} ({display_name})")
         return True
         
     except Exception as e:
