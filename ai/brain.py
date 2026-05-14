@@ -327,6 +327,34 @@ DOMAIN_KEYWORDS = {
 # POST-PROCESSING ENFORCEMENT LAYER
 # ═══════════════════════════════════════════════
 
+def _is_teaching_response(response: str) -> bool:
+    """
+    Check if a response is actually teaching/explaining something.
+    
+    We look for words and phrases that show the AI is explaining a concept
+    — not just greeting, encouraging, or correcting a small mistake.
+    
+    Teaching indicators include: "means", "is when", "because", 
+    "think of it", "imagine", "for example", "let me explain",
+    "here's how", "the key", "remember", "so if", "here's why"
+    
+    Args:
+        response: The AI's response text
+        
+    Returns:
+        True if this response is teaching something (needs Nigerian check)
+        False if it's just a greeting, emotional check-in, or quick correction
+    """
+    teaching_patterns = [
+        "means", "is when", "because", "think of it",
+        "imagine", "for example", "let me explain",
+        "here's how", "the key", "remember", "so if",
+        "here's why",
+    ]
+    resp_lower = response.lower()
+    return any(pattern in resp_lower for pattern in teaching_patterns)
+
+
 def enforce_one_question(response: str) -> str:
     """If the AI asks more than one question, keep only the first one."""
     questions = response.split("?")
@@ -388,23 +416,62 @@ def enforce_nigerian_example(response: str) -> str:
     """
     Check if teaching response has Nigerian references.
     
+    ONLY checks responses that are actually teaching something
+    (uses _is_teaching_response gate). Greetings, emotional check-ins,
+    and quick corrections are skipped entirely — no false positives.
+    
+    No 3-sentence minimum — even short teaching responses get checked.
+    
     Logs a warning if missing but does NOT modify the response.
     The warning is a monitoring signal — if this fires too often,
     the system prompt needs adjustment.
     """
+    # ── STEP 1: Skip if this isn't a teaching response ──
+    if not _is_teaching_response(response):
+        return response
+    
+    # ── STEP 2: Expanded Nigerian terms list ──
     nigerian_terms = [
-        "danfo", "suya", "puff-puff", "egusi", "okada", "keke",
-        "nepa", "wahala", "jollof", "garri", "mile 12", "inec",
-        "achebe", "soyinka", "lagos", "abuja", "kano", "naira",
-        "generator", "borehole", "kerosene", "omo", "agege",
-        "nneoma", "chidera", "emeka", "amara", "kennedy",
+        # Markets & Commerce
+        "mile 12", "mile12", "balogun", "alaba", "onitsha", "ariaria",
+        "wuse market", "bodija", "sabo", "market", "naira", "kobo",
+        "trader", "haggle", "bargain", "trading",
+        # Food & Cooking
+        "jollof", "suya", "puff-puff", "puff puff", "egusi", "garri",
+        "akara", "moin moin", "moin-moin", "okpa", "amala", "eba",
+        "fufu", "pounded yam", "agege bread", "agege", "bole",
+        "kuli-kuli", "kulikuli", "zobo", "chin chin", "meat pie",
+        # Transport
+        "danfo", "okada", "keke", "napep", "keke napep", "molue",
+        "bRT", "abuja taxi", "water taxi",
+        # People & Places
+        "lagos", "abuja", "kano", "enugu", "portharcourt", "ibadan",
+        "owerri", "jos", "calabar", "benin city", "ilorin", "kaduna",
+        "achebe", "soyinka", "adichie", "fela",
+        # School Life
+        "waec", "waec question", "jamb question", "neco", "pry",
+        "jss", "ss1", "ss2", "ss3", "class captain", "prefect",
+        "assembly", "lesson teacher",
+        # Infrastructure
+        "nepa", "phed", "eedc", "generator", "gen", "borehole",
+        "inverter", "prepaid meter", "tap water",
+        # Culture & Media
+        "nollywood", "inec", "pvc", "polling unit", "local government",
+        "nysc", "corper", "serving", "aso ebi", "owambe",
+        # Slang & Expressions
+        "wahala", "abeg", "na wa", "chop", "vex", "gist",
+        "no wahala", "you get?", "shey", "na", "dey", "oya",
     ]
     
+    # ── STEP 3: Count sentences for the log message ──
     sentences = [s for s in response.split(".") if len(s.strip()) > 10]
-    if len(sentences) >= 3:
-        has_nigerian = any(term in response.lower() for term in nigerian_terms)
-        if not has_nigerian:
-            logger.warning("Teaching response has no Nigerian example")
+    
+    # ── STEP 4: Check for Nigerian terms (no sentence minimum) ──
+    has_nigerian = any(term in response.lower() for term in nigerian_terms)
+    if not has_nigerian:
+        logger.warning(
+            f"Teaching response ({len(sentences)} sentences) has no Nigerian example"
+        )
     
     return response
 
@@ -637,7 +704,7 @@ async def think(
 
     if not raw_response:
         _log_ai_failure(student_id, "ALL_KEYS_EXHAUSTED", "All API keys exhausted or failed")
-        # Stable fallback selection using MD5 instead of unstable hash()
+        # Stable fallback selection using MD5 hash (consistent across restarts)
         fallbacks = [
             f"I had a small technical hiccup, {name}. Can you ask me again?",
             f"Ah, my brain lagged for a second, {name}. Try me one more time?",
