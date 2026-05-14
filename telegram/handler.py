@@ -659,16 +659,6 @@ async def _handle_pin_submission(
         return True
 
 
-def _extract_name_from_history(conversation_history: List[Dict]) -> Optional[str]:
-    """Try to extract a name from conversation history."""
-    for msg in conversation_history:
-        if msg.get("role") == "user":
-            name = _extract_name_from_message(msg.get("content", ""))
-            if name:
-                return name
-    return None
-
-
 async def _handle_account_creation_failure(chat_id: int, student_id: str) -> None:
     """Handle a failed account creation gracefully."""
     
