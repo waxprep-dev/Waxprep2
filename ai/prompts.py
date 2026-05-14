@@ -147,5 +147,4 @@ def get_lite_prompt(student: dict, recent_subject: str = None,
     Short prompt wrapper. Since the main prompt is already simplified,
     this returns the same prompt. Kept for backward compatibility.
     """
-    safe_context = sanitize_context(context_str)
-    return get_wax_system_prompt(student, recent_subject, safe_context, lite=True)
+    return get_wax_system_prompt(student, recent_subject, context_str, lite=True)
