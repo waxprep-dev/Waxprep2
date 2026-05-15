@@ -31,7 +31,7 @@ QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
 
 # ── Deferral keywords ─────────────────────────
 DEFERRAL_KEYWORDS = [
-    "anything", "you pick", "any one", "whatever",
+    "you pick", "any one", "whatever",
     "up to you", "choose for me", "i don't know what to study",
     "i don't care", "surprise me",
     "let's change topic", "change topic", "let's move on",
@@ -688,7 +688,16 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
     is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
     
-    if is_deferral and not is_preference:
+    # Don't hijack the conversation if the student named a subject explicitly
+    named_subject = False
+    if is_deferral:
+        for subject_key in SUBJECT_MAP:
+            display = subject_key.replace("_", " ")
+            if re.search(r'\b' + re.escape(display) + r'\b', msg_lower):
+                named_subject = True
+                break
+    
+    if is_deferral and not is_preference and not named_subject:
         await _handle_deferral(chat_id, student, student_id, name, msg_lower)
         return
 
@@ -940,7 +949,11 @@ async def _handle_deferral(
     elif deferral_count == 2:
         response = f"{name}, I already picked. {trouble_subject}. You told me it's confusing and you're not alone in that. But running from it won't help. Let's face it together. Ready?"
     else:
-        response = f"{trouble_subject}, {name}. No more running. We're doing this. Tell me what you already know about {trouble_subject}."
+        response = (
+            f"{name}, {trouble_subject} — yeah, the one everyone fears. "
+            f"But you already know more than you think. "
+            f"Tell me one thing about it that makes sense to you. We'll build from there."
+        )
 
     try:
         redis_client.setex(deferral_key, DEFERRAL_TTL, str(deferral_count))
