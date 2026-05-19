@@ -1,17 +1,19 @@
 """
 WaxPrep v2 — State Machine
-Defines every state a student can be in and what transitions are allowed.
-This is the brain's foundation — everything else depends on this.
+Defines every state a student can be in.
+Lightweight context tracker. Triggers backend events (session save, memory update).
+The AI prompt and student memory are the real foundation.
 
 Architecture:
     - StudentState enum: All possible states with documentation
-    - ALLOWED_TRANSITIONS: Guards against impossible state jumps
+    - No transition whitelist — any valid state is accepted
     - Dual persistence: Supabase FIRST (durable source of truth), Redis SECOND (fast cache)
-    - Temp students: Redis only, default state "chatting", no Supabase calls
-    - Session ENDED trigger: Automatically saves memory for the Teacher Voice
+    - Temp students: Redis only, default state "active", no Supabase calls
+    - Session ENDED trigger: Automatically saves memory for the Teacher Voice, then flips to IDLE
     
 Memory Flow:
     set_state("ended") → _on_session_ended() → save_session_summary() + save_student_memory()
+    → auto-flip to IDLE
     Next login → _build_memory_context() → "LAST SESSION: biology - diffusion."
     (The context builder produces structured labels, not narrative text.)
 
@@ -33,88 +35,29 @@ logger = logging.getLogger("waxprep.state")
 
 
 class StudentState(Enum):
-    """All possible states a student can be in. IN_EXAM_MODE is reserved."""
-    ONBOARDING = "onboarding"          # First time, setting up profile
-    IDLE = "idle"                      # Between sessions, waiting
-    GREETING = "greeting"              # Just opened the app, being welcomed
-    IN_LESSON = "in_lesson"            # Actively learning a topic
-    IN_PRACTICE = "in_practice"        # Doing practice questions
-    STUCK = "stuck"                    # Failed 3+ times, needs intervention
-    IN_EXAM_MODE = "in_exam_mode"      # Reserved — not yet implemented
-    ASKING_QUESTION = "asking_question" # Temporary detour from lesson
-    PAUSED = "paused"                  # Student said "not now"
-    CHATTING = "chatting"              # Non-learning conversation
-    ENDED = "ended"                    # Session complete
+    """All possible states a student can be in."""
+    ONBOARDING = "onboarding"          # First contact, temp student, learning name/level
+    ACTIVE = "active"                  # Session in progress — Wax decides the flow
+    ENDED = "ended"                    # Session just finished — triggers memory save
+    IDLE = "idle"                      # Between sessions, waiting for student to return
 
 
-# ── Allowed Transitions ──────────────────────
-# A state can only change to certain other states.
-# This prevents schizophrenic behavior where the bot
-# jumps from onboarding directly to exam mode.
+# ── Old state remapping for backward compatibility ──────────────────────
+# Students with legacy state values get silently migrated on read.
+# A one-time DB migration should also be run:
+#   UPDATE students SET current_state = 'active' WHERE current_state IN
+#     ('in_lesson', 'in_practice', 'stuck', 'asking_question', 'paused', 'chatting', 'in_exam_mode');
+#   UPDATE students SET current_state = 'idle' WHERE current_state IN ('greeting', 'idle');
 
-ALLOWED_TRANSITIONS: Dict[StudentState, List[StudentState]] = {
-    StudentState.ONBOARDING: [
-        StudentState.IDLE,
-        StudentState.GREETING,
-    ],
-    StudentState.IDLE: [
-        StudentState.GREETING,
-        StudentState.IN_LESSON,
-        StudentState.IN_PRACTICE,
-        StudentState.ASKING_QUESTION,
-        StudentState.CHATTING,
-    ],
-    StudentState.GREETING: [
-        StudentState.IN_LESSON,
-        StudentState.IN_PRACTICE,
-        StudentState.IDLE,
-        StudentState.CHATTING,
-        StudentState.PAUSED,
-    ],
-    StudentState.IN_LESSON: [
-        StudentState.IN_PRACTICE,
-        StudentState.STUCK,
-        StudentState.ASKING_QUESTION,
-        StudentState.PAUSED,
-        StudentState.ENDED,
-    ],
-    StudentState.IN_PRACTICE: [
-        StudentState.IN_LESSON,
-        StudentState.STUCK,
-        StudentState.ASKING_QUESTION,
-        StudentState.ENDED,
-    ],
-    StudentState.STUCK: [
-        StudentState.IN_LESSON,
-        StudentState.IDLE,
-        StudentState.ASKING_QUESTION,
-        StudentState.PAUSED,
-    ],
-    StudentState.ASKING_QUESTION: [
-        StudentState.IN_LESSON,
-        StudentState.IN_PRACTICE,
-        StudentState.IDLE,
-    ],
-    StudentState.PAUSED: [
-        StudentState.IDLE,
-        StudentState.GREETING,
-        StudentState.IN_LESSON,
-    ],
-    StudentState.CHATTING: [
-        StudentState.IDLE,
-        StudentState.GREETING,
-        StudentState.IN_LESSON,
-    ],
-    StudentState.ENDED: [
-        StudentState.IDLE,
-        StudentState.GREETING,
-    ],
-    # IN_EXAM_MODE not yet implemented — reserved
-    # But exit paths exist so admin-forced entries don't brick students
-    StudentState.IN_EXAM_MODE: [
-        StudentState.IDLE,
-        StudentState.ENDED,
-    ],
+OLD_STATE_MAP = {
+    "greeting": "idle",
+    "in_lesson": "active",
+    "in_practice": "active",
+    "stuck": "active",
+    "asking_question": "active",
+    "paused": "active",
+    "chatting": "active",
+    "in_exam_mode": "active",
 }
 
 
@@ -139,14 +82,14 @@ async def get_state(student_id: str) -> Optional[str]:
         student_id: Student database ID
         
     Returns:
-        State string (e.g., "in_lesson") or None
+        State string (e.g., "active") or None
     """
     # Basic validation to save a database round-trip
     if not student_id or not student_id.strip():
         logger.warning("get_state called with empty student_id")
         return None
     
-    # ── Temp students: Redis only, default "chatting" ──
+    # ── Temp students: Redis only, default "active" ──
     if student_id.startswith("temp_"):
         key = f"student_state:{student_id}"
         try:
@@ -154,11 +97,18 @@ async def get_state(student_id: str) -> Optional[str]:
             if cached:
                 decoded = cached.decode("utf-8") if isinstance(cached, bytes) else cached
                 if decoded:
+                    # Remap old state values for temp students too
+                    if decoded in OLD_STATE_MAP:
+                        logger.warning(
+                            f"Temp student {student_id} has old state '{decoded}' — "
+                            f"remapping to '{OLD_STATE_MAP[decoded]}'"
+                        )
+                        return OLD_STATE_MAP[decoded]
                     return decoded
         except Exception as e:
             logger.error(f"Redis get_state error for temp student {student_id}: {e}")
-        # Default state for temp students — they're always chatting
-        return StudentState.CHATTING.value
+        # Default state for temp students — they're always active
+        return StudentState.ACTIVE.value
     
     # ── Registered students: Redis first, Supabase fallback ──
     # Check Redis first
@@ -168,6 +118,13 @@ async def get_state(student_id: str) -> Optional[str]:
         if cached:
             decoded = cached.decode("utf-8") if isinstance(cached, bytes) else cached
             if decoded:
+                # Remap old state values silently
+                if decoded in OLD_STATE_MAP:
+                    logger.warning(
+                        f"Student {student_id} has old state '{decoded}' in Redis — "
+                        f"remapping to '{OLD_STATE_MAP[decoded]}'"
+                    )
+                    return OLD_STATE_MAP[decoded]
                 return decoded
     except Exception as e:
         logger.error(f"Redis get_state error for {student_id}: {e}")
@@ -183,6 +140,15 @@ async def get_state(student_id: str) -> Optional[str]:
         if result.data:
             row = result.data[0]
             state = row.get("current_state")
+            
+            # Remap old state values from database
+            if state in OLD_STATE_MAP:
+                logger.warning(
+                    f"Student {student_id} has old state '{state}' in DB — "
+                    f"remapping to '{OLD_STATE_MAP[state]}'"
+                )
+                state = OLD_STATE_MAP[state]
+            
             if not state:
                 # No state stored yet — infer from onboarding status
                 is_complete = row.get("onboarding_complete", False)
@@ -220,12 +186,14 @@ async def set_state(
     """
     Change a student's state. Returns True if successful.
     
-    Validates the transition before saving.
+    No transition whitelist — any valid state is accepted.
+    Prevents impossible state jumps that would confuse the backend trigger pipeline.
     Temp students: Redis only, no Supabase calls, no session memory.
     Registered students: Persists to Supabase FIRST, then Redis.
     
     If transitioning to ENDED, automatically saves a session summary
-    and updates student memory for the Teacher Memory Voice (registered only).
+    and updates student memory for the Teacher Memory Voice (registered only),
+    then auto-flips to IDLE so the student is ready for the next session.
     
     Args:
         student_id: Student's database ID
@@ -238,33 +206,20 @@ async def set_state(
     Returns:
         True if state was changed successfully, False otherwise
     """
+    # Only validation: is this a real state?
+    try:
+        target_state = StudentState(new_state)
+    except ValueError:
+        logger.error(f"set_state failed: invalid target state '{new_state}'")
+        return False
+
     is_temp = student_id.startswith("temp_")
     
     # ── Temp students: Redis only ──
     if is_temp:
         current_state_str = await get_state(student_id)
         if not current_state_str:
-            current_state_str = StudentState.CHATTING.value
-        
-        try:
-            current_state = StudentState(current_state_str)
-        except ValueError:
-            current_state = StudentState.CHATTING
-        
-        try:
-            target_state = StudentState(new_state)
-        except ValueError:
-            logger.error(f"set_state failed: invalid target state '{new_state}'")
-            return False
-        
-        # Validate transition
-        allowed = ALLOWED_TRANSITIONS.get(current_state, [])
-        if target_state not in allowed:
-            logger.warning(
-                f"State transition blocked: {current_state.value} → {new_state} "
-                f"(allowed from {current_state.value}: {[s.value for s in allowed]})"
-            )
-            return False
+            current_state_str = StudentState.ACTIVE.value
         
         # Save to Redis only
         key = f"student_state:{student_id}"
@@ -272,7 +227,7 @@ async def set_state(
             redis_client.setex(key, STATE_CACHE_TTL, new_state)
             logger.info(
                 f"STATE TRANSITION (temp): {student_id}: "
-                f"{current_state.value} → {new_state}"
+                f"{current_state_str} → {new_state}"
                 + (f" | Reason: {reason}" if reason else "")
             )
             return True
@@ -286,35 +241,9 @@ async def set_state(
         logger.warning(f"set_state failed: student {student_id} not found")
         return False
 
-    # Parse current state
-    try:
-        current_state = StudentState(current_state_str)
-    except ValueError:
-        logger.warning(
-            f"Invalid current state '{current_state_str}' for {student_id}. "
-            f"Defaulting to IDLE."
-        )
-        current_state = StudentState.IDLE
-
-    # Parse new state
-    try:
-        target_state = StudentState(new_state)
-    except ValueError:
-        logger.error(f"set_state failed: invalid target state '{new_state}'")
-        return False
-
-    # Check if transition is allowed
-    allowed = ALLOWED_TRANSITIONS.get(current_state, [])
-    if target_state not in allowed:
-        logger.warning(
-            f"State transition blocked: {current_state.value} → {new_state} "
-            f"(allowed from {current_state.value}: {[s.value for s in allowed]})"
-        )
-        return False
-
     # Log the transition
     logger.info(
-        f"STATE TRANSITION: {student_id}: {current_state.value} → {new_state}"
+        f"STATE TRANSITION: {student_id}: {current_state_str} → {new_state}"
         + (f" | Reason: {reason}" if reason else "")
     )
 
@@ -354,7 +283,7 @@ async def set_state(
         )
         return False
 
-    # ── Session ENDED → Save memory (non-blocking) ──
+    # ── Session ENDED → Save memory (non-blocking), then flip to IDLE ──
     if target_state == StudentState.ENDED:
         try:
             await _on_session_ended(student_id, session_context or {})
@@ -364,6 +293,12 @@ async def set_state(
                 exc_info=True
             )
             # Don't block — state change succeeded, memory is non-critical
+        
+        # Auto-flip to IDLE so next message triggers a fresh welcome
+        try:
+            await set_state(student_id, StudentState.IDLE.value, reason="Auto-flip after session ended")
+        except Exception as e:
+            logger.error(f"Auto-flip to IDLE failed for {student_id}: {e}")
 
     return True
 
@@ -412,6 +347,7 @@ async def _on_session_ended(student_id: str, context: Dict[str, Any]) -> None:
 
     # If no explicit struggles, try to detect from conversation
     # (Only runs if no score data available — score wins over keywords)
+    # TODO Phase 2: Replace keyword detection with Silent Guide signal data
     if not struggled_with and score is None:
         try:
             recent_history = await get_history(student_id)
@@ -543,7 +479,7 @@ async def is_in_state(student_id: str, state: str) -> bool:
     
     Args:
         student_id: Student database ID
-        state: State string to check (e.g., "in_lesson")
+        state: State string to check (e.g., "active")
         
     Returns:
         True if student is in the specified state
@@ -607,9 +543,10 @@ async def force_state(
 
 async def clear_state(student_id: str) -> None:
     """
-    Remove state from cache and database.
+    Remove state from cache and set to idle in database.
     
     Used on account deletion or complete reset.
+    A reset student never has an undefined state.
     """
     logger.info(f"Clearing state for {student_id}")
     
@@ -621,7 +558,7 @@ async def clear_state(student_id: str) -> None:
 
     try:
         supabase.table("students") \
-            .update({"current_state": None}) \
+            .update({"current_state": "idle"}) \
             .eq("id", student_id) \
             .execute()
     except Exception as e:
