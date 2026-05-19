@@ -41,14 +41,6 @@ DEFERRAL_KEYWORDS = [
     "suggest something", "suggest a topic",
 ]
 
-# ── Preference keywords ───────────────────────
-PREFERENCE_KEYWORDS = [
-    "i prefer", "i don't like", "i dont like", "i like",
-    "use something from", "don't use", "dont use",
-    "stop using", "no more", "i changed my mind",
-    "instead of", "rather than", "not that",
-]
-
 # ── Session end keywords ─────────────────────
 SESSION_END_KEYWORDS = [
     "i'm tired", "i am tired", "i'm done", "i am done",
@@ -61,14 +53,6 @@ SESSION_END_KEYWORDS = [
     "i dey go", "e don do", "e don do me",
     "i dey come", "make i chop", "make i eat",
     "i go come back", "i dey go sleep",
-]
-
-# ── Nigerian time phrases ──
-NIGERIAN_TIME_PHRASES = [
-    "i'm coming", "i dey come", "make i chop", "make i eat",
-    "i wan eat", "let me eat first", "i dey go bathroom",
-    "one minute", "small time", "i dey come back",
-    "no dey far",
 ]
 
 # ── Subject name mapping ──────────────────────
@@ -159,12 +143,6 @@ UNDERSTANDING_PHRASES = [
     "you don sabi am", "na so e be", "you get am",
     "e don enter", "correct guy", "correct girl",
     "you dey try", "na im be that",
-]
-
-# Wake phrases that should NEVER appear for temp students
-WAKE_PHRASES = [
-    "welcome back", "you're back", "you returned", "welcome back,",
-    "STUDENT IS RETURNING", "INFORMED GREETING", "CELEBRATE:",
 ]
 
 # Phrases that indicate a student wants continuity
@@ -266,8 +244,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             is_practice=False,
         )
 
-        response = _sanitize_wake_phrases(response, is_temp=True)
-
         try:
             await save_message(temp_id, "assistant", response)
         except Exception:
@@ -312,7 +288,13 @@ def _extract_name_from_message(text: str) -> Optional[str]:
         match = re.search(pattern, msg, re.IGNORECASE)
         if match:
             name = match.group(1)
-            if name.lower() not in ("not", "good", "fine", "ok", "okay", "sure", "new", "student", "done", "tired"):
+            if name.lower() not in (
+                "not", "good", "fine", "ok", "okay", "sure", "new", "student",
+                "done", "tired", "confused", "just", "here", "ready", "back",
+                "leaving", "going", "thinking", "trying", "really", "so", "very",
+                "still", "sorry", "hungry", "lost", "stuck", "waiting", "coming",
+                "serious",
+            ):
                 return name[0].upper() + name[1:].lower() if len(name) > 1 else name.upper()
     return None
 
@@ -332,18 +314,6 @@ def _extract_name_from_history(conversation_history: List[Dict]) -> Optional[str
             if match:
                 return match.group(1)
     return None
-
-
-def _sanitize_wake_phrases(text: str, is_temp: bool = False) -> str:
-    """Remove wake/session-reset phrases from AI responses."""
-    if not is_temp:
-        return text
-    sanitized = text
-    for phrase in WAKE_PHRASES:
-        sanitized = re.sub(re.escape(phrase), "", sanitized, flags=re.IGNORECASE)
-    sanitized = re.sub(r'\s+', ' ', sanitized)
-    sanitized = re.sub(r'\n\s*\n', '\n\n', sanitized)
-    return sanitized.strip()
 
 
 # ═══════════════════════════════════════════════
@@ -576,7 +546,7 @@ async def _handle_pin_submission(
     if len(pin) < 4:
         await send_telegram_message(
             chat_id,
-            "At least 4 characters. Try again."
+            "Ah ah, make am at least 4 characters. Try again."
         )
         return True
     
@@ -664,10 +634,7 @@ async def _handle_account_creation_failure(chat_id: int, student_id: str) -> Non
     
     await send_telegram_message(
         chat_id,
-        "Ah, my fault. The account didn't create — something glitched on my end.\n\n"
-        "But here's the good part: everything we talked about today? Still here. "
-        "Still saved. We can try again now, or we can keep studying and fix it later.\n\n"
-        "Your call. Try again or keep going?"
+        "Omo, network dey misbehave. The account no gree create. But no stress — everything we talk today still dey. We fit try again now, or we continue. Your call."
     )
 
 
@@ -681,11 +648,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         await _handle_session_end(chat_id, student, text, student_id, name, msg_lower)
         return
 
-    if any(phrase in msg_lower for phrase in NIGERIAN_TIME_PHRASES):
-        await _handle_stepping_away(chat_id, student_id, name)
-        return
-
-    is_preference = any(phrase in msg_lower for phrase in PREFERENCE_KEYWORDS)
     is_deferral = any(phrase in msg_lower for phrase in DEFERRAL_KEYWORDS)
     
     # Don't hijack the conversation if the student named a subject explicitly
@@ -697,8 +659,8 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
                 named_subject = True
                 break
     
-    if is_deferral and not is_preference and not named_subject:
-        await _handle_deferral(chat_id, student, student_id, name, msg_lower)
+    if is_deferral and not named_subject:
+        await _handle_deferral(chat_id, student, student_id, name, text)
         return
 
     cleaned = text.strip().upper()
@@ -716,25 +678,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         return
 
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
-
-
-# ═══════════════════════════════════════════════
-# STEPPING AWAY HANDLER
-# ═══════════════════════════════════════════════
-
-async def _handle_stepping_away(chat_id: int, student_id: str, name: str) -> None:
-    """Handle Nigerian time expressions."""
-    key = f"stepped_away:{student_id}"
-    try:
-        redis_client.setex(key, 3600, "1")
-    except Exception:
-        pass
-    try:
-        timestamp_key = f"last_message_time:{student_id}"
-        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
-    except Exception:
-        pass
-    await send_telegram_message(chat_id, "No wahala. I dey here.")
 
 
 # ═══════════════════════════════════════════════
@@ -788,31 +731,7 @@ async def _handle_session_end(
     # Natural pause before account offer so goodbye and offer are separate messages
     await asyncio.sleep(1.5)
 
-    session_completed = False
-    session_score = None
     session_struggles = []
-
-    for msg in reversed(conversation_history[-10:]):
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "").lower()
-            if any(phrase in content for phrase in UNDERSTANDING_PHRASES):
-                session_completed = True
-                correct_count = sum(
-                    1 for m in conversation_history[-20:]
-                    if m.get("role") == "assistant" and
-                    any(p in m.get("content", "").lower() for p in UNDERSTANDING_PHRASES)
-                )
-                wrong_count = sum(
-                    1 for m in conversation_history[-20:]
-                    if m.get("role") == "assistant" and
-                    any(p in m.get("content", "").lower() for p in [
-                        "not quite", "not exactly", "close", "almost", "that's not",
-                    ])
-                )
-                total = correct_count + wrong_count
-                if total > 0:
-                    session_score = correct_count / total
-                break
 
     struggle_keywords = ["confused", "don't understand", "struggling", "hard", "difficult"]
     for msg in conversation_history[-10:]:
@@ -832,8 +751,8 @@ async def _handle_session_end(
     session_context = {
         "subject": recent_subject or "unknown",
         "topic": session_topic or "discussed",
-        "completed": session_completed,
-        "score": session_score,
+        "completed": False,
+        "score": None,
         "struggled_with": session_struggles,
     }
 
@@ -921,17 +840,11 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
 # ═══════════════════════════════════════════════
 
 async def _handle_deferral(
-    chat_id: int, student: dict, student_id: str, name: str, msg_lower: str
+    chat_id: int, student: dict, student_id: str, name: str, text: str
 ) -> None:
-    """Handle when a student defers or asks to change topic."""
-    from database.conversations import save_message
-
-    trouble_subject = student.get("student_subject")
-    if not trouble_subject:
-        trouble_subject = _infer_recent_subject(student, [])
-    if not trouble_subject or trouble_subject in ("unknown", "a subject", ""):
-        trouble_subject = "Mathematics"
-
+    """Handle when a student defers or asks to change topic.
+    Routes through the AI with a deferral whisper instead of hardcoded scripts.
+    """
     deferral_key = f"deferral_count:{student_id}"
     deferral_count = 0
     try:
@@ -944,33 +857,25 @@ async def _handle_deferral(
 
     deferral_count += 1
 
-    if deferral_count == 1:
-        response = f"{trouble_subject}. You said it's been confusing you — that's exactly where we start. Let's go."
-    elif deferral_count == 2:
-        response = f"{name}, I already picked. {trouble_subject}. You told me it's confusing and you're not alone in that. But running from it won't help. Let's face it together. Ready?"
-    else:
-        response = (
-            f"{name}, {trouble_subject} — yeah, the one everyone fears. "
-            f"But you already know more than you think. "
-            f"Tell me one thing about it that makes sense to you. We'll build from there."
-        )
-
     try:
         redis_client.setex(deferral_key, DEFERRAL_TTL, str(deferral_count))
     except Exception:
         pass
-    try:
-        await save_message(student_id, "assistant", response)
-    except Exception:
-        pass
 
+    # Inject whisper for the AI
+    whisper = (
+        f"The student is deferring topic choice (deferral count: {deferral_count}). "
+        f"Pick a subject for them based on their conversation history. "
+        f"If they've deferred multiple times, be gently firm — not frustrated."
+    )
+    whisper_key = f"waxprep:deferral_whisper:{student_id}"
     try:
-        timestamp_key = f"last_message_time:{student_id}"
-        redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
-    except Exception:
-        pass
+        redis_client.setex(whisper_key, 60, whisper)
+    except Exception as e:
+        logger.error(f"Failed to inject deferral whisper: {e}")
 
-    await send_telegram_message(chat_id, response)
+    # Route to AI conversation handler so Wax responds naturally
+    await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
 # ═══════════════════════════════════════════════
@@ -1019,6 +924,20 @@ async def _handle_ai_conversation(
         context_str = await _build_memory_context(student_id)
     except Exception:
         context_str = ""
+
+    # Check for deferral whisper injected by _handle_deferral
+    whisper_key = f"waxprep:deferral_whisper:{student_id}"
+    try:
+        whisper_raw = redis_client.get(whisper_key)
+        if whisper_raw:
+            whisper_text = whisper_raw.decode("utf-8") if isinstance(whisper_raw, bytes) else whisper_raw
+            if context_str:
+                context_str = whisper_text + "\n\n" + context_str
+            else:
+                context_str = whisper_text
+            redis_client.delete(whisper_key)
+    except Exception:
+        pass
 
     # Session priming: skip for temp students
     is_temp = student_id.startswith("temp_")
@@ -1100,9 +1019,6 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
-
-    if is_temp:
-        response = _sanitize_wake_phrases(response, is_temp=True)
 
     try:
         from brain.safety import check_output_safety
@@ -1229,7 +1145,7 @@ async def _build_wake_context(student_id: str) -> str:
             score = last_session.get("score")
             struggles = last_session.get("struggled_with", [])
             if subject and subject != "unknown" and topic and topic != "discussed":
-                wake_line = f"STUDENT IS RETURNING. Last session: {subject} - {topic}."
+                wake_line = f"Last session: {subject} - {topic}."
                 if score is not None:
                     wake_line += f" Scored {int(score * 100)}%."
                 if struggles:
@@ -1243,10 +1159,10 @@ async def _build_wake_context(student_id: str) -> str:
         if memory:
             sessions_count = memory.get("sessions_completed", 0)
             if sessions_count > 0:
-                parts.append(f"INFORMED GREETING: Acknowledge this is session #{sessions_count + 1}.")
+                parts.append(f"This is the student's {sessions_count + 1}th session.")
             mastered = memory.get("topics_mastered", [])
             if mastered:
-                parts.append(f"CELEBRATE: Student has mastered {len(mastered)} topics. Mention if natural.")
+                parts.append(f"Topics mastered: {', '.join(mastered)}. Mention if natural.")
     except Exception:
         pass
 
@@ -1352,11 +1268,20 @@ def _extract_session_signals(
 
 def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Dict]) -> Optional[str]:
     """Infer what subject the student is currently discussing."""
+    # Scan recent assistant messages for subject mentions
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
             for subject in SUBJECT_MAP:
                 if subject.replace("_", " ").lower() in content.lower():
+                    return subject
+    # Scan last 5 assistant messages more specifically (Fix 5)
+    for msg in reversed(conversation_history[-5:]):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            for subject in SUBJECT_MAP:
+                display = subject.replace("_", " ")
+                if display.lower() in content.lower():
                     return subject
     trouble_subject = student.get("student_subject")
     if trouble_subject:
@@ -1476,7 +1401,20 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     else:
         subjects_pool = student_subjects.copy()
 
-    subject = _pick_rotated_subject(student_id, subjects_pool)
+    # Check if student specified a subject in the message (Fix 6)
+    requested_subject = None
+    msg_lower = message_text.strip().lower()
+    for subject_key, mapped_subject in SUBJECT_MAP.items():
+        display = subject_key.replace("_", " ")
+        if re.search(r'\b' + re.escape(display) + r'\b', msg_lower):
+            requested_subject = mapped_subject
+            break
+    
+    if requested_subject:
+        subject = requested_subject
+    else:
+        subject = _pick_rotated_subject(student_id, subjects_pool)
+    
     db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
     questions = await _load_questions(db_subject)
 
@@ -1532,7 +1470,7 @@ async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_da
     except Exception:
         return
     if not student:
-        await send_telegram_message(chat_id, "I can't find your account. Type *HI* to restart.")
+        await send_telegram_message(chat_id, "Omo, I no fit find your account. Just send 'hi' make we start fresh.")
         return
     if callback_data in ("A", "B", "C", "D"):
         await _handle_quiz_answer(chat_id, student, callback_data)
@@ -1567,10 +1505,22 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
     correct = question.get("correct_answer", "A").strip().upper()
     is_correct = (answer == correct)
 
+    correct_responses = [
+        f"✅ *Correct!* You sabi that one, {name}.",
+        f"✅ *Correct!* E don enter. Nice one, {name}.",
+        f"✅ *Correct!* You get am. Keep going, {name}.",
+        f"✅ *Correct!* Na so e be. Well done, {name}.",
+    ]
+    incorrect_responses = [
+        f"Almost, {name}. The answer na *{correct}*. Make I show you why...",
+        f"Close! But no be that one. Correct answer: *{correct}*. Let me break it down...",
+        f"No wahala, {name}. The correct answer be *{correct}*. Here's why...",
+    ]
+
     if is_correct:
-        response = f"✅ *Correct!*\n\nWell done, {name}!"
+        response = random.choice(correct_responses)
     else:
-        response = f"❌ That's not quite right.\n\nThe correct answer is *{correct}*."
+        response = random.choice(incorrect_responses)
 
     _log_quiz_answer(student_id, question, is_correct)
     response += "\n\nType *quiz* for another question!"
@@ -1607,9 +1557,16 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
 
 def _validate_question(question: Dict[str, Any]) -> bool:
     """Validate that a question has required fields."""
-    if not question.get("question_text") and not question.get("question"):
+    body = question.get("question_text") or question.get("question") or ""
+    if len(body.strip()) < 10:
         return False
     if not question.get("correct_answer"):
+        return False
+    options = question.get("options")
+    if not options or not isinstance(options, dict) or len(options) == 0:
+        return False
+    correct = question.get("correct_answer", "").strip().upper()
+    if correct not in options:
         return False
     return True
 
