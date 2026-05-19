@@ -10,9 +10,13 @@ Security: __repr__ masks sensitive values so accidental logging doesn't leak cre
 
 import os
 import logging
-from dotenv import load_dotenv
+import warnings
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — env vars come from the platform
 
 logger = logging.getLogger("waxprep.settings")
 
@@ -28,6 +32,10 @@ class Settings:
     # ── Supabase ──────────────────────────────
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+    # TODO Phase 3: Add SUPABASE_ANON_KEY for read operations.
+    # Currently all operations use the service key (bypasses RLS).
+    # Student data isolation relies entirely on application-level WHERE clauses.
+    # Also: add pre-commit hook to prevent logging of SUPABASE_SERVICE_KEY.
     # NOTE: SUPABASE_SERVICE_KEY is the service role key — it bypasses RLS.
     # NEVER log this value. NEVER expose it in error messages.
     # Use settings.SUPABASE_ANON_KEY for public operations when available.
@@ -93,6 +101,11 @@ class Settings:
         Use GROQ_API_KEYS for multi-key rotation.
         This property exists for code that expects a single key.
         """
+        warnings.warn(
+            "GROQ_API_KEY is deprecated. Use GROQ_API_KEYS instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         keys = self.GROQ_API_KEYS
         return keys[0] if keys else ""
 
@@ -158,24 +171,27 @@ class Settings:
     
     def validate(self) -> list:
         """
-        Validate that all required production settings are configured.
+        Validate that all required settings are configured.
         
         Returns a list of warning messages. Empty list means all good.
         Call this from the lifespan startup in main.py.
         """
         warnings = []
         
+        # Always check — bot can't function without these in any environment
+        if not self.TELEGRAM_BOT_TOKEN:
+            warnings.append("TELEGRAM_BOT_TOKEN is not set — bot will not start")
+        if not self.GROQ_API_KEYS or not self.GROQ_API_KEYS[0]:
+            warnings.append("No Groq API keys configured — AI will fail")
+        if not self.REDIS_URL:
+            warnings.append("REDIS_URL is not set — conversation history will fail")
+        if not self.SUPABASE_URL:
+            warnings.append("SUPABASE_URL is not set — student data will fail")
+        
+        # Production-only checks
         if self.is_production:
-            if not self.SUPABASE_URL:
-                warnings.append("SUPABASE_URL is not set")
             if not self.SUPABASE_SERVICE_KEY:
                 warnings.append("SUPABASE_SERVICE_KEY is not set")
-            if not self.REDIS_URL:
-                warnings.append("REDIS_URL is not set")
-            if not self.GROQ_API_KEYS or not self.GROQ_API_KEYS[0]:
-                warnings.append("No Groq API keys configured")
-            if not self.TELEGRAM_BOT_TOKEN:
-                warnings.append("TELEGRAM_BOT_TOKEN is not set")
             if not self.TELEGRAM_WEBHOOK_SECRET:
                 warnings.append(
                     "TELEGRAM_WEBHOOK_SECRET is not set — webhook is UNPROTECTED"
