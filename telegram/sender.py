@@ -9,6 +9,7 @@ Handles all Telegram Bot API communication:
 This module is a pure API client — no business logic, no database.
 """
 
+import asyncio
 import logging
 from typing import Optional, Dict, Any
 
@@ -100,7 +101,8 @@ async def send_telegram_message(
                                     f"{retry_response.status_code}"
                                 )
                         except Exception as e:
-                            logger.error(f"Plain text retry exception: {e}")
+                            last_error = f"Plain text retry exception: {e}"
+                            logger.error(last_error)
                         return False
 
                 # Rate limit — wait and retry
@@ -111,7 +113,6 @@ async def send_telegram_message(
                         f"(attempt {attempt + 1}/{max_retries})"
                     )
                     if attempt < max_retries:
-                        import asyncio
                         await asyncio.sleep(retry_after)
                         continue
 
@@ -122,27 +123,25 @@ async def send_telegram_message(
                         f"Retrying (attempt {attempt + 1}/{max_retries})"
                     )
                     if attempt < max_retries:
-                        import asyncio
                         await asyncio.sleep(1.0 * (attempt + 1))  # Exponential-ish backoff
                         continue
 
                 # Other error — don't retry
-                logger.error(
-                    f"Telegram send error (status={response.status_code}): "
-                    f"{response.text[:200]}"
-                )
+                last_error = f"Telegram send error (status={response.status_code}): {response.text[:200]}"
+                logger.error(last_error)
                 return False
 
-        except httpx.TimeoutException:
-            logger.error(f"Telegram send timeout for chat_id={chat_id}")
+        except httpx.TimeoutException as e:
+            last_error = f"Telegram send timeout for chat_id={chat_id}"
+            logger.error(last_error)
             if attempt < max_retries:
                 continue
             return False
 
         except Exception as e:
-            logger.error(f"Telegram send exception: {e}", exc_info=True)
+            last_error = f"Telegram send exception: {e}"
+            logger.error(last_error, exc_info=True)
             if attempt < max_retries:
-                import asyncio
                 await asyncio.sleep(0.5)
                 continue
             return False
