@@ -75,11 +75,10 @@ def _normalize_observation(category: str, fact: str) -> str:
     # Lowercase and strip
     normalized = fact.lower().strip()
     
-    # Remove filler phrases that change wording but not meaning
+    # Defensive: AI should return clean facts per prompt, but normalize just in case.
+    # Only strip phrases that would prevent deduplication of identical facts.
     filler_phrases = [
         "wants to be a", "wants to become a", "wants to study",
-        "is interested in", "mentioned", "said they want",
-        "thinks about", "considering", "might want to",
     ]
     for phrase in filler_phrases:
         normalized = normalized.replace(phrase, "")
@@ -87,15 +86,8 @@ def _normalize_observation(category: str, fact: str) -> str:
     # Collapse whitespace
     normalized = " ".join(normalized.split())
     
-    # Create a short hash for the key
-    # For career goals, use the actual goal as the key
-    # For other categories, hash to prevent absurdly long keys
-    if category in ("career_goal", "exam_target"):
-        # Keep readable for these critical categories
-        key_content = normalized.replace(" ", "_")[:50]
-    else:
-        # Hash for everything else
-        key_content = hashlib.md5(normalized.encode()).hexdigest()[:12]
+    # Use human-readable text keys for ALL categories — no invisible hashes
+    key_content = normalized.replace(" ", "_")[:60]
     
     return f"{category}:{key_content}"
 
@@ -135,7 +127,7 @@ def _build_extraction_prompt(conversation_history: List[Dict],
     for msg in conversation_history[-MAX_EXTRACTION_WINDOW:]:
         role = msg.get("role", "user")
         content = msg.get("content", "")[:200]  # Truncate long messages
-        prefix = "Student" if role == "user" else "Wax"
+        prefix = "Student" if role == "user" else "Teacher"
         transcript_lines.append(f"{prefix}: {content}")
     
     transcript = "\n".join(transcript_lines)
@@ -148,13 +140,17 @@ def _build_extraction_prompt(conversation_history: List[Dict],
             known_items.append(f"- [{obs.get('category', '')}] {obs.get('fact', '')}")
         known_facts = "Already known about this student:\n" + "\n".join(known_items)
     
+    # TODO Phase 2: Extract negative signals — domain avoidances, disliked teaching styles, 
+    # rejected subjects. Currently only extracts positive/addition facts.
     return f"""Extract 1-3 NEW facts about this student from the conversation below.
-Only extract facts the student EXPLICITLY stated. Don't infer.
+Extract facts the student stated explicitly AND patterns they strongly implied through repeated behavior.
+Mark explicit statements as 'student_stated_explicitly' (confidence 0.8-1.0).
+Mark implied patterns as 'student_implied' (confidence 0.3-0.6).
 If nothing new was shared, return an empty list.
 
-Categories: career_goal, academic_strength, academic_struggle, learning_style, 
-domain_preference, personal_context, exam_target, communication_style, 
-emotional_state, life_circumstance
+Common categories include: career_goal, academic_strength, academic_struggle, learning_style, 
+domain_preference, personal_context, exam_target, communication_style, emotional_state, life_circumstance.
+Use these OR create a new category if nothing fits.
 
 {known_facts}
 
@@ -197,12 +193,13 @@ async def extract_observations_from_conversation(
         # Use FAST model for progressive, SMART for session end
         model = settings.GROQ_SMART_MODEL if is_session_end else settings.GROQ_FAST_MODEL
         
+        # TODO Phase 2: Move extraction prompt to ai/prompts.py as get_extraction_prompt()
         client = _get_client(settings.GROQ_API_KEY)
         response = await asyncio.to_thread(
             client.chat.completions.create,
             model=model,
             messages=[
-                {"role": "system", "content": "You are an observation extractor. Extract only facts the student explicitly stated. Return valid JSON only. No commentary."},
+                {"role": "system", "content": "You are an observation extractor. Extract facts the student stated explicitly AND patterns they strongly implied through repeated behavior. Return valid JSON only. No commentary."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=300 if is_session_end else 150,
@@ -249,8 +246,6 @@ async def extract_observations_from_conversation(
             
             # Skip invalid entries
             if not category or not fact:
-                continue
-            if category not in OBSERVATION_CATEGORIES:
                 continue
             if len(fact) < 3 or len(fact) > 200:
                 continue
@@ -326,9 +321,14 @@ async def extract_and_save_observations(
             is_session_end=is_session_end,
         )
         
-        # Save each new observation
+        # Save each new observation with deduplication check
         saved_count = 0
         for obs in new_observations:
+            obs_key = _normalize_observation(obs["category"], obs["fact"])
+            # Check against existing keys
+            if any(_normalize_observation(e["category"], e["fact"]) == obs_key for e in existing):
+                continue  # Skip duplicates
+            
             success = await save_observation(
                 student_id=student_id,
                 category=obs["category"],
@@ -338,6 +338,7 @@ async def extract_and_save_observations(
             )
             if success:
                 saved_count += 1
+                existing.append(obs)  # Add to in-memory list for subsequent checks
         
         if saved_count > 0:
             logger.info(
@@ -367,6 +368,7 @@ def calculate_authority(observation: Dict) -> float:
     Returns:
         Authority score (0.0 to 1.0+)
     """
+    category = observation.get("category", "")
     source = observation.get("source", "ai_inferred_single")
     base = SOURCE_AUTHORITY.get(source, 0.3)
     
@@ -382,17 +384,19 @@ def calculate_authority(observation: Dict) -> float:
     if confidence >= 0.9:
         base += 0.1
     
-    # Penalty for old observations
-    last_updated = observation.get("last_updated")
-    if last_updated:
-        try:
-            updated_time = datetime.fromisoformat(last_updated)
-            days_old = (datetime.now(timezone.utc) - updated_time).days
-            if days_old > 60:
-                base -= 0.2
-            elif days_old > 30:
-                base -= 0.1
-        except Exception:
-            pass
+    # Age penalty only for volatile categories
+    volatile_categories = {"emotional_state", "life_circumstance"}
+    if category in volatile_categories:
+        last_updated = observation.get("last_updated")
+        if last_updated:
+            try:
+                updated_time = datetime.fromisoformat(last_updated)
+                days_old = (datetime.now(timezone.utc) - updated_time).days
+                if days_old > 60:
+                    base -= 0.2
+                elif days_old > 30:
+                    base -= 0.1
+            except Exception:
+                pass
     
     return max(0.0, min(1.0, base))
