@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from database.client import redis_client, supabase
+from brain.observation_utils import normalize_observation_key, calculate_authority
 
 logger = logging.getLogger("waxprep.database.observations")
 
@@ -48,45 +49,9 @@ MAX_ARCHIVE_OBSERVATIONS = 100
 # KEY GENERATION
 # ═══════════════════════════════════════════════
 
-def _normalize_observation_key(category: str, fact: str) -> str:
-    """
-    Normalize an observation into a stable, content-addressable key.
-    
-    Same fact always produces the same key. This IS the deduplication.
-    
-    Args:
-        category: Observation category
-        fact: The extracted fact text
-        
-    Returns:
-        Normalized key like "career_goal:brain_surgeon"
-    """
-    import hashlib
-    
-    normalized = fact.lower().strip()
-    
-    # Remove filler phrases
-    filler_phrases = [
-        "wants to be a", "wants to become a", "wants to study",
-        "is interested in", "mentioned", "said they want",
-        "thinks about", "considering", "might want to",
-    ]
-    for phrase in filler_phrases:
-        normalized = normalized.replace(phrase, "")
-    
-    normalized = " ".join(normalized.split())
-    
-    if category in ("career_goal", "exam_target"):
-        key_content = normalized.replace(" ", "_")[:50]
-    else:
-        key_content = hashlib.md5(normalized.encode()).hexdigest()[:12]
-    
-    return f"{category}:{key_content}"
-
-
 def _observation_key(student_id: str, category: str, fact: str) -> str:
     """Build a full Redis key for an observation."""
-    normalized = _normalize_observation_key(category, fact)
+    normalized = normalize_observation_key(category, fact)
     return f"observation:{student_id}:{normalized}"
 
 
@@ -122,7 +87,7 @@ async def save_observation(
         return False
     
     obs_key = _observation_key(student_id, category, fact)
-    normalized = _normalize_observation_key(category, fact)
+    normalized = normalize_observation_key(category, fact)
     now = datetime.now(timezone.utc).isoformat()
     
     # Check if this observation already exists
@@ -135,22 +100,31 @@ async def save_observation(
     except Exception:
         existing = None
     
+    # Always check for conflicts before saving (Fix 4: run on both UPDATE and CREATE)
+    await _resolve_category_conflicts(student_id, category, fact, obs_key, source, confidence)
+    
+    # Source-based confidence increment (Fix 6)
+    source_increment = {
+        "student_stated_explicitly": 0.15,
+        "student_confirmed": 0.20,
+        "quiz_data": 0.15,
+        "student_implied": 0.08,
+        "ai_inferred_single": 0.03,
+        "ai_inferred_multiple": 0.05,
+    }.get(source, 0.05)
+    
     if existing:
         # UPDATE existing observation
         observation = {
             **existing,
-            "confidence": min(1.0, confidence + 0.1),  # Increase confidence on repeat
+            "confidence": min(1.0, existing.get("confidence", 0.5) + source_increment),
             "times_observed": existing.get("times_observed", 1) + 1,
             "last_updated": now,
             "active": True,
         }
         logger.debug(f"Updated existing observation: {normalized}")
     else:
-        # Check for CONFLICT with existing observations in same category
-        # (e.g., old career_goal vs new career_goal)
-        await _resolve_category_conflicts(student_id, category, fact, obs_key)
-        
-        # CREATE new observation
+        # CREATE new observation (conflicts already resolved above)
         observation = {
             "student_id": student_id,
             "category": category,
@@ -196,7 +170,9 @@ async def _resolve_category_conflicts(
     student_id: str, 
     new_category: str, 
     new_fact: str,
-    new_key: str
+    new_key: str,
+    source: str = "ai_inferred_single",
+    confidence: float = 0.5,
 ) -> None:
     """
     Check for conflicting observations in the same category.
@@ -228,18 +204,16 @@ async def _resolve_category_conflicts(
             if not existing.get("active", True):
                 continue
             
-            # Check if new observation has HIGHER authority
-            from brain.observations import calculate_authority
-            
+            # Check if new observation has HIGHER authority (Fix 5: > not >=)
             existing_authority = calculate_authority(existing)
             new_authority = calculate_authority({
-                "source": "student_stated_explicitly",
-                "confidence": 0.9,
+                "source": source,
+                "confidence": confidence,
                 "times_observed": 1,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
             })
             
-            if new_authority >= existing_authority:
+            if new_authority > existing_authority:
                 # New observation supersedes old one
                 existing["active"] = False
                 existing["outdated_reason"] = "superseded_by_newer_observation"
@@ -296,10 +270,10 @@ async def get_active_observations(
         else:
             all_keys = redis_client.smembers(f"observation_index:{student_id}")
         
-        # Fetch each observation
-        for key_bytes in list(all_keys)[:limit * 2]:  # Fetch extra for filtering
-            key = key_bytes.decode("utf-8") if isinstance(key_bytes, bytes) else key_bytes
-            
+        # Fix 7: Fetch all keys, filter, then apply limit
+        all_keys_list = [k.decode("utf-8") if isinstance(k, bytes) else k for k in all_keys]
+        
+        for key in all_keys_list:
             raw = redis_client.get(key)
             if not raw:
                 continue
@@ -319,10 +293,33 @@ async def get_active_observations(
                 continue
             
             observations.append(obs)
+            
+            # Stop once we have enough
+            if len(observations) >= limit:
+                break
     
     except Exception as e:
         logger.error(f"Failed to load observations for {student_id}: {e}")
-        return []
+    
+    # Fix 8: Supabase fallback when Redis is empty or sparse
+    if len(observations) < 3:
+        try:
+            result = supabase.table("observations") \
+                .select("*") \
+                .eq("student_id", student_id) \
+                .eq("active", True) \
+                .eq("deleted", False) \
+                .order("last_updated", desc=True) \
+                .limit(limit) \
+                .execute()
+            if result.data:
+                # Repopulate Redis from Supabase
+                for row in result.data:
+                    obs_key = _observation_key(student_id, row["category"], row["fact"])
+                    redis_client.setex(obs_key, OBSERVATION_TTL, json.dumps(row))
+                return result.data
+        except Exception as e:
+            logger.error(f"Supabase fallback failed: {e}")
     
     # Sort by last_updated (newest first)
     observations.sort(key=lambda x: x.get("last_updated", ""), reverse=True)
@@ -513,6 +510,11 @@ async def forget_all_observations(student_id: str) -> bool:
             
             # Set shorter TTL for deleted observations (30-day recovery)
             redis_client.setex(key, OBSERVATION_DELETION_RECOVERY, json.dumps(obs))
+            
+            # Fix 9: Clean up index sets on soft delete
+            redis_client.srem(f"observation_index:{student_id}", key)
+            redis_client.srem(f"observation_index:{student_id}:category:{obs['category']}", key)
+            
             deleted_count += 1
         
         logger.info(
@@ -530,16 +532,12 @@ async def hard_delete_expired_observations() -> int:
     """
     Permanently delete observations past the recovery window.
     
-    Should be run as a periodic task (e.g., daily).
-    Observations marked deleted >30 days ago are permanently removed.
+    Redis TTL handles this automatically — when OBSERVATION_DELETION_RECOVERY 
+    expires, Redis deletes the key. Supabase cleanup is not yet implemented.
     
-    Returns:
-        Number of observations hard-deleted
+    This function exists as a hook for future Supabase hard-deletion.
     """
-    # This is a maintenance function — implementation depends on
-    # how you scan Redis keys. For now, expired TTL handles this naturally.
-    # When OBSERVATION_DELETION_RECOVERY expires, Redis auto-deletes.
-    logger.info("Hard delete not yet implemented — relying on Redis TTL expiration")
+    logger.debug("Hard delete relying on Redis TTL expiration")
     return 0
 
 
@@ -597,6 +595,9 @@ async def export_observations(student_id: str) -> Dict:
 async def _sync_observation_to_supabase(observation: Dict) -> None:
     """Sync a single observation to Supabase. Non-blocking background task."""
     try:
+        # REQUIRES unique constraint on Supabase observations table:
+        #   CREATE UNIQUE INDEX idx_observations_dedup ON observations(student_id, normalized_key);
+        # Without this, upserts will create duplicates.
         supabase.table("observations").upsert(
             {
                 "student_id": observation["student_id"],
