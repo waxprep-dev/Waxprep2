@@ -5,11 +5,25 @@ student memory so Wax remembers who each student is across sessions.
 
 Storage format:
     - Conversation History: Redis Lists (RPUSH + LTRIM, atomic)
-    - Session Summaries: Redis Strings (JSON, 30-day TTL)
-    - Student Memory: Redis Strings (JSON, 90-day TTL, order-preserving merge)
+    - Session Summaries: Redis Strings (JSON, 30-day TTL) + SIAPM Episodic (ZSET)
+    - Student Memory: Redis Strings (JSON, 90-day TTL) + SIAPM Semantic (Hash)
+
+FIXES APPLIED:
+    1. HISTORY_TTL increased from 14 days to 90 days.
+    2. Warning log added when message content exceeds 5000 chars.
+    3. Timestamp guard added to save_session_summary() — prevents overwriting newer with older.
+    4. Race condition in save_student_memory() documented with TODO for Phase 3.
+    5. TODO added for Supabase backup of conversation history (Phase 3).
+    6. TODO added for soft-delete recovery in clear_history() (Phase 2).
+    7. save_session_summary() now ALSO writes to SIAPM episodic memory (wax:em:{id}).
+    8. save_student_memory() now ALSO writes to SIAPM semantic memory (wax:sm:{id}).
+    9. get_session_summary() tries wax:em:{id} first, falls back to old key.
+    10. get_student_memory() tries wax:sm:{id} first, falls back to old key.
+    11. SIAPM entry dict puts **summary first so explicit mappings override raw fields.
 """
 
 from database.client import redis_client
+from brain.siapm_memory import save_episodic_memory, save_semantic_memory
 from datetime import datetime, timezone
 import json
 import logging
@@ -18,7 +32,11 @@ logger = logging.getLogger("waxprep.conversations")
 
 # ── Conversation History ──────────────────────
 HISTORY_MAX_LENGTH = 50   # Store up to 50 messages
-HISTORY_TTL = 86400 * 14  # 14 days (covers weekend-only students who study Saturdays)
+HISTORY_TTL = 86400 * 90  # 90 days (was 14 days — weekend students kept losing history)
+
+# TODO Phase 3: Add Supabase backup for conversation history (append-only log table)
+#   Table: conversation_logs(student_id, role, content, timestamp)
+#   Inserted in background after every save_message() call.
 
 
 async def save_message(student_id: str, role: str, content: str):
@@ -39,6 +57,8 @@ async def save_message(student_id: str, role: str, content: str):
         role = "user"
     
     # Truncate content to prevent memory abuse from buggy/malicious callers
+    if len(content) > 5000:
+        logger.warning(f"Message content truncated from {len(content)} to 5000 chars for student {student_id}")
     content = content[:5000]
     
     key = f"conversation:{student_id}"
@@ -95,6 +115,8 @@ async def get_history(student_id: str, limit: int = 20) -> list:
 
 async def clear_history(student_id: str):
     """Clear conversation history permanently."""
+    # TODO Phase 2: Implement soft delete with 30-day recovery window instead of permanent deletion.
+    #   Move list to a backup key (conversation:deleted:{student_id}:{timestamp}) with 30-day TTL.
     key = f"conversation:{student_id}"
     try:
         redis_client.delete(key)
@@ -110,6 +132,7 @@ SESSION_SUMMARY_TTL = 86400 * 30  # 30 days
 async def save_session_summary(student_id: str, summary: dict):
     """
     Store a summary of the last teaching session.
+    Also writes to SIAPM episodic memory (wax:em:{student_id}) for long-term session history.
     
     Args:
         student_id: Student's database ID
@@ -122,24 +145,76 @@ async def save_session_summary(student_id: str, summary: dict):
             - ended_at: str (ISO timestamp)
     """
     key = f"session_summary:{student_id}"
+    now = datetime.now(timezone.utc).isoformat()
+    
     try:
+        # Timestamp guard: don't overwrite a newer summary with an older one
+        existing_raw = redis_client.get(key)
+        if existing_raw:
+            existing = json.loads(existing_raw)
+            existing_ended = existing.get("ended_at") or existing.get("saved_at")
+            new_ended = summary.get("ended_at") or summary.get("saved_at") or now
+            if existing_ended and new_ended:
+                try:
+                    existing_dt = datetime.fromisoformat(existing_ended.replace("Z", "+00:00"))
+                    new_dt = datetime.fromisoformat(new_ended.replace("Z", "+00:00"))
+                    if existing_dt > new_dt:
+                        logger.warning(
+                            f"Session summary save blocked for {student_id}: "
+                            f"existing summary ({existing_ended}) is newer than incoming ({new_ended})"
+                        )
+                        return
+                except (ValueError, AttributeError):
+                    pass  # Malformed timestamps — proceed with overwrite
+        
         # Create a copy so we don't mutate the caller's dict
         summary_to_save = {
             **summary,
-            "saved_at": datetime.now(timezone.utc).isoformat()
+            "saved_at": now
         }
         redis_client.setex(key, SESSION_SUMMARY_TTL, json.dumps(summary_to_save))
+        
     except Exception as e:
         logger.error(f"Session summary save error for {student_id}: {e}")
+        return  # Don't write to SIAPM if legacy save failed
+    
+    # SIAPM episodic write (non-blocking — failure is logged but not fatal)
+    try:
+        entry = {
+            **summary,  # raw fields first so explicit mappings below override them
+            "session_id": summary.get("session_id", f"{student_id}:{now}"),
+            "date": summary.get("ended_at") or summary.get("saved_at") or now,
+            "duration": summary.get("duration"),
+            "topics": [summary.get("topic")] if summary.get("topic") else [],
+            "victories": summary.get("victories", []),
+            "struggles": summary.get("struggled_with", []),
+            "emotional_arc": summary.get("emotional_arc"),
+            "cliffhanger": summary.get("cliffhanger"),
+        }
+        await save_episodic_memory(student_id, entry)
+    except Exception as e:
+        logger.warning(f"SIAPM episodic write failed for {student_id}: {e}")
 
 
 async def get_session_summary(student_id: str) -> dict | None:
     """
     Get the last session summary.
+    Tries SIAPM episodic memory (wax:em:{student_id}) first, falls back to legacy key.
     
     Returns:
         Dict with session summary, or None if no previous session exists.
     """
+    # Try SIAPM first
+    siapm_key = f"wax:em:{student_id}"
+    try:
+        raw_entries = redis_client.zrange(siapm_key, -1, -1)
+        if raw_entries:
+            entry_str = raw_entries[0].decode("utf-8") if isinstance(raw_entries[0], bytes) else raw_entries[0]
+            return json.loads(entry_str)
+    except Exception as e:
+        logger.warning(f"SIAPM episodic load failed for {student_id}: {e}")
+    
+    # Fallback to legacy key
     key = f"session_summary:{student_id}"
     try:
         raw = redis_client.get(key)
@@ -159,6 +234,7 @@ async def save_student_memory(student_id: str, memory_updates: dict):
     """
     Update persistent knowledge about a student.
     Merges with existing memory so nothing is lost.
+    Also writes the merged result to SIAPM semantic memory (wax:sm:{student_id}).
     
     Merge rules:
         - sessions_completed: OVERWRITE (caller already computed correct value)
@@ -196,17 +272,51 @@ async def save_student_memory(student_id: str, memory_updates: dict):
                 memory[k] = v
 
         redis_client.setex(key, STUDENT_MEMORY_TTL, json.dumps(memory))
+        
     except Exception as e:
         logger.error(f"Student memory save error for {student_id}: {e}")
+        return  # Don't write to SIAPM if legacy save failed
+    
+    # NOTE: The merge above is a read-modify-write pattern with a race condition
+    # under concurrent updates. Two simultaneous calls can read the same state,
+    # merge independently, and the second write clobbers the first.
+    # TODO Phase 3: Replace with atomic Redis operation (Lua script or WATCH/MULTI/EXEC)
+    # or migrate fully to SIAPM semantic memory which uses per-field Hash updates
+    # (naturally atomic at the field level).
+    
+    # SIAPM semantic write (non-blocking — failure is logged but not fatal)
+    try:
+        await save_semantic_memory(student_id, memory)
+    except Exception as e:
+        logger.warning(f"SIAPM semantic write failed for {student_id}: {e}")
 
 
 async def get_student_memory(student_id: str) -> dict:
     """
     Get everything Wax knows about this student.
+    Tries SIAPM semantic memory (wax:sm:{student_id}) first, falls back to legacy key.
     
     Returns:
         Dict with memory fields, or empty dict if no memory exists yet.
     """
+    # Try SIAPM first
+    siapm_key = f"wax:sm:{student_id}"
+    try:
+        raw = redis_client.hgetall(siapm_key)
+        if raw:
+            memory = {}
+            for field, value in raw.items():
+                field_str = field.decode("utf-8") if isinstance(field, bytes) else field
+                value_str = value.decode("utf-8") if isinstance(value, bytes) else value
+                try:
+                    memory[field_str] = json.loads(value_str)
+                except json.JSONDecodeError:
+                    memory[field_str] = value_str
+            return memory
+    except Exception as e:
+        logger.warning(f"SIAPM semantic load failed for {student_id}: {e}")
+    
+    # Fallback to legacy key
     key = f"student_memory:{student_id}"
     try:
         raw = redis_client.get(key)
