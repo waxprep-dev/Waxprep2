@@ -1,10 +1,12 @@
 # Changes made:
-# - Replaced _build_memory_context() with new version that loads all 5 memory layers
+# - Integrated input safety check using check_input_safety (before AI processing)
+# - Integrated output safety check using check_output_safety (after AI response) with regenerative fallback
+# - Replaced _build_memory_context() with version that loads all 5 memory layers
 #   (working memory, observations filtered by thermal score, episodic memory, semantic memory, procedural memory)
-#   and adds topic continuity instruction.
+#   and enforces topic continuity.
 # - Added new function _save_working_memory_update() to auto-save working memory after every AI response.
-# - Integrated call to _save_working_memory_update() in _handle_ai_conversation() after assistant message is saved and sent.
-# These changes implement P0-C001 (dynamic memory context in AI prompts).
+# - Called _save_working_memory_update() in _handle_ai_conversation() after assistant message is saved and sent.
+# These changes implement P0-C001 (dynamic memory context in AI prompts) and output/input safety layering.
 
 """
 WaxPrep v2 — Telegram Message Handler
@@ -181,9 +183,17 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
     logger.debug(f"Processing message from chat_id={chat_id}: {text[:100]}...")
 
+    # ═══════════════════════════════════════════════
+    # LAYER 1: INPUT SAFETY CHECK (BEFORE AI)
+    # ═══════════════════════════════════════════════
     try:
-        from brain.safety import run_safety_checks
-        if await run_safety_checks(chat_id, text):
+        from brain.safety import check_input_safety
+        safety_result = await check_input_safety(chat_id, text, student.get("id") if student else None)
+        
+        if not safety_result["safe"]:
+            # Blocked — send refusal, don't call AI
+            await send_telegram_message(chat_id, safety_result["response"])
+            logger.warning(f"Message blocked: {safety_result['reason']} for chat_id={chat_id}")
             return
     except ImportError:
         pass
@@ -1128,14 +1138,30 @@ async def _handle_ai_conversation(
         logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
+    # ═══════════════════════════════════════════════
+    # LAYER 2: OUTPUT SAFETY CHECK (AFTER AI)
+    # ═══════════════════════════════════════════════
     try:
         from brain.safety import check_output_safety
-        if await check_output_safety(response):
-            response = f"Let me try that differently, {name}. What subject are you studying right now?"
+        output_check = await check_output_safety(response, context=context_str)
+        
+        if not output_check["safe"]:
+            logger.warning(f"AI response blocked: {output_check['reason']}")
+            # Regenerate with stricter prompt
+            try:
+                strict_context = context_str + "\n\nSTRICT MODE: Do not give away answers. Guide with questions only."
+                response = await think(
+                    message=text, student=student,
+                    conversation_history=conversation_history,
+                    recent_subject=recent_subject, context_str=strict_context,
+                    is_practice=is_practice
+                )
+            except Exception:
+                response = f"I can't give you the answer directly, {name}. But I can help you figure it out. What have you tried so far?"
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Output safety check error: {e}")
 
     try:
         await save_message(student_id, "assistant", response)
