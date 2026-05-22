@@ -1,3 +1,11 @@
+# Changes made:
+# - Replaced _build_memory_context() with new version that loads all 5 memory layers
+#   (working memory, observations filtered by thermal score, episodic memory, semantic memory, procedural memory)
+#   and adds topic continuity instruction.
+# - Added new function _save_working_memory_update() to auto-save working memory after every AI response.
+# - Integrated call to _save_working_memory_update() in _handle_ai_conversation() after assistant message is saved and sent.
+# These changes implement P0-C001 (dynamic memory context in AI prompts).
+
 """
 WaxPrep v2 — Telegram Message Handler
 Processes incoming Telegram messages. Routes new students to a warm AI conversation,
@@ -1138,6 +1146,17 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
+    # NEW: Auto-save Working Memory after every response (P0-C001)
+    try:
+        await _save_working_memory_update(
+            student_id=student_id,
+            response=response,
+            current_topic=recent_subject,
+            text=text
+        )
+    except Exception as e:
+        logger.error(f"Working memory auto-save failed: {e}")
+
     try:
         from database.conversations import save_session_summary
         user_msg_count = sum(1 for m in conversation_history[-10:] if m.get("role") == "user")
@@ -1391,46 +1410,386 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
 # ═══════════════════════════════════════════════
 
 async def _build_memory_context(student_id: str) -> str:
-    """Build memory context for the AI prompt."""
+    """
+    Build memory context for the AI prompt.
+    
+    NEW (P0-C001): Loads Working Memory, filters observations by thermal score,
+    and enforces topic continuity. The AI now knows what the student is currently
+    studying, how confused they are, and what emotional state they're in.
+    """
     if student_id.startswith("temp_"):
         return ""
+    
     from database.conversations import get_session_summary, get_student_memory
-
+    from brain.siapm_memory import load_all_memory
+    
     context_parts: List[str] = []
+    
+    # ═══════════════════════════════════════════════
+    # 1. WORKING MEMORY (HIGHEST PRIORITY)
+    # ═══════════════════════════════════════════════
+    try:
+        memory = await load_all_memory(student_id)
+        working_memory = memory.get("working_memory", {})
+        
+        if working_memory:
+            wm_lines = ["CURRENT SESSION STATE:"]
+            
+            active_topic = working_memory.get("active_topic", "unknown")
+            if active_topic and active_topic != "unknown":
+                wm_lines.append(f"- Active topic: {active_topic}")
+            
+            stuck_on = working_memory.get("stuck_on", "")
+            if stuck_on:
+                wm_lines.append(f"- Student is stuck on: {stuck_on}")
+            
+            emotional_state = working_memory.get("emotional_state", "neutral")
+            if emotional_state and emotional_state != "neutral":
+                wm_lines.append(f"- Emotional state: {emotional_state}")
+            
+            last_question = working_memory.get("last_question", "")
+            if last_question:
+                wm_lines.append(f"- Last question asked: {last_question}")
+            
+            pace = working_memory.get("pace", "normal")
+            if pace and pace != "normal":
+                wm_lines.append(f"- Pace: {pace}")
+            
+            cliffhanger = working_memory.get("cliffhanger", "")
+            if cliffhanger:
+                wm_lines.append(f"- Unfinished: {cliffhanger}")
+            
+            if len(wm_lines) > 1:
+                context_parts.append("\n".join(wm_lines))
+                
+                # TOPIC CONTINUITY INSTRUCTION
+                # This prevents the AI from drifting to random topics
+                if active_topic and active_topic != "unknown":
+                    context_parts.append(
+                        f"TOPIC CONTINUITY: You are currently discussing {active_topic}. "
+                        f"Stay on this topic unless the student explicitly asks to switch. "
+                        f"Do not introduce new subjects without checking if the student wants to move on."
+                    )
+    except Exception as e:
+        logger.error(f"Working memory load error for {student_id}: {e}")
+    
+    # ═══════════════════════════════════════════════
+    # 2. OBSERVATIONS (FILTERED BY THERMAL SCORE)
+    # ═══════════════════════════════════════════════
+    try:
+        memory = memory if 'memory' in locals() else await load_all_memory(student_id)
+        observations = memory.get("observations", [])
+        
+        # Filter: Only high-thermal observations (emotionally significant)
+        # AND relevant to current topic
+        relevant_obs = []
+        for obs in observations:
+            thermal_score = obs.get("thermal_score", 0)
+            if isinstance(thermal_score, str):
+                try:
+                    thermal_score = float(thermal_score)
+                except (ValueError, TypeError):
+                    thermal_score = 0
+            
+            # Only load observations with thermal_score > 30
+            if thermal_score > 30:
+                surface_value = obs.get("surface_value", obs.get("content", ""))
+                provenance = obs.get("provenance", "EXTRACTED")
+                
+                # Mark provenance: VERIFIED = no marker, INFERRED/EXTRACTED = "~"
+                marker = ""
+                if provenance in ("INFERRED", "EXTRACTED"):
+                    marker = "~"
+                elif provenance == "UNCERTAIN":
+                    marker = "?"
+                
+                relevant_obs.append(f"{marker}{surface_value}")
+        
+        # Max 10 observations to prevent context bloat
+        if relevant_obs:
+            context_parts.append("STUDENT OBSERVATIONS:\n" + "\n".join(relevant_obs[:10]))
+    except Exception as e:
+        logger.error(f"Observation filtering error for {student_id}: {e}")
+    
+    # ═══════════════════════════════════════════════
+    # 3. EPISODIC MEMORY (LAST 3 SESSIONS, WEIGHTED)
+    # ═══════════════════════════════════════════════
+    try:
+        memory = memory if 'memory' in locals() else await load_all_memory(student_id)
+        episodic = memory.get("episodic_memory", [])
+        
+        # Only load last 3 sessions (not all 10)
+        recent_episodic = episodic[-3:] if len(episodic) > 3 else episodic
+        
+        for session in recent_episodic:
+            session_date = session.get("date", "recent")
+            topics = session.get("topics", [])
+            victories = session.get("victories", [])
+            struggles = session.get("struggles", [])
+            emotional_arc = session.get("emotional_arc", "")
+            
+            parts = []
+            if topics:
+                parts.append(f"Topics: {', '.join(topics[:3])}")
+            if victories:
+                parts.append(f"Wins: {', '.join(victories[:2])}")
+            if struggles:
+                parts.append(f"Struggled with: {', '.join(struggles[:2])}")
+            if emotional_arc:
+                parts.append(f"Mood: {emotional_arc}")
+            
+            if parts:
+                context_parts.append(f"SESSION ({session_date}): {' | '.join(parts)}")
+    except Exception as e:
+        logger.error(f"Episodic memory load error for {student_id}: {e}")
+    
+    # ═══════════════════════════════════════════════
+    # 4. SEMANTIC MEMORY (VERIFIED FACTS ONLY)
+    # ═══════════════════════════════════════════════
+    try:
+        memory = memory if 'memory' in locals() else await load_all_memory(student_id)
+        semantic = memory.get("semantic_memory", {})
+        
+        semantic_lines = []
+        
+        # Identity traits (VERIFIED)
+        identity = semantic.get("identity_traits", {})
+        if identity:
+            for key, value in identity.items():
+                if isinstance(value, dict):
+                    val = value.get("value", "")
+                    prov = value.get("provenance", "EXTRACTED")
+                else:
+                    val = value
+                    prov = "EXTRACTED"
+                
+                marker = "" if prov == "VERIFIED" else "~"
+                semantic_lines.append(f"{marker}{key}: {val}")
+        
+        # Learning style (INFERRED — marked with ~)
+        learning_style = semantic.get("learning_style", {})
+        if learning_style:
+            for key, value in learning_style.items():
+                if isinstance(value, dict):
+                    val = value.get("value", "")
+                else:
+                    val = value
+                semantic_lines.append(f"~{key}: {val}")
+        
+        # Career goals (VERIFIED if student stated)
+        career_goals = semantic.get("career_goals", {})
+        if career_goals:
+            for key, value in career_goals.items():
+                if isinstance(value, dict):
+                    val = value.get("value", "")
+                    prov = value.get("provenance", "EXTRACTED")
+                else:
+                    val = value
+                    prov = "EXTRACTED"
+                marker = "" if prov == "VERIFIED" else "~"
+                semantic_lines.append(f"{marker}Goal: {val}")
+        
+        # Mastered topics
+        mastered = semantic.get("mastered_topics", {})
+        if mastered:
+            mastered_list = []
+            for topic, data in mastered.items():
+                if isinstance(data, dict):
+                    date = data.get("date", "")
+                    mastered_list.append(f"{topic} ({date})")
+                else:
+                    mastered_list.append(topic)
+            if mastered_list:
+                semantic_lines.append(f"Mastered: {', '.join(mastered_list[:5])}")
+        
+        # Struggling topics
+        struggling = semantic.get("struggling_topics", {})
+        if struggling:
+            struggling_list = []
+            for topic, data in struggling.items():
+                if isinstance(data, dict):
+                    error_pattern = data.get("error_pattern", "")
+                    struggling_list.append(f"{topic} ({error_pattern})")
+                else:
+                    struggling_list.append(topic)
+            if struggling_list:
+                semantic_lines.append(f"Struggling: {', '.join(struggling_list[:5])}")
+        
+        if semantic_lines:
+            context_parts.append("STUDENT PROFILE:\n" + "\n".join(semantic_lines))
+    except Exception as e:
+        logger.error(f"Semantic memory load error for {student_id}: {e}")
+    
+    # ═══════════════════════════════════════════════
+    # 5. PROCEDURAL MEMORY (HOW TO TEACH THIS STUDENT)
+    # ═══════════════════════════════════════════════
+    try:
+        memory = memory if 'memory' in locals() else await load_all_memory(student_id)
+        procedural = memory.get("procedural_memory", {})
+        
+        if procedural:
+            proc_lines = ["TEACHING PREFERENCES:"]
+            
+            explanation_depth = procedural.get("explanation_depth", "")
+            if explanation_depth:
+                proc_lines.append(f"- Explanation style: {explanation_depth}")
+            
+            joke_frequency = procedural.get("joke_frequency", "")
+            if joke_frequency and joke_frequency != "medium":
+                proc_lines.append(f"- Joke frequency: {joke_frequency}")
+            
+            encouragement_style = procedural.get("encouragement_style", "")
+            if encouragement_style and encouragement_style != "general":
+                proc_lines.append(f"- Encouragement: {encouragement_style}")
+            
+            correction_style = procedural.get("correction_style", "")
+            if correction_style and correction_style != "direct":
+                proc_lines.append(f"- Correction style: {correction_style}")
+            
+            analogy_domains = procedural.get("analogy_domains", [])
+            if analogy_domains:
+                proc_lines.append(f"- Best analogies: {', '.join(analogy_domains[:3])}")
+            
+            trigger_phrases = procedural.get("trigger_phrases", {})
+            if trigger_phrases:
+                motivates = trigger_phrases.get("motivates", [])
+                demotivates = trigger_phrases.get("demotivates", [])
+                if motivates:
+                    proc_lines.append(f"- Motivates them: {', '.join(motivates[:3])}")
+                if demotivates:
+                    proc_lines.append(f"- Demotivates them: {', '.join(demotivates[:3])}")
+            
+            if len(proc_lines) > 1:
+                context_parts.append("\n".join(proc_lines))
+    except Exception as e:
+        logger.error(f"Procedural memory load error for {student_id}: {e}")
+    
+    # ═══════════════════════════════════════════════
+    # 6. LEGACY: LAST SESSION SUMMARY (from DB)
+    # ═══════════════════════════════════════════════
     try:
         last_session = await get_session_summary(student_id)
+        if last_session:
+            subject = last_session.get("subject", "a subject")
+            topic = last_session.get("topic", "a topic")
+            if subject not in ("unknown", "a subject", "") and topic not in ("unknown", "a topic", "discussed", ""):
+                session_line = f"LAST SESSION: {subject} - {topic}."
+                if last_session.get("completed") and last_session.get("score") is not None:
+                    session_line += f" Score: {int(last_session['score'] * 100)}%."
+                context_parts.append(session_line)
     except Exception:
-        last_session = None
-
-    if last_session:
-        subject = last_session.get("subject", "a subject")
-        topic = last_session.get("topic", "a topic")
-        if subject not in ("unknown", "a subject", "") and topic not in ("unknown", "a topic", "discussed", ""):
-            session_line = f"LAST SESSION: {subject} - {topic}."
-            if last_session.get("completed") and last_session.get("score") is not None:
-                session_line += f" Score: {int(last_session['score'] * 100)}%."
-            context_parts.append(session_line)
-
+        pass
+    
+    # ═══════════════════════════════════════════════
+    # 7. LEGACY: STUDENT MEMORY (from DB)
+    # ═══════════════════════════════════════════════
     try:
-        memory = await get_student_memory(student_id)
+        db_memory = await get_student_memory(student_id)
+        if db_memory:
+            struggles = db_memory.get("struggles_with", [])
+            strengths = db_memory.get("strong_in", [])
+            mastered = db_memory.get("topics_mastered", [])
+            sessions_count = db_memory.get("sessions_completed", 0)
+            if struggles:
+                context_parts.append(f"STUDENT STRUGGLES WITH: {', '.join(struggles[-5:])}.")
+            if strengths:
+                context_parts.append(f"STUDENT IS STRONG IN: {', '.join(strengths[-5:])}.")
+            if mastered:
+                context_parts.append(f"TOPICS MASTERED: {', '.join(mastered[-5:])}.")
+            if sessions_count > 0:
+                context_parts.append(f"Sessions completed: {sessions_count}.")
     except Exception:
-        memory = None
+        pass
+    
+    return "MEMORY CONTEXT:\n" + "\n\n".join(context_parts) if context_parts else ""
 
-    if memory:
-        struggles = memory.get("struggles_with", [])
-        strengths = memory.get("strong_in", [])
-        mastered = memory.get("topics_mastered", [])
-        sessions_count = memory.get("sessions_completed", 0)
-        if struggles:
-            context_parts.append(f"STUDENT STRUGGLES WITH: {', '.join(struggles[-5:])}.")
-        if strengths:
-            context_parts.append(f"STUDENT IS STRONG IN: {', '.join(strengths[-5:])}.")
-        if mastered:
-            context_parts.append(f"TOPICS MASTERED: {', '.join(mastered[-5:])}.")
-        if sessions_count > 0:
-            context_parts.append(f"Sessions completed: {sessions_count}.")
 
-    return "MEMORY CONTEXT:\n" + "\n".join(context_parts) if context_parts else ""
+# ═══════════════════════════════════════════════
+# NEW: WORKING MEMORY AUTO-SAVE FUNCTION (P0-C001)
+# ═══════════════════════════════════════════════
+
+async def _save_working_memory_update(
+    student_id: str,
+    response: str,
+    current_topic: Optional[str],
+    text: str
+) -> None:
+    """
+    Auto-save Working Memory after every AI response.
+    
+    Extracts:
+    - active_topic: What we're currently discussing
+    - stuck_on: What the student is confused about
+    - emotional_state: How the student feels
+    - last_question: What Wax just asked
+    - pace: How fast we're going
+    - cliffhanger: Unfinished problem/concept
+    """
+    if student_id.startswith("temp_"):
+        return
+    
+    from brain.siapm_memory import save_working_memory
+    
+    wm_update = {}
+    
+    # Active topic from current conversation
+    if current_topic and current_topic != "unknown":
+        wm_update["active_topic"] = current_topic
+    
+    # Detect confusion from student message
+    confusion_signals = ["don't understand", "confused", "stuck", "lost", "don't get", "huh", "wait"]
+    if any(signal in text.lower() for signal in confusion_signals):
+        wm_update["emotional_state"] = "confused"
+        # Try to extract what they're stuck on
+        for signal in confusion_signals:
+            if signal in text.lower():
+                idx = text.lower().find(signal)
+                context = text[max(0, idx-30):idx+50]
+                wm_update["stuck_on"] = context.strip()
+                break
+    
+    # Detect frustration
+    frustration_signals = ["this is hard", "i give up", "too difficult", "impossible", "i can't"]
+    if any(signal in text.lower() for signal in frustration_signals):
+        wm_update["emotional_state"] = "frustrated"
+    
+    # Detect excitement/engagement
+    excitement_signals = ["i get it", "that makes sense", "oh wow", "cool", "awesome"]
+    if any(signal in text.lower() for signal in excitement_signals):
+        wm_update["emotional_state"] = "engaged"
+    
+    # Extract last question from Wax's response
+    sentences = [s.strip() for s in re.split(r'[.!?]+', response) if s.strip()]
+    if sentences and sentences[-1].endswith("?"):
+        wm_update["last_question"] = sentences[-1]
+    
+    # Detect pace from response length
+    if len(sentences) <= 2:
+        wm_update["pace"] = "fast"
+    elif len(sentences) >= 6:
+        wm_update["pace"] = "slow"
+    else:
+        wm_update["pace"] = "normal"
+    
+    # Detect cliffhanger (unfinished problem)
+    cliffhanger_signals = ["try this", "solve this", "what about", "how about", "next problem"]
+    if any(signal in response.lower() for signal in cliffhanger_signals):
+        # Find the problem/exercise mentioned
+        for signal in cliffhanger_signals:
+            if signal in response.lower():
+                idx = response.lower().find(signal)
+                cliffhanger = response[idx:idx+100].strip()
+                wm_update["cliffhanger"] = cliffhanger
+                break
+    
+    # Only save if we have something to save
+    if wm_update:
+        try:
+            await save_working_memory(student_id, wm_update)
+            logger.debug(f"Working memory updated for {student_id}: {wm_update}")
+        except Exception as e:
+            logger.error(f"Working memory save failed for {student_id}: {e}")
+
 
 # ═══════════════════════════════════════════════
 # QUIZ ENGINE
