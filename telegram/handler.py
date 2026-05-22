@@ -1,12 +1,9 @@
 # Changes made:
-# - Integrated input safety check using check_input_safety (before AI processing)
-# - Integrated output safety check using check_output_safety (after AI response) with regenerative fallback
-# - Replaced _build_memory_context() with version that loads all 5 memory layers
-#   (working memory, observations filtered by thermal score, episodic memory, semantic memory, procedural memory)
-#   and enforces topic continuity.
-# - Added new function _save_working_memory_update() to auto-save working memory after every AI response.
-# - Called _save_working_memory_update() in _handle_ai_conversation() after assistant message is saved and sent.
-# These changes implement P0-C001 (dynamic memory context in AI prompts) and output/input safety layering.
+# - Fixed input safety check to pass student_id=None (student not yet loaded)
+# - Replaced output safety check with dict-based version with regenerative fallback
+# - Integrated new _build_memory_context() with all 5 memory layers
+# - Added _save_working_memory_update() and call it after each response
+# These implement P0-C001 memory context, safety layering, and fix UnboundLocalError.
 
 """
 WaxPrep v2 — Telegram Message Handler
@@ -188,7 +185,8 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
     # ═══════════════════════════════════════════════
     try:
         from brain.safety import check_input_safety
-        safety_result = await check_input_safety(chat_id, text, student.get("id") if student else None)
+        # Student not loaded yet — pass None for student_id
+        safety_result = await check_input_safety(chat_id, text, student_id=None)
         
         if not safety_result["safe"]:
             # Blocked — send refusal, don't call AI
