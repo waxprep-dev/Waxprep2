@@ -1,9 +1,15 @@
 """
-WaxPrep v2 — AI Brain (Enhanced)
+WaxPrep v2 — AI Brain (Enhanced + P1-A Dialectical Support)
 Calls the Groq API with Wax's system prompt and returns the response.
 Includes REAL post-processing enforcement layer — no more "monitoring only."
 
-NEW (P0-B007 + P0-B001):
+NEW (P1-A):
+- Dialectical generation: produces TWO responses (Socratic-cool + Empiric-hot)
+- Register Weaver integration: compresses dual voices into Rupture Interface
+- Dialectical responses are NEVER cached (context-dependent)
+- Imports get_socratic_cool_prompt and get_empiric_hot_prompt from ai.prompts
+
+P0-B007 + P0-B001:
 - Temperature 0.55 (was 0.75) for consistent persona
 - Real output enforcement via output_enforcer.py
 - Persona reinforcement every 5-7 turns
@@ -32,10 +38,15 @@ import random
 import re
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from groq import Groq
 from config.settings import settings
-from ai.prompts import get_wax_system_prompt, get_lite_prompt
+from ai.prompts import (
+    get_wax_system_prompt, 
+    get_lite_prompt,
+    get_socratic_cool_prompt,
+    get_empiric_hot_prompt
+)
 
 # NEW: Import real output enforcer
 from ai.output_enforcer import enforce_output
@@ -83,16 +94,21 @@ def _normalize_for_cache(text: str) -> str:
     text = " ".join(text.split())
     return text
 
-def _build_cache_key(message: str, class_level: str = "SS3", is_practice: bool = False) -> str:
+def _build_cache_key(message: str, class_level: str = "SS3", is_practice: bool = False, is_dialectical: bool = False) -> str:
     """Build a tiered cache key."""
     tier = _get_class_tier(class_level)
     normalized = _normalize_for_cache(message)
-    hashed = hashlib.sha256(normalized.encode()).hexdigest()[:16]  # SHA-256 instead of MD5
+    hashed = hashlib.sha256(normalized.encode()).hexdigest()[:16]
     suffix = ":practice" if is_practice else ""
-    return f"response_cache:{CACHE_VERSION}:{tier}:{hashed}{suffix}"
+    dialectical_flag = ":dialectical" if is_dialectical else ""
+    return f"response_cache:{CACHE_VERSION}:{tier}:{hashed}{suffix}{dialectical_flag}"
 
-def _is_cacheable(message: str) -> bool:
+def _is_cacheable(message: str, is_dialectical: bool = False) -> bool:
     """Determine if a student message should be cached."""
+    # NEVER cache dialectical responses — they are context-dependent
+    if is_dialectical:
+        return False
+        
     msg_lower = message.lower().strip()
     skip_patterns = [
         "hi", "hello", "hey", "good morning", "good evening",
@@ -122,11 +138,11 @@ def _is_cacheable(message: str) -> bool:
         return True
     return False
 
-async def _get_cached_response(message: str, class_level: str = "SS3", is_practice: bool = False) -> Optional[str]:
+async def _get_cached_response(message: str, class_level: str = "SS3", is_practice: bool = False, is_dialectical: bool = False) -> Optional[str]:
     """Check if a cached response exists."""
     try:
         from database.client import redis_client
-        cache_key = _build_cache_key(message, class_level, is_practice)
+        cache_key = _build_cache_key(message, class_level, is_practice, is_dialectical)
         cached = redis_client.get(cache_key)
         if cached:
             cached_str = cached.decode("utf-8") if isinstance(cached, bytes) else cached
@@ -136,11 +152,15 @@ async def _get_cached_response(message: str, class_level: str = "SS3", is_practi
         logger.error(f"Cache read error: {e}")
     return None
 
-async def _cache_response(message: str, response: str, class_level: str = "SS3", is_practice: bool = False) -> None:
+async def _cache_response(message: str, response: str, class_level: str = "SS3", is_practice: bool = False, is_dialectical: bool = False) -> None:
     """Store an AI response in the cache."""
+    # Never cache dialectical responses
+    if is_dialectical:
+        return
+        
     try:
         from database.client import redis_client
-        cache_key = _build_cache_key(message, class_level, is_practice)
+        cache_key = _build_cache_key(message, class_level, is_practice, is_dialectical)
         redis_client.setex(cache_key, CACHE_TTL, response)
         logger.debug(f"Cache SAVED: {message[:50]}...")
     except Exception as e:
@@ -153,12 +173,11 @@ async def _cache_response(message: str, response: str, class_level: str = "SS3",
 def _inject_persona_reinforcement(messages: List[Dict], turn_count: int) -> List[Dict]:
     """
     Inject persona reminder every 5-7 turns to prevent persona drift.
-    
+
     Research (Anthropic 2025): Persona instructions fade after 10 turns.
     Reinforcement every 5-7 turns maintains consistent personality.
     """
     if turn_count > 0 and turn_count % 6 == 0:
-        # Every 6th turn, add a gentle reminder
         reminder = {
             "role": "system",
             "content": (
@@ -168,7 +187,6 @@ def _inject_persona_reinforcement(messages: List[Dict], turn_count: int) -> List
                 "You keep responses to 3-6 sentences. You end with a question."
             )
         }
-        # Insert before the last user message
         messages.insert(-1, reminder)
         logger.debug(f"Injected persona reinforcement at turn {turn_count}")
     return messages
@@ -189,46 +207,34 @@ def _score_response_quality(response: str, current_topic: Optional[str]) -> Dict
         "length": 0.5,
         "engagement": 0.5,
     }
-    
-    # Length score: 3-6 sentences = perfect
+
     sentences = [s for s in re.split(r'[.!?]+', response) if s.strip()]
     if 3 <= len(sentences) <= 6:
         scores["length"] = 1.0
     elif len(sentences) <= 2:
-        scores["length"] = 0.3  # Too short
+        scores["length"] = 0.3
     else:
-        scores["length"] = 0.6  # Too long
-    
-    # Engagement score: ends with question = good
+        scores["length"] = 0.6
+
     if response.strip().endswith("?"):
         scores["engagement"] = 1.0
     elif "?" in response:
         scores["engagement"] = 0.7
     else:
         scores["engagement"] = 0.3
-    
-    # Persona compliance: no banned phrases
+
     from ai.output_enforcer import BANNED_PHRASES
     banned_count = sum(1 for p in BANNED_PHRASES if re.search(p, response.lower()))
     if banned_count == 0:
         scores["persona_compliance"] = 1.0
     else:
         scores["persona_compliance"] = max(0.0, 1.0 - (banned_count * 0.3))
-    
-    # Relevance: mentions topic
+
     if current_topic and current_topic != "unknown":
         topic_mentioned = current_topic.lower().replace("_", " ") in response.lower()
         scores["relevance"] = 1.0 if topic_mentioned else 0.4
-    
+
     return scores
-
-# ═══════════════════════════════════════════════
-# LEGACY: Removed fake enforce_rules and enforce_nigerian_example
-# They are replaced by real enforcement in output_enforcer.py
-# ═══════════════════════════════════════════════
-
-# NOTE: Old enforce_rules() and enforce_nigerian_example() deleted.
-# Real enforcement now happens via enforce_output() after AI generation.
 
 # ═══════════════════════════════════════════════
 # MAIN AI FUNCTION
@@ -240,17 +246,27 @@ async def think(
     conversation_history: list = None,
     recent_subject: str = None,
     context_str: str = '',
-    is_practice: bool = False
+    is_practice: bool = False,
+    is_dialectical: bool = False,
+    dialectical_voice: str = None,
+    topic: str = None,
+    student_position: str = "",
+    contradiction_type: str = "",
 ) -> str:
     """
     Main AI thinking function with REAL enforcement.
-    
-    NEW:
-    - Temperature 0.55 (was 0.75) for consistent persona
-    - Real output enforcement via output_enforcer.py
-    - Persona reinforcement every 6 turns
-    - Response quality scoring
-    - Token usage tracking
+
+    NEW (P1-A):
+    - When is_dialectical=True and dialectical_voice is set, generates a single
+      voice response (Socratic-cool or Empiric-hot) using the dialectical prompt.
+    - Normal mode unchanged: generates one response with standard persona.
+
+    Args:
+        is_dialectical: If True, use dialectical voice prompt instead of standard
+        dialectical_voice: "socratic" or "empiric" — which voice to generate
+        topic: The debate topic (for dialectical mode)
+        student_position: The student's current position in the debate
+        contradiction_type: Type of detected contradiction
     """
     conversation_history = conversation_history or []
     student_id = student.get('id', 'unknown')
@@ -258,7 +274,26 @@ async def think(
     class_level = student.get('class_level', 'SS3')
 
     # Build system prompt
-    if is_practice:
+    if is_dialectical and dialectical_voice:
+        # Use dialectical voice prompt
+        memory_context = context_str if context_str else ""
+        if dialectical_voice == "socratic":
+            system_prompt = get_socratic_cool_prompt(
+                topic=topic or recent_subject or "this topic",
+                student_position=student_position,
+                contradiction_type=contradiction_type,
+                memory_context=memory_context
+            )
+        elif dialectical_voice == "empiric":
+            system_prompt = get_empiric_hot_prompt(
+                topic=topic or recent_subject or "this topic",
+                student_position=student_position,
+                contradiction_type=contradiction_type,
+                memory_context=memory_context
+            )
+        else:
+            system_prompt = get_wax_system_prompt(student, recent_subject, context_str)
+    elif is_practice:
         system_prompt = get_lite_prompt(student, recent_subject, context_str)
     else:
         system_prompt = get_wax_system_prompt(student, recent_subject, context_str)
@@ -281,11 +316,10 @@ async def think(
     turn_count = len([m for m in messages if m.get("role") == "user"])
     messages = _inject_persona_reinforcement(messages, turn_count)
 
-    # Check response cache
-    if _is_cacheable(message):
-        cached_response = await _get_cached_response(message, class_level, is_practice)
+    # Check response cache (skip for dialectical)
+    if _is_cacheable(message, is_dialectical):
+        cached_response = await _get_cached_response(message, class_level, is_practice, is_dialectical)
         if cached_response:
-            # Even cached responses go through enforcement
             enforced = await enforce_output(
                 cached_response,
                 current_topic=recent_subject,
@@ -324,7 +358,7 @@ async def think(
                 model=settings.GROQ_SMART_MODEL,
                 messages=messages,
                 max_tokens=400,
-                temperature=0.55,  # CHANGED: Was 0.75, now 0.55 for consistent persona
+                temperature=0.55,
             )
 
             result = response.choices[0].message.content
@@ -366,9 +400,7 @@ async def think(
         hash_val = int(hashlib.md5(str(student_id).encode()).hexdigest()[:8], 16)
         return fallbacks[hash_val % len(fallbacks)]
 
-    # ═══════════════════════════════════════════════
     # REAL OUTPUT ENFORCEMENT (P0-B001)
-    # ═══════════════════════════════════════════════
     try:
         enforced_response = await enforce_output(
             raw_response,
@@ -378,35 +410,82 @@ async def think(
         )
     except Exception as e:
         logger.error(f"Output enforcement failed: {e}")
-        enforced_response = raw_response  # Fallback to raw if enforcement crashes
+        enforced_response = raw_response
 
     # Score response quality
     quality_scores = _score_response_quality(enforced_response, recent_subject)
     logger.info(f"Response quality for {student_id}: {quality_scores}")
 
-    # Cache the ENFORCED response (not raw)
-    if _is_cacheable(message):
-        await _cache_response(message, enforced_response, class_level, is_practice)
+    # Cache the ENFORCED response (not raw) — skip for dialectical
+    if _is_cacheable(message, is_dialectical):
+        await _cache_response(message, enforced_response, class_level, is_practice, is_dialectical)
 
-    # Track token usage (approximate)
+    # Track token usage
     _track_token_usage(student_id, len(message), len(enforced_response))
 
     return enforced_response
+
+
+async def think_dialectical(
+    message: str,
+    student: dict,
+    topic: str,
+    student_position: str,
+    contradiction_type: str,
+    conversation_history: list = None,
+    context_str: str = '',
+) -> Tuple[str, str]:
+    """
+    Generate BOTH dialectical voices and return them as a tuple.
+
+    This is the main entry point for dialectical debate generation.
+    Calls think() twice — once for Socratic-cool, once for Empiric-hot.
+
+    Returns: (socratic_response, empiric_response)
+    """
+    # Generate Socratic-cool voice
+    socratic_response = await think(
+        message=message,
+        student=student,
+        conversation_history=conversation_history,
+        recent_subject=topic,
+        context_str=context_str,
+        is_dialectical=True,
+        dialectical_voice="socratic",
+        topic=topic,
+        student_position=student_position,
+        contradiction_type=contradiction_type,
+    )
+
+    # Generate Empiric-hot voice
+    empiric_response = await think(
+        message=message,
+        student=student,
+        conversation_history=conversation_history,
+        recent_subject=topic,
+        context_str=context_str,
+        is_dialectical=True,
+        dialectical_voice="empiric",
+        topic=topic,
+        student_position=student_position,
+        contradiction_type=contradiction_type,
+    )
+
+    return socratic_response, empiric_response
+
 
 def _track_token_usage(student_id: str, input_len: int, output_len: int) -> None:
     """Track approximate token usage for cost monitoring."""
     try:
         from database.client import redis_client
-        # Rough estimate: 1 token ≈ 4 characters
         input_tokens = input_len // 4
         output_tokens = output_len // 4
         total = input_tokens + output_tokens
-        
+
         daily_key = f"token_usage:{student_id}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
         redis_client.incrby(daily_key, total)
-        redis_client.expire(daily_key, 86400 * 7)  # Keep for 7 days
-        
-        # Also track globally
+        redis_client.expire(daily_key, 86400 * 7)
+
         global_key = f"token_usage:global:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
         redis_client.incrby(global_key, total)
         redis_client.expire(global_key, 86400 * 7)
