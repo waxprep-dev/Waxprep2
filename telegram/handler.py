@@ -10,6 +10,7 @@ NEW (P1-A):
 - Imported _default_intent from ai.intent_router instead of duplicating
 - Account creation intent now flows through Intent Router, not hard-coded keywords
 - Fetches PIG intimacy score via get_current_intimacy_score() for fast path
+- Thermal-aware phrase fetching via config.constants.get_phrases
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -61,75 +62,10 @@ from brain.state_socket import (
 # ═══════════════════════════════════════════════════════════════════════
 from brain.relational_intimacy import get_current_intimacy_score
 
-# ── Subject name mapping ──────────────────────
-SUBJECT_MAP: Dict[str, str] = {
-    "mathematics": "mathematics", "maths": "mathematics", "math": "mathematics",
-    "english": "english", "english_language": "english",
-    "civic_education": "civic_education", "civic": "civic_education",
-    "computer_studies": "computer_studies", "computer": "computer_studies", "ict": "computer_studies",
-    "data_processing": "data_processing", "data": "data_processing",
-    "physics": "physics", "chemistry": "chemistry", "biology": "biology",
-    "further_mathematics": "further_mathematics", "further mathematics": "further_mathematics",
-    "agricultural_science": "agricultural_science", "agric": "agricultural_science",
-    "health_education": "health_education", "health": "health_education",
-    "physical_education": "physical_education", "physical": "physical_education", "phe": "physical_education",
-    "technical_drawing": "technical_drawing", "technical drawing": "technical_drawing",
-    "food_and_nutrition": "food_and_nutrition", "food & nutrition": "food_and_nutrition",
-    "economics": "economics", "econs": "economics",
-    "commerce": "commerce",
-    "accounting": "accounting", "accounts": "accounting", "financial_accounting": "accounting",
-    "business_studies": "business_studies", "business studies": "business_studies",
-    "marketing": "marketing",
-    "book_keeping": "book_keeping", "book keeping": "book_keeping",
-    "office_practice": "office_practice", "office practice": "office_practice",
-    "insurance": "insurance",
-    "government": "government", "govt": "government",
-    "literature": "literature_in_english",
-    "literature_in_english": "literature_in_english",
-    "literature-in-english": "literature_in_english",
-    "history": "history",
-    "christian_religious_studies": "crs", "crs": "crs",
-    "islamic_religious_studies": "irs", "irs": "irs", "islamic": "irs",
-    "geography": "geography", "geo": "geography",
-    "visual_arts": "visual_arts", "visual arts": "visual_arts", "art": "visual_arts", "fine_art": "visual_arts",
-    "music": "music",
-    "french": "french",
-    "arabic": "arabic",
-    "yoruba": "yoruba", "igbo": "igbo", "hausa": "hausa",
-    "fashion_design": "fashion_design", "fashion design": "fashion_design", "garment_making": "fashion_design",
-    "gsm_repairs": "gsm_repairs", "gsm repairs": "gsm_repairs", "computer_hardware": "gsm_repairs",
-    "solar_installation": "solar_installation", "solar installation": "solar_installation", "solar": "solar_installation",
-    "livestock_farming": "livestock_farming", "livestock farming": "livestock_farming",
-    "beauty_cosmetology": "beauty_cosmetology", "beauty": "beauty_cosmetology", "cosmetology": "beauty_cosmetology",
-    "horticulture": "horticulture", "crop_production": "horticulture",
-}
-
-# ── Fallback subject pools by track ───────────
-TRACK_FALLBACKS: Dict[str, List[str]] = {
-    "science": [
-        "english", "mathematics", "physics", "chemistry", "biology",
-        "further_mathematics", "agricultural_science", "health_education",
-        "physical_education", "technical_drawing", "food_and_nutrition",
-        "computer_studies", "data_processing",
-    ],
-    "commercial": [
-        "english", "mathematics", "economics", "commerce", "accounting",
-        "business_studies", "marketing", "book_keeping", "office_practice",
-        "insurance", "data_processing", "computer_studies",
-    ],
-    "arts": [
-        "english", "mathematics", "government", "literature_in_english",
-        "civic_education", "history", "christian_religious_studies",
-        "islamic_religious_studies", "geography", "visual_arts", "music",
-        "french", "arabic", "yoruba", "igbo", "hausa",
-    ],
-    "trade": [
-        "english", "mathematics", "fashion_design", "gsm_repairs",
-        "solar_installation", "livestock_farming", "beauty_cosmetology",
-        "horticulture", "computer_studies",
-    ],
-    "unknown": ["english", "mathematics", "civic_education"],
-}
+# ═══════════════════════════════════════════════════════════════════════
+# NEW: Living Constants Registry (P1-A thermal-aware phrases)
+# ═══════════════════════════════════════════════════════════════════════
+from config.constants import SUBJECT_MAP, TRACK_FALLBACKS, get_phrases
 
 # TTLs and limits
 QUIZ_TTL_SECONDS = 1800
@@ -141,18 +77,7 @@ PROGRESSIVE_EXTRACTION_INTERVAL = 5
 ACCOUNT_OFFER_COOLDOWN = 86400
 TRIAD_TTL_SECONDS = 3600  # How long a dialectical debate stays active
 
-# Understanding confirmation phrases (English + Pidgin)
-UNDERSTANDING_PHRASES = [
-    "you've got it", "exactly", "you worked that out",
-    "you're right", "well done", "correct", "perfect",
-    "that's it", "you got it", "you understand",
-    "now you're getting it", "you're on a roll",
-    "you don sabi am", "na so e be", "you get am",
-    "e don enter", "correct guy", "correct girl",
-    "you dey try", "na im be that",
-]
-
-# Phrases that indicate a student wants continuity
+# Phrases that indicate a student wants continuity (still static for now)
 CONTINUITY_PHRASES = [
     "will you remember", "can we continue", "come back",
     "tomorrow", "next time", "save this", "keep this",
@@ -314,7 +239,6 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     # ═══════════════════════════════════════════════════════════════════════
     triad_state = await _get_active_triad(student_id)
     if triad_state and _dialectical_available:
-        # Student is in the middle of a dialectical debate
         await _continue_dialectical_debate(chat_id, student, student_id, text, triad_state, conversation_history)
         return
 
@@ -322,9 +246,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     # STEP 1: AI INTENT CLASSIFICATION (ALWAYS FIRST)
     # ═══════════════════════════════════════════════════════════════════════
     try:
-        # Fetch PIG intimacy score using fast path (P0-G + P1-A)
         intimacy_score = await get_current_intimacy_score(student_id)
-
         intent = await classify_intent(text, conversation_history, intimacy_score=float(intimacy_score))
         logger.info(f"Intent classified for {student_id}: {intent['action']} (confidence: {intent['confidence']:.2f})")
     except Exception as e:
@@ -408,14 +330,12 @@ async def _start_dialectical_debate(
     Start a new dialectical debate when dissonance is detected.
     """
     if not _dialectical_available:
-        # Fallback to normal teaching if dialectical socket is missing
         await _handle_ai_conversation(chat_id, student, text, student_id, student.get("name", "Student").split()[0])
         return
 
     topic = intent.get("subject") or intent.get("topic") or "this topic"
     dissonance = intent.get("dissonance", {})
 
-    # Get intimacy score for Schism gating
     intimacy_score = Decimal("0")
     try:
         from brain.relational_intimacy import get_intimacy_manager
@@ -425,7 +345,6 @@ async def _start_dialectical_debate(
     except Exception:
         pass
 
-    # Process through dialectical socket
     result = await process_for_dialectical(
         student_id=student_id,
         message=text,
@@ -435,20 +354,16 @@ async def _start_dialectical_debate(
     )
 
     if not result:
-        # Dissonance detected but socket returned None — fallback to normal
         await _handle_ai_conversation(chat_id, student, text, student_id, student.get("name", "Student").split()[0])
         return
 
-    # Store triad state in Redis for continuation
     triad_state = result.get("triad_state", {})
     await _set_active_triad(student_id, triad_state)
 
-    # Send the Rupture Interface to the student
     rupture = result.get("rupture_interface", "")
     if rupture:
         await send_telegram_message(chat_id, rupture)
 
-    # Log the dialectical event
     logger.info(f"Dialectical debate started for {student_id}: {topic} (score: {dissonance.get('score', 'N/A')})")
 
 
@@ -468,22 +383,17 @@ async def _continue_dialectical_debate(
         await _handle_ai_conversation(chat_id, student, text, student_id, student.get("name", "Student").split()[0])
         return
 
-    # Continue the triad
     result = await continue_triad(triad_state, text)
 
-    # Update triad state
     new_triad_state = result.get("triad_state", {})
     await _set_active_triad(student_id, new_triad_state)
 
-    # Send the next Rupture Interface
     rupture = result.get("rupture_interface", "")
     if rupture:
         await send_telegram_message(chat_id, rupture)
 
-    # Check if debate should end (student has taken a clear stance)
     stance = result.get("student_stance", "undetermined")
     if stance in ["synthetic", "rejecting", "formal_leaning", "vernacular_leaning"]:
-        # Student has chosen a side — end the debate gracefully
         await _clear_active_triad(student_id)
         closing = _generate_debate_closing(stance, student.get("name", "Student").split()[0])
         await send_telegram_message(chat_id, closing)
@@ -584,7 +494,6 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
-    # MIGRATED: Use State Socket instead of direct set_state
     session_context = {
         "subject": recent_subject or "unknown",
         "topic": session_topic or "discussed",
@@ -608,7 +517,6 @@ async def _handle_session_end(
     except Exception:
         pass
 
-    # Session-end observation extraction
     if not student_id.startswith("temp_"):
         try:
             from brain.observations import extract_and_save_observations
@@ -733,7 +641,6 @@ async def _handle_ai_conversation(
     except Exception:
         conversation_history = []
 
-    # MIGRATED: Get current mode from State Socket
     try:
         current_mode = await get_current_mode(student_id)
     except Exception:
@@ -873,7 +780,6 @@ async def _handle_ai_conversation(
                 import random
                 from ai.prompts import CLIFF_EDGE_PROMPTS
 
-                # Determine which prompt set to use based on recent context
                 last_user_msg = None
                 for msg in reversed(conversation_history[-5:]):
                     if msg.get("role") == "user":
@@ -1092,12 +998,13 @@ def _strip_wake_context(context_str: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# SESSION SIGNAL EXTRACTOR
+# SESSION SIGNAL EXTRACTOR (Thermal-aware phrase usage)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _extract_session_signals(
+async def _extract_session_signals(
     message: str, response: str, student: dict,
     conversation_history: list, recent_subject: str,
+    student_id: str = None  # NEW: to fetch thermal state
 ) -> dict:
     """Analyze a session to extract learning signals for the Student Model."""
     signals: Dict[str, Any] = {
@@ -1111,6 +1018,17 @@ def _extract_session_signals(
     msg_lower = message.strip().lower()
     resp_lower = response.strip().lower()
 
+    # Fetch thermal-aware understanding phrases dynamically
+    thermal = "hot"  # default
+    if student_id:
+        try:
+            mode = await get_current_mode(student_id)
+            thermal = "hot" if mode in ("teaching", "chatting", "in_quiz") else "cool"
+        except Exception:
+            pass
+
+    understanding_phrases = get_phrases("understanding", thermal_state=thermal)
+
     if any(phrase in msg_lower for phrase in ["give me an example", "show me"]):
         signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.3
     if any(phrase in msg_lower for phrase in ["just the definition", "be direct", "no examples"]):
@@ -1118,7 +1036,7 @@ def _extract_session_signals(
     if any(phrase in msg_lower for phrase in ["tell me a story", "make it a story"]):
         signals["teaching_style"]["stories"] = signals["teaching_style"].get("stories", 0) + 0.3
 
-    if any(phrase in resp_lower for phrase in UNDERSTANDING_PHRASES):
+    if any(phrase in resp_lower for phrase in understanding_phrases):
         if any(word in resp_lower for word in ["example", "imagine", "think of"]):
             signals["teaching_style"]["examples"] = signals["teaching_style"].get("examples", 0) + 0.1
 
@@ -1374,7 +1292,6 @@ async def _save_working_memory_update(
         if current_topic and current_topic != "unknown":
             wm_update["active_topic"] = current_topic
 
-        # Detect emotional state from student message
         msg_lower = text.lower()
         if any(w in msg_lower for w in ["confused", "i don't get", "i dont get", "lost", "stuck"]):
             wm_update["emotional_state"] = "confused"
@@ -1385,22 +1302,18 @@ async def _save_working_memory_update(
         elif any(w in msg_lower for w in ["bored", "tired", "sleepy", "not interested"]):
             wm_update["emotional_state"] = "bored"
 
-        # Extract last question from response
         sentences = [s.strip() for s in response.split(".") if s.strip()]
         if sentences and sentences[-1].endswith("?"):
             wm_update["last_question"] = sentences[-1]
 
-        # Detect pace from message length
         if len(text.split()) > 50:
             wm_update["pace"] = "fast"
         elif len(text.split()) < 5:
             wm_update["pace"] = "slow"
 
-        # Detect if student is stuck
         if any(w in msg_lower for w in ["stuck", "can't solve", "dont know how", "no idea", "help me start"]):
             wm_update["stuck_on"] = current_topic or "unknown"
 
-        # Detect cliffhanger
         if any(w in response.lower() for w in ["next time", "tomorrow", "we'll continue", "hang on", "not yet"]):
             wm_update["cliffhanger"] = "Session paused mid-topic"
 
@@ -1426,12 +1339,10 @@ async def _start_quiz(
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
 
-    # Normalize subject
     if subject:
         subject = subject.lower().strip()
         subject = SUBJECT_MAP.get(subject, subject)
     else:
-        # Try to infer from conversation
         try:
             from database.conversations import get_history
             conversation_history = await get_history(student_id)
@@ -1439,13 +1350,11 @@ async def _start_quiz(
             conversation_history = []
         subject = _infer_recent_subject(student, conversation_history)
 
-    # Fallback subjects
     if not subject:
         track = student.get("track", "unknown")
         fallback_subjects = TRACK_FALLBACKS.get(track, TRACK_FALLBACKS["unknown"])
         subject = random.choice(fallback_subjects)
 
-    # Get quiz question
     question_data = await _get_quiz_question(student_id, subject, topic)
 
     if not question_data:
@@ -1456,7 +1365,6 @@ async def _start_quiz(
         )
         return
 
-    # Store quiz state in Redis
     quiz_state = {
         "subject": subject,
         "topic": topic,
@@ -1472,7 +1380,6 @@ async def _start_quiz(
         logger.error(f"Failed to save quiz state: {e}")
         return
 
-    # Send question with keyboard
     question_text = question_data.get("question", "")
     options = question_data.get("options", [])
 
@@ -1487,7 +1394,6 @@ async def _start_quiz(
 
 async def _get_quiz_question(student_id: str, subject: str, topic: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Get a quiz question for the student."""
-    # Try JAMB questions first for SS3 students
     try:
         from database.students import get_student_by_id
         student = await get_student_by_id(student_id)
@@ -1500,7 +1406,6 @@ async def _get_quiz_question(student_id: str, subject: str, topic: Optional[str]
         if jamb_question:
             return jamb_question
 
-    # Fallback to AI-generated question
     try:
         from ai.brain import think
         from database.conversations import get_history
@@ -1522,14 +1427,12 @@ async def _get_quiz_question(student_id: str, subject: str, topic: Optional[str]
             is_practice=True
         )
 
-        # Parse AI response into question format
         lines = [l.strip() for l in response.split("\n") if l.strip()]
         if len(lines) >= 5:
             question_text = lines[0]
             options = lines[1:5]
-            correct = 0  # Default to first option
+            correct = 0
 
-            # Try to find correct answer marker
             for i, opt in enumerate(options):
                 if "*" in opt or "(correct)" in opt.lower():
                     correct = i
@@ -1550,12 +1453,10 @@ async def _get_quiz_question(student_id: str, subject: str, topic: Optional[str]
 async def _get_jamb_question(subject: str) -> Optional[Dict[str, Any]]:
     """Get a JAMB past question for the subject."""
     try:
-        # Check cooldown
         cooldown_key = f"jamb_cooldown:{subject}"
         if redis_client.exists(cooldown_key):
             return None
 
-        # Try to load from JSON file
         import os
         data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
         jamb_file = os.path.join(data_dir, "jamb_questions_clean.json")
@@ -1572,7 +1473,6 @@ async def _get_jamb_question(subject: str) -> Optional[Dict[str, Any]]:
 
         question = random.choice(subject_questions)
 
-        # Set cooldown to avoid repetition
         redis_client.setex(cooldown_key, JAMB_CHECK_COOLDOWN, "1")
 
         return {
@@ -1605,7 +1505,6 @@ async def _evaluate_quiz_answer(
     if is_correct:
         score += 1
 
-    # Build feedback message
     name = "Student"
     try:
         from database.students import get_student_by_id
@@ -1622,7 +1521,6 @@ async def _evaluate_quiz_answer(
 
     feedback += f"Score: {score}/{question_number}\n"
 
-    # Check if quiz is complete
     if question_number >= total_questions:
         feedback += f"\nQuiz complete! Final score: {score}/{total_questions}"
         if score == total_questions:
@@ -1635,21 +1533,16 @@ async def _evaluate_quiz_answer(
             feedback += " 📚 Let's review this topic together."
 
         await send_telegram_message(chat_id, feedback)
-
-        # Save quiz result
         await _save_quiz_result(student_id, subject, score, total_questions)
 
-        # Clear quiz state
         try:
             redis_client.delete(f"quiz:{student_id}")
         except Exception:
             pass
     else:
-        # Next question
         feedback += f"Question {question_number + 1} of {total_questions}:"
         await send_telegram_message(chat_id, feedback)
 
-        # Get next question
         next_question = await _get_quiz_question(student_id, subject, quiz_state.get("topic"))
         if next_question:
             quiz_state["current_question"] = next_question
