@@ -736,3 +736,66 @@ async def should_trigger_cliff_edge(student_id: str) -> Tuple[bool, Decimal, Opt
         return (False, score, "No Tier 1 or Tier 2 events in last 10 interactions")
 
     return (True, score, None)
+
+
+async def get_current_intimacy_score(student_id: str) -> Decimal:
+    """
+    Get the current PIG intimacy score for a student.
+    Fast path: checks Redis first, then materialized view, then calculates from events.
+    
+    Returns Decimal score (0.0-10.0+). 
+    0.0 = no relationship data.
+    ≥4.0 = ready for full Schism.
+    <4.0 = muted Schism only.
+    """
+    if not student_id:
+        return Decimal("0")
+    
+    # Fast path: Redis
+    try:
+        from database.client import redis_client
+        key = f"pig:stack:{student_id}"
+        raw = redis_client.get(key)
+        if raw:
+            data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            # Quick parse: just get events and calculate
+            stack = RelationalIntimacyStack.from_dict(data)
+            return stack.current_score()
+    except Exception:
+        pass
+    
+    # Medium path: materialized view (if Redis empty)
+    try:
+        from database.client import supabase
+        result = supabase.table("relational_intimacy_current").select("current_score").eq("student_id", student_id).execute()
+        if result.data and len(result.data) > 0:
+            score_val = result.data[0].get("current_score")
+            if score_val is not None:
+                return Decimal(str(score_val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        pass
+    
+    # Slow path: calculate from events table directly
+    try:
+        from database.client import supabase
+        result = supabase.table("relational_intimacy_events").select("*").eq("student_id", student_id).execute()
+        if result.data:
+            stack = RelationalIntimacyStack(student_id)
+            for row in result.data:
+                try:
+                    event = IntimacyEvent(
+                        tier=row.get("tier", 4),
+                        event_type=row.get("event_type", "unknown"),
+                        text_snippet=row.get("content_preview", "")[:100],
+                        topic=row.get("topic"),
+                        timestamp=datetime.fromisoformat(str(row.get("created_at", "")).replace("Z", "+00:00")) if row.get("created_at") else datetime.now(timezone.utc),
+                        confidence=Decimal(str(row.get("metadata", {}).get("confidence", "1.0"))) if isinstance(row.get("metadata"), dict) else Decimal("1.0"),
+                    )
+                    stack.events.append(event)
+                except Exception:
+                    continue
+            return stack.current_score()
+    except Exception:
+        pass
+    
+    return Decimal("0")
