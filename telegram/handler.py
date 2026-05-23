@@ -1,26 +1,12 @@
-# Changes made:
-# - Fixed input safety check to pass student_id=None (student not yet loaded)
-# - Replaced output safety check with dict-based version with regenerative fallback
-# - Integrated new _build_memory_context() with all 5 memory layers
-# - Added _save_working_memory_update() and call it after each response
-# These implement P0-C001 memory context, safety layering, and fix UnboundLocalError.
-
 """
-WaxPrep v2 — Telegram Message Handler
-Processes incoming Telegram messages. Routes new students to a warm AI conversation,
-registered users to the AI brain. Handles quiz commands and answers.
-Supports callback queries (inline keyboard) AND text-based answers.
+WaxPrep v2 — Telegram Message Handler (State Socket Migration)
 
-Now with AI-First Intent Routing — Every message goes to the AI before any action.
-No more keyword bypasses. Aligned with WaxPrep Foundation Blueprint v1.0.
+MIGRATED: All state operations now go through brain/state_socket.py
+instead of direct brain/state.py calls. This is the Sacred Wall pattern.
 
-Now with Observation Extraction — Wax learns from every conversation.
-Observations extracted progressively (every 5 messages) and at session end.
-Content-addressable deduplication prevents duplicates.
-
-Now with Account Creation Trigger — Wax offers account creation at the right moment:
-trust demonstrated + value received + loss is visible.
+Core files never touch engines directly. They touch Sockets.
 """
+
 import asyncio
 import hashlib
 import json
@@ -34,20 +20,28 @@ from typing import Any, Dict, List, Optional
 from telegram.sender import send_telegram_message, build_quiz_keyboard, answer_callback_query
 from database.client import redis_client
 
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # NEW: AI-First Intent Router (P0-A001)
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 from ai.intent_router import classify_intent
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIGRATED: State Socket replaces direct state.py (P0-F Socket Pattern)
+# ═══════════════════════════════════════════════════════════════════════
+from brain.state_socket import (
+    get_current_mode,
+    set_mode,
+    get_context_for_ai,
+    record_message,
+    on_crash_recovery,
+)
 
 logger = logging.getLogger("waxprep.handler")
 
-# ── Quiz trigger keywords ────────────────────
-# NOTE: These are now FALLBACK ONLY. The intent router handles quiz detection.
-# Kept for emergency fallback if AI classification fails.
+# ── Quiz trigger keywords (FALLBACK ONLY — intent router handles detection) ──
 QUIZ_TRIGGERS = ["quiz", "quiz me", "test me"]
 
-# ── Deferral keywords ─────────────────────────
-# NOTE: These are now FALLBACK ONLY. The intent router handles deferral detection.
+# ── Deferral keywords (FALLBACK ONLY) ──
 DEFERRAL_KEYWORDS = [
     "you pick", "any one", "whatever",
     "up to you", "choose for me", "i don't know what to study",
@@ -59,8 +53,7 @@ DEFERRAL_KEYWORDS = [
     "suggest something", "suggest a topic",
 ]
 
-# ── Session end keywords ─────────────────────
-# NOTE: These are now FALLBACK ONLY. The intent router handles session end detection.
+# ── Session end keywords (FALLBACK ONLY) ──
 SESSION_END_KEYWORDS = [
     "i'm tired", "i am tired", "i'm done", "i am done",
     "good night", "goodnight", "i need a break", "taking a break",
@@ -172,6 +165,7 @@ CONTINUITY_PHRASES = [
     "will you be here", "can i come back",
 ]
 
+
 async def process_telegram_message(chat_id: int, text: str) -> None:
     """Entry point for all Telegram text messages."""
     text = text.strip()[:4000]
@@ -180,16 +174,14 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
 
     logger.debug(f"Processing message from chat_id={chat_id}: {text[:100]}...")
 
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # LAYER 1: INPUT SAFETY CHECK (BEFORE AI)
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     try:
         from brain.safety import check_input_safety
-        # Student not loaded yet — pass None for student_id
         safety_result = await check_input_safety(chat_id, text, student_id=None)
-        
+
         if not safety_result["safe"]:
-            # Blocked — send refusal, don't call AI
             await send_telegram_message(chat_id, safety_result["response"])
             logger.warning(f"Message blocked: {safety_result['reason']} for chat_id={chat_id}")
             return
@@ -211,9 +203,9 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         await _handle_registered_student(chat_id, student, text)
         return
 
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # UNREGISTERED USER — temp student flow
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     temp_id = f"temp_{chat_id}"
     new_student = {
         "id": temp_id,
@@ -225,7 +217,6 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         "current_streak": 0,
     }
 
-    # Load any existing history and recover name so the AI doesn't forget
     try:
         from database.conversations import get_history
         conversation_history = await get_history(temp_id)
@@ -238,71 +229,9 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
             new_student["name"] = recovered_name
             logger.info(f"Recovered name for {temp_id}: {recovered_name}")
 
-    # Route through the full handler stack so temp students get session-end
-    # detection, deferrals, quizzes, account offers, and observation extraction
     await _handle_registered_student(chat_id, new_student, text)
     return
 
-    # ── First conversation for this temp student ──
-    try:
-        from ai.brain import think
-        from database.conversations import save_message
-
-        await save_message(temp_id, "user", text)
-
-        try:
-            conversation_history = await get_history(temp_id)
-        except Exception:
-            conversation_history = []
-
-        context_str = (
-            "This is a new student. You don't know anything about them yet. "
-            "Introduce yourself warmly. Ask their name naturally when it feels right. "
-            "Don't interrogate. Just welcome them and let the conversation flow. "
-            "NEVER say 'Welcome back' to a new student. This is their first conversation."
-        )
-
-        response = await think(
-            message=text,
-            student=new_student,
-            conversation_history=conversation_history,
-            recent_subject=None,
-            context_str=context_str,
-            is_practice=False,
-        )
-
-        try:
-            await save_message(temp_id, "assistant", response)
-        except Exception:
-            pass
-
-        await send_telegram_message(chat_id, response)
-
-        # Name extraction — current message first, then scan recent history
-        extracted_name = _extract_name_from_message(text)
-        if not extracted_name and conversation_history:
-            extracted_name = _extract_name_from_history(conversation_history[-5:])
-
-        if extracted_name:
-            new_student["name"] = extracted_name
-            try:
-                await save_message(
-                    temp_id,
-                    "system",
-                    f"Student introduced themselves as {extracted_name}."
-                )
-            except Exception:
-                pass
-
-        try:
-            timestamp_key = f"last_message_time:{temp_id}"
-            redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.error(f"New student handler failed: {e}", exc_info=True)
-        await send_telegram_message(chat_id, "Hey. I'm Wax. What's your name?")
 
 def _extract_name_from_message(text: str) -> Optional[str]:
     """Try to extract a name from a student's message."""
@@ -324,6 +253,7 @@ def _extract_name_from_message(text: str) -> Optional[str]:
                 return name[0].upper() + name[1:].lower() if len(name) > 1 else name.upper()
     return None
 
+
 def _extract_name_from_history(conversation_history: List[Dict]) -> Optional[str]:
     """Scan conversation history for student name introductions."""
     if not conversation_history:
@@ -340,161 +270,10 @@ def _extract_name_from_history(conversation_history: List[Dict]) -> Optional[str
                 return match.group(1)
     return None
 
-# ═══════════════════════════════════════════════
-# ACCOUNT CREATION TRIGGER
-# ═══════════════════════════════════════════════
 
-def should_offer_account_creation(
-    conversation_history: List[Dict],
-    student_id: str,
-    current_state: str
-) -> bool:
-    """
-    Determine if this is the right moment to offer account creation.
-
-    Three conditions must ALL be true:
-    1. Trust demonstrated: 5+ substantive exchanges
-    2. Value received: At least one confirmed learning moment
-    3. Loss is visible: Continuity concern OR natural session end
-    """
-    if not student_id.startswith("temp_"):
-        return False
-
-    cooldown_key = f"account_offer_cooldown:{student_id}"
-    try:
-        if redis_client.exists(cooldown_key):
-            return False
-    except Exception:
-        pass
-
-    in_progress_key = f"account_creation_in_progress:{student_id}"
-    try:
-        if redis_client.exists(in_progress_key):
-            return False
-    except Exception:
-        pass
-
-    if not conversation_history:
-        return False
-
-    user_messages = [m for m in conversation_history if m.get("role") == "user"]
-    substantive = [
-        m for m in user_messages
-        if len(m.get("content", "").split()) > 2
-        and m.get("content", "").lower().strip() not in (
-            "ok", "okay", "yes", "yeah", "no", "yep", "k", "oh", "hmm",
-            "nothing", "good", "fine", "sure", "cool", "alright",
-        )
-    ]
-    if len(substantive) < 5:
-        return False
-
-    assistant_messages = [m for m in conversation_history if m.get("role") == "assistant"]
-    had_breakthrough = False
-
-    for i, msg in enumerate(assistant_messages):
-        content = msg.get("content", "").lower()
-        if any(phrase in content for phrase in [
-            "you've got it", "exactly", "you worked that out",
-            "you're right", "well done", "correct", "you get",
-            "you understand", "now you're getting", "perfect",
-            "that's it",
-        ]):
-            try:
-                msg_index = conversation_history.index(msg)
-                if msg_index >= 0 and msg_index + 1 < len(conversation_history):
-                    next_msg = conversation_history[msg_index + 1]
-                    if next_msg.get("role") == "user":
-                        next_content = next_msg.get("content", "").lower()
-                        if not any(word in next_content for word in [
-                            "whatever", "i guess", "if you say", "i don't",
-                            "not really", "not sure", "maybe",
-                        ]):
-                            had_breakthrough = True
-                            break
-            except (ValueError, IndexError):
-                pass
-
-    if not had_breakthrough:
-        return False
-
-    last_few_user = [m.get("content", "").lower() for m in user_messages[-5:]]
-    has_continuity_concern = any(
-        phrase in msg
-        for msg in last_few_user
-        for phrase in CONTINUITY_PHRASES
-    )
-
-    is_session_ending = (
-        current_state == "ended"
-        or any(
-            phrase in (user_messages[-1].get("content", "").lower() if user_messages else "")
-            for phrase in SESSION_END_KEYWORDS
-        )
-    )
-
-    if not (has_continuity_concern or is_session_ending):
-        return False
-
-    return True
-
-async def _maybe_offer_account_creation(
-    chat_id: int,
-    student: Dict[str, Any],
-    student_id: str,
-    conversation_history: List[Dict],
-    current_state: str
-) -> bool:
-    """Check if we should offer account creation and send the offer if so."""
-    logger.info(f"ACCOUNT OFFER CHECK: student_id={student_id}, temp={student_id.startswith('temp_')}")
-
-    if not should_offer_account_creation(conversation_history, student_id, current_state):
-        return False
-
-    try:
-        redis_client.setex(f"account_offer_cooldown:{student_id}", ACCOUNT_OFFER_COOLDOWN, "1")
-    except Exception:
-        pass
-
-    name = student.get("name", "Student").split()[0]
-    if name == "Student":
-        for msg in reversed(conversation_history):
-            if msg.get("role") == "user":
-                extracted = _extract_name_from_message(msg.get("content", ""))
-                if extracted:
-                    name = extracted
-                    break
-
-    if current_state == "ended" or any(
-        phrase in conversation_history[-1].get("content", "").lower()
-        for phrase in SESSION_END_KEYWORDS
-    ):
-        offer_message = (
-            f"{name}, before you go — everything we did today? "
-            f"Once you close this chat, it's gone. I won't remember any of it tomorrow.\n\n"
-            f"If you want me to remember you next time, just say *yes*. "
-            f"Takes 10 seconds."
-        )
-    else:
-        offer_message = (
-            f"{name}, you asked if I'll remember everything. "
-            f"Truth is, without an account, I start fresh every time you open this chat.\n\n"
-            f"If you want me to remember you — your name, your subjects, your progress — "
-            f"just say *yes*. Takes 10 seconds."
-        )
-
-    await send_telegram_message(chat_id, offer_message)
-
-    try:
-        redis_client.setex(f"account_creation_offered:{student_id}", 3600, "1")
-    except Exception:
-        pass
-
-    return True
-
-# ═══════════════════════════════════════════════
-# ACCOUNT CREATION HANDLER
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# ACCOUNT CREATION (DISABLED — waiting for friend's research)
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_account_creation_response(
     chat_id: int,
@@ -502,51 +281,9 @@ async def _handle_account_creation_response(
     text: str,
     conversation_history: List[Dict]
 ) -> bool:
-    """Handle a student's response to the account creation offer."""
-    msg_lower = text.strip().lower()
-
-    positive_responses = [
-        "yes", "yeah", "yep", "sure", "ok", "okay", "yes o",
-        "create", "create it", "let's do it", "do it", "go ahead",
-        "how", "what do i do", "tell me", "show me",
-    ]
-
-    if any(msg_lower == resp or msg_lower.startswith(resp) for resp in positive_responses):
-        try:
-            redis_client.setex(f"account_creation_in_progress:{student_id}", 600, "1")
-        except Exception:
-            pass
-
-        try:
-            redis_client.delete(f"account_creation_offered:{student_id}")
-        except Exception:
-            pass
-
-        await send_telegram_message(
-            chat_id,
-            "Pick a code. At least 4 characters. Something you'll remember."
-        )
-        return True
-
-    negative_responses = [
-        "no", "nope", "nah", "not now", "later", "maybe later",
-        "no thanks", "i'm good", "no o",
-    ]
-
-    if any(msg_lower == resp or msg_lower.startswith(resp) for resp in negative_responses):
-        try:
-            redis_client.delete(f"account_creation_offered:{student_id}")
-        except Exception:
-            pass
-
-        await send_telegram_message(
-            chat_id,
-            "No wahala. We'll keep studying — I'm not going anywhere. "
-            "When you're ready, just say *create account*."
-        )
-        return True
-
+    """DISABLED: Account creation flow paused pending research."""
     return False
+
 
 async def _handle_pin_submission(
     chat_id: int,
@@ -554,150 +291,46 @@ async def _handle_pin_submission(
     text: str,
     conversation_history: List[Dict]
 ) -> bool:
-    """Handle a student's PIN submission during account creation."""
-    in_progress_key = f"account_creation_in_progress:{student_id}"
-    try:
-        if not redis_client.exists(in_progress_key):
-            return False
-    except Exception:
-        return False
+    """DISABLED: Account creation flow paused pending research."""
+    return False
 
-    pin = text.strip()
 
-    if len(pin) < 4:
-        await send_telegram_message(
-            chat_id,
-            "Ah ah, make am at least 4 characters. Try again."
-        )
-        return True
-
-    pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-
-    try:
-        from database.students import create_student
-
-        student = await create_student(
-            platform="telegram",
-            platform_user_id=str(chat_id).split("_")[-1] if "_" in str(chat_id) else str(chat_id),
-            name=_extract_name_from_history(conversation_history) or "Student",
-            pin=pin,
-            class_level="unknown",
-            target_exam="unknown",
-            subjects=[],
-            student_subject="",
-            student_state="Nigeria",
-        )
-
-        if not student:
-            await _handle_account_creation_failure(chat_id, student_id)
-            return True
-
-        permanent_id = student.get("id")
-        if not permanent_id:
-            await _handle_account_creation_failure(chat_id, student_id)
-            return True
-
-        from database.migrations import migrate_temp_to_permanent
-        migration_results = await migrate_temp_to_permanent(student_id, permanent_id)
-
-        if not migration_results.get("conversation_history"):
-            logger.critical(
-                f"Conversation migration failed for {student_id} → {permanent_id}"
-            )
-            await _handle_account_creation_failure(chat_id, student_id)
-            return True
-
-        try:
-            redis_client.delete(f"account_creation_in_progress:{student_id}")
-            redis_client.delete(f"account_creation_offered:{student_id}")
-            redis_client.delete(f"account_offer_cooldown:{student_id}")
-        except Exception:
-            pass
-
-        name = student.get("name", "Student")
-        raw_name = name.strip()
-        display_name = raw_name.split()[0] if raw_name else "Student"
-
-        await send_telegram_message(
-            chat_id,
-            f"You're in, {display_name}. 🎉\n\n"
-            f"Your WAX ID: *{student['wax_id']}*\n\n"
-            f"Everything we talked about today? It's all here. I remember all of it."
-        )
-
-        await asyncio.sleep(2)
-
-        await send_telegram_message(
-            chat_id,
-            f"One more thing — write this down. On paper. Not in this chat.\n\n"
-            f"Recovery Code: *{student['recovery_code']}*\n\n"
-            f"If you lose it, I can't get it back for you. That's the only copy."
-        )
-
-        logger.info(f"Account created: {student_id} → {permanent_id} ({display_name})")
-        return True
-
-    except Exception as e:
-        logger.error(f"Account creation failed for {student_id}: {e}")
-        await _handle_account_creation_failure(chat_id, student_id)
-        return True
-
-async def _handle_account_creation_failure(chat_id: int, student_id: str) -> None:
-    """Handle a failed account creation gracefully."""
-
-    logger.error(f"Account creation failed for {student_id}")
-
-    try:
-        redis_client.delete(f"account_creation_in_progress:{student_id}")
-    except Exception:
-        pass
-
-    await send_telegram_message(
-        chat_id,
-        "Omo, network dey misbehave. The account no gree create. But no stress — everything we talk today still dey. We fit try again now, or we continue. Your call."
-    )
-
-# ═══════════════════════════════════════════════
-# NEW: AI-FIRST INTENT ROUTING (P0-A002, P0-A003, P0-A004, P0-A005)
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# AI-FIRST INTENT ROUTING (P0-A002, P0-A003, P0-A004, P0-A005)
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text: str) -> None:
     """
     Route a registered student's message using AI-first intent classification.
-    
     EVERY message goes to the AI first. The AI decides what to do.
-    No more keyword bypasses.
     """
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
-    
+
     # Get conversation history for context
     try:
         from database.conversations import get_history
         conversation_history = await get_history(student_id)
     except Exception:
         conversation_history = []
-    
-    # ═══════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════
     # STEP 1: AI INTENT CLASSIFICATION (ALWAYS FIRST)
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     try:
         intent = await classify_intent(text, conversation_history)
         logger.info(f"Intent classified for {student_id}: {intent['action']} (confidence: {intent['confidence']:.2f})")
     except Exception as e:
         logger.error(f"Intent classification failed: {e}")
-        # Fallback to basic keyword matching only if AI fails completely
         intent = _fallback_intent_classification(text)
-    
+
     action = intent.get("action", "teach")
     confidence = intent.get("confidence", 0.5)
-    
-    # ═══════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════
     # STEP 2: LOW CONFIDENCE → ASK FOR CLARITY
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     if confidence < 0.7 and action != "teach":
-        # If AI is unsure about a non-teaching action, default to teaching
-        # But inject a hint about what the student might want
         hint = ""
         if action == "quiz":
             hint = f"The student might want a quiz"
@@ -708,92 +341,80 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
             hint = "The student might want to end the session. "
         elif action == "defer":
             hint = "The student is deferring topic choice. "
-        
-        # Route to AI conversation with the hint
+
         await _handle_ai_conversation(
             chat_id, student, text, student_id, name,
             intent_hint=hint, suggested_action=action
         )
         return
-    
-    # ═══════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════
     # STEP 3: ROUTE BASED ON AI'S DECISION
-    # ═══════════════════════════════════════════════
-    
-    # QUIZ: AI detected quiz intent with high confidence
+    # ═══════════════════════════════════════════════════════════════════════
+
     if action == "quiz":
         subject = intent.get("subject")
         topic = intent.get("topic")
         await _start_quiz(chat_id, student, text, subject=subject, topic=topic)
         return
-    
-    # END SESSION: AI detected session end with high confidence
+
     if action == "end_session":
         await _handle_session_end(chat_id, student, text, student_id, name, text.lower())
         return
-    
-    # DEFERRAL: AI detected deferral with high confidence
+
     if action == "defer":
         await _handle_deferral(chat_id, student, student_id, name, text)
         return
-    
-    # EMOTIONAL SUPPORT: AI detected student needs support
+
     if action == "emotional_support":
-        # Route through AI conversation with emotional support context
         await _handle_ai_conversation(
             chat_id, student, text, student_id, name,
             intent_hint="The student needs emotional support. Be empathetic, validate their feelings, then gently guide back to actionable steps."
         )
         return
-    
-    # GREETING: Simple greeting
+
     if action == "greeting":
-        # Let the AI handle it naturally
         await _handle_ai_conversation(chat_id, student, text, student_id, name)
         return
-    
-    # DEFAULT: TEACH — Let the AI handle the conversation
+
+    # DEFAULT: TEACH
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
 
 def _fallback_intent_classification(text: str) -> dict:
-    """
-    Emergency fallback if the AI intent classifier fails completely.
-    Uses basic keyword matching ONLY as last resort.
-    """
+    """Emergency fallback if the AI intent classifier fails completely."""
     msg_lower = text.lower().strip()
-    
+
     if any(w in msg_lower for w in ["quiz", "test me", "test my"]):
-        return {"action": "quiz", "subject": None, "topic": None, 
+        return {"action": "quiz", "subject": None, "topic": None,
                 "confidence": 0.5, "student_emotion": "neutral", "context_aware": False}
-    
+
     if any(w in msg_lower for w in ["bye", "goodnight", "good night", "i'm done", "i am done"]):
         return {"action": "end_session", "subject": None, "topic": None,
                 "confidence": 0.5, "student_emotion": "neutral", "context_aware": False}
-    
+
     if any(w in msg_lower for w in ["you pick", "choose for me", "whatever", "surprise me"]):
         return {"action": "defer", "subject": None, "topic": None,
                 "confidence": 0.5, "student_emotion": "neutral", "context_aware": False}
-    
+
     if any(w in msg_lower for w in ["hi", "hello", "hey", "good morning", "good evening"]):
         return {"action": "greeting", "subject": None, "topic": None,
                 "confidence": 0.5, "student_emotion": "neutral", "context_aware": False}
-    
+
     return {"action": "teach", "subject": None, "topic": None,
             "confidence": 0.5, "student_emotion": "neutral", "context_aware": False}
 
 
-# ═══════════════════════════════════════════════
-# SESSION END HANDLER
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# SESSION END HANDLER (MIGRATED to State Socket)
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_session_end(
     chat_id: int, student: dict, text: str,
     student_id: str, name: str, msg_lower: str
 ) -> None:
-    """Handle natural session endings with observation extraction."""
+    """Handle natural session endings with State Socket."""
     from ai.brain import think
-    from brain.state import get_state, set_state
     from database.conversations import get_history, save_message, save_session_summary
 
     try:
@@ -831,41 +452,21 @@ async def _handle_session_end(
 
     await send_telegram_message(chat_id, response)
 
-    # Natural pause before account offer so goodbye and offer are separate messages
-    await asyncio.sleep(1.5)
-
-    session_struggles = []
-
-    struggle_keywords = ["confused", "don't understand", "struggling", "hard", "difficult"]
-    for msg in conversation_history[-10:]:
-        if msg.get("role") == "user":
-            content = msg.get("content", "").lower()
-            for kw in struggle_keywords:
-                if kw in content:
-                    idx = content.find(kw)
-                    before = content[max(0, idx-15):idx]
-                    negated = any(neg in before for neg in [
-                        "not ", "isn't ", "wasn't ", "no longer ", "not as ", "don't ",
-                    ])
-                    if not negated and session_topic and session_topic not in session_struggles:
-                        session_struggles.append(session_topic)
-                        break
-
+    # MIGRATED: Use State Socket instead of direct set_state
     session_context = {
         "subject": recent_subject or "unknown",
         "topic": session_topic or "discussed",
         "completed": False,
         "score": None,
-        "struggled_with": session_struggles,
+        "struggled_with": [],
     }
 
-    try:
-        await set_state(student_id, "ended",
-            reason=f"Student ended session: {msg_lower[:50]}",
-            session_context=session_context,
-        )
-    except Exception:
-        pass
+    await set_mode(
+        student_id=student_id,
+        mode="ended",
+        confidence=1.0,
+        metadata={"reason": f"Student ended session: {msg_lower[:50]}", "session_context": session_context}
+    )
 
     try:
         await save_session_summary(student_id, {
@@ -891,18 +492,10 @@ async def _handle_session_end(
         except Exception as e:
             logger.error(f"Session-end extraction trigger failed: {e}")
 
-    # Account creation offer for temp students at session end
-    if student_id.startswith("temp_"):
-        try:
-            await _maybe_offer_account_creation(
-                chat_id=chat_id,
-                student=student,
-                student_id=student_id,
-                conversation_history=conversation_history,
-                current_state="ended",
-            )
-        except Exception as e:
-            logger.error(f"Account offer at session end failed: {e}")
+    # DISABLED: Account creation offer (waiting for research)
+    # if student_id.startswith("temp_"):
+    #     await _maybe_offer_account_creation(...)
+
 
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
     """Extract the current topic from recent conversation history."""
@@ -936,16 +529,15 @@ def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
                     return subject_display
     return "discussed"
 
-# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
 # DEFERRAL HANDLER
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_deferral(
     chat_id: int, student: dict, student_id: str, name: str, text: str
 ) -> None:
-    """Handle when a student defers or asks to change topic.
-    Routes through the AI with a deferral whisper instead of hardcoded scripts.
-    """
+    """Handle when a student defers or asks to change topic."""
     deferral_key = f"deferral_count:{student_id}"
     deferral_count = 0
     try:
@@ -963,7 +555,6 @@ async def _handle_deferral(
     except Exception:
         pass
 
-    # Inject whisper for the AI
     whisper = (
         f"The student is deferring topic choice (deferral count: {deferral_count}). "
         f"Pick a subject for them based on their conversation history. "
@@ -975,12 +566,12 @@ async def _handle_deferral(
     except Exception as e:
         logger.error(f"Failed to inject deferral whisper: {e}")
 
-    # Route to AI conversation handler so Wax responds naturally
     await _handle_ai_conversation(chat_id, student, text, student_id, name)
 
-# ═══════════════════════════════════════════════
-# AI CONVERSATION HANDLER
-# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
+# AI CONVERSATION HANDLER (MIGRATED to State Socket)
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_ai_conversation(
     chat_id: int,
@@ -992,12 +583,9 @@ async def _handle_ai_conversation(
     suggested_action: str = ""
 ) -> None:
     """
-    Process a student message through the AI brain with progressive observation extraction.
-    
-    NEW: Supports intent hints from the intent router for better context.
+    Process a student message through the AI brain with State Socket integration.
     """
     from ai.brain import think
-    from brain.state import get_state, set_state
     from database.conversations import get_history, save_message
 
     try:
@@ -1016,12 +604,11 @@ async def _handle_ai_conversation(
     except Exception:
         conversation_history = []
 
+    # MIGRATED: Get current mode from State Socket
     try:
-        current_state = await get_state(student_id)
-        if not current_state:
-            current_state = "idle"
+        current_mode = await get_current_mode(student_id)
     except Exception:
-        current_state = "idle"
+        current_mode = "idle"
 
     recent_subject = _infer_recent_subject(student, conversation_history)
     current_topic = recent_subject or "unknown"
@@ -1031,7 +618,7 @@ async def _handle_ai_conversation(
     except Exception:
         context_str = ""
 
-    # Check for deferral whisper injected by _handle_deferral
+    # Check for deferral whisper
     whisper_key = f"waxprep:deferral_whisper:{student_id}"
     try:
         whisper_raw = redis_client.get(whisper_key)
@@ -1045,7 +632,7 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # NEW: Add intent hint from the intent router
+    # Add intent hint from the intent router
     if intent_hint:
         hint_text = f"INTENT HINT: {intent_hint}"
         if suggested_action:
@@ -1054,6 +641,16 @@ async def _handle_ai_conversation(
             context_str = hint_text + "\n\n" + context_str
         else:
             context_str = hint_text
+
+    # MIGRATED: Get state context from Socket for AI injection
+    try:
+        state_context = await get_context_for_ai(student_id)
+        if context_str:
+            context_str = state_context + "\n\n" + context_str
+        else:
+            context_str = state_context
+    except Exception:
+        pass
 
     # Session priming: skip for temp students
     is_temp = student_id.startswith("temp_")
@@ -1069,29 +666,9 @@ async def _handle_ai_conversation(
         else:
             context_str = _strip_wake_context(context_str)
 
-    # Account creation flow for temp students
-    if is_temp:
-        try:
-            if redis_client.exists(f"account_creation_offered:{student_id}"):
-                handled = await _handle_account_creation_response(
-                    chat_id=chat_id,
-                    student_id=student_id,
-                    text=text,
-                    conversation_history=conversation_history,
-                )
-                if handled:
-                    return
-            elif redis_client.exists(f"account_creation_in_progress:{student_id}"):
-                handled = await _handle_pin_submission(
-                    chat_id=chat_id,
-                    student_id=student_id,
-                    text=text,
-                    conversation_history=conversation_history,
-                )
-                if handled:
-                    return
-        except Exception as e:
-            logger.error(f"Account creation flow error: {e}")
+    # DISABLED: Account creation flow
+    # if is_temp:
+    #     ... (account creation logic removed)
 
     # Progressive observation extraction
     if not is_temp:
@@ -1123,7 +700,7 @@ async def _handle_ai_conversation(
         except Exception as e:
             logger.error(f"Student model load failed: {e}", exc_info=True)
 
-    is_practice = current_state in ("in_practice", "chatting", "idle", "paused")
+    is_practice = current_mode in ("teaching", "chatting", "idle", "paused")
 
     try:
         response = await think(
@@ -1136,16 +713,13 @@ async def _handle_ai_conversation(
         logger.error(f"AI brain error: {e}", exc_info=True)
         response = f"Ah, my brain just froze for a second, {name}. Can you try again?"
 
-    # ═══════════════════════════════════════════════
     # LAYER 2: OUTPUT SAFETY CHECK (AFTER AI)
-    # ═══════════════════════════════════════════════
     try:
         from brain.safety import check_output_safety
         output_check = await check_output_safety(response, context=context_str)
-        
+
         if not output_check["safe"]:
             logger.warning(f"AI response blocked: {output_check['reason']}")
-            # Regenerate with stricter prompt
             try:
                 strict_context = context_str + "\n\nSTRICT MODE: Do not give away answers. Guide with questions only."
                 response = await think(
@@ -1170,7 +744,7 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # NEW: Auto-save Working Memory after every response (P0-C001)
+    # Auto-save Working Memory
     try:
         await _save_working_memory_update(
             student_id=student_id,
@@ -1181,54 +755,19 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Working memory auto-save failed: {e}")
 
+    # MIGRATED: Record message in State Socket for future mind mirror
     try:
-        from database.conversations import save_session_summary
-        user_msg_count = sum(1 for m in conversation_history[-10:] if m.get("role") == "user")
-        if user_msg_count >= 2:
-            session_topic = _extract_topic_from_history(conversation_history)
-            if response:
-                for keyword in [
-                    "Today:", "today:", "Let's learn about", "let's learn about",
-                    "Let's focus on", "let's focus on", "Let's dive into", "let's dive into",
-                    "you were doing well with", "You were doing well with",
-                    "we covered", "We covered",
-                ]:
-                    if keyword in response:
-                        parts = response.split(keyword, 1)
-                        if len(parts) > 1:
-                            extracted = parts[1].strip().split(".")[0].strip()[:50]
-                            if extracted and len(extracted) > 2:
-                                session_topic = extracted
-                                break
-            await save_session_summary(student_id, {
-                "subject": recent_subject or "unknown",
-                "topic": session_topic,
-                "completed": False, "score": None,
-                "struggled_with": [], "ended_at": None
-            })
+        await record_message(student_id, "user", text)
+        await record_message(student_id, "assistant", response)
     except Exception:
         pass
 
-    if _pending_model_update is not None and _student_model_available:
-        try:
-            session_signals = _extract_session_signals(
-                message=text, response=response, student=student,
-                conversation_history=conversation_history,
-                recent_subject=recent_subject,
-            )
-            _pending_model_update.update_teaching_style(session_signals)
-            _pending_model_update.update_example_domains(session_signals)
-            _pending_model_update.update_communication_style(session_signals)
-            _pending_model_update.update_competence(session_signals)
-            await save_student_model(_pending_model_update)
-        except Exception as e:
-            logger.error(f"Student model update failed: {e}", exc_info=True)
-
+    # MIGRATED: Update state via Socket
     try:
-        if current_state == "idle":
-            await set_state(student_id, "chatting", reason="First message")
-        elif current_state == "paused":
-            await set_state(student_id, "chatting", reason="Returned from pause")
+        if current_mode == "idle":
+            await set_mode(student_id, "chatting", confidence=1.0, metadata={"reason": "First message"})
+        elif current_mode == "paused":
+            await set_mode(student_id, "chatting", confidence=1.0, metadata={"reason": "Returned from pause"})
     except Exception:
         pass
 
@@ -1238,22 +777,10 @@ async def _handle_ai_conversation(
     except Exception:
         pass
 
-    # Account creation offer for temp students (mid-conversation)
-    if is_temp:
-        try:
-            await _maybe_offer_account_creation(
-                chat_id=chat_id,
-                student=student,
-                student_id=student_id,
-                conversation_history=conversation_history,
-                current_state=current_state,
-            )
-        except Exception as e:
-            logger.error(f"Account offer check failed: {e}")
 
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # SESSION PRIMING — wake detection
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _detect_session_gap(student_id: str) -> bool:
     """Check if enough time has passed to treat this as a new session wake."""
@@ -1270,6 +797,7 @@ async def _detect_session_gap(student_id: str) -> bool:
         return False
     except Exception:
         return False
+
 
 async def _build_wake_context(student_id: str) -> str:
     """Build context for when a student returns after a gap."""
@@ -1309,6 +837,7 @@ async def _build_wake_context(student_id: str) -> str:
 
     return "WAKE CONTEXT:\n" + "\n".join(f"- {p}" for p in parts) if parts else ""
 
+
 def _strip_wake_context(context_str: str) -> str:
     """Remove any wake context markers from a context string."""
     if not context_str:
@@ -1327,9 +856,10 @@ def _strip_wake_context(context_str: str) -> str:
             filtered.append(line)
     return "\n".join(filtered).strip()
 
-# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
 # SESSION SIGNAL EXTRACTOR
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 def _extract_session_signals(
     message: str, response: str, student: dict,
@@ -1400,20 +930,19 @@ def _extract_session_signals(
 
     return signals
 
-# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
 # SUBJECT INFERENCE
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Dict]) -> Optional[str]:
     """Infer what subject the student is currently discussing."""
-    # Scan recent assistant messages for subject mentions
     for msg in reversed(conversation_history[-10:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
             for subject in SUBJECT_MAP:
                 if subject.replace("_", " ").lower() in content.lower():
                     return subject
-    # Scan last 5 assistant messages more specifically (Fix 5)
     for msg in reversed(conversation_history[-5:]):
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
@@ -1429,83 +958,69 @@ def _infer_recent_subject(student: Dict[str, Any], conversation_history: List[Di
         return subjects[0]
     return None
 
-# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
 # MEMORY CONTEXT BUILDER
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _build_memory_context(student_id: str) -> str:
-    """
-    Build memory context for the AI prompt.
-    
-    NEW (P0-C001): Loads Working Memory, filters observations by thermal score,
-    and enforces topic continuity. The AI now knows what the student is currently
-    studying, how confused they are, and what emotional state they're in.
-    """
+    """Build memory context for the AI prompt with all 5 memory layers."""
     if student_id.startswith("temp_"):
         return ""
-    
+
     from database.conversations import get_session_summary, get_student_memory
     from brain.siapm_memory import load_all_memory
-    
+
     context_parts: List[str] = []
-    
-    # ═══════════════════════════════════════════════
-    # 1. WORKING MEMORY (HIGHEST PRIORITY)
-    # ═══════════════════════════════════════════════
+
+    # 1. WORKING MEMORY
     try:
         memory = await load_all_memory(student_id)
         working_memory = memory.get("working_memory", {})
-        
+
         if working_memory:
             wm_lines = ["CURRENT SESSION STATE:"]
-            
             active_topic = working_memory.get("active_topic", "unknown")
             if active_topic and active_topic != "unknown":
                 wm_lines.append(f"- Active topic: {active_topic}")
-            
+
             stuck_on = working_memory.get("stuck_on", "")
             if stuck_on:
                 wm_lines.append(f"- Student is stuck on: {stuck_on}")
-            
+
             emotional_state = working_memory.get("emotional_state", "neutral")
             if emotional_state and emotional_state != "neutral":
                 wm_lines.append(f"- Emotional state: {emotional_state}")
-            
+
             last_question = working_memory.get("last_question", "")
             if last_question:
                 wm_lines.append(f"- Last question asked: {last_question}")
-            
+
             pace = working_memory.get("pace", "normal")
             if pace and pace != "normal":
                 wm_lines.append(f"- Pace: {pace}")
-            
+
             cliffhanger = working_memory.get("cliffhanger", "")
             if cliffhanger:
                 wm_lines.append(f"- Unfinished: {cliffhanger}")
-            
+
             if len(wm_lines) > 1:
                 context_parts.append("\n".join(wm_lines))
-                
-                # TOPIC CONTINUITY INSTRUCTION
-                # This prevents the AI from drifting to random topics
-                if active_topic and active_topic != "unknown":
-                    context_parts.append(
-                        f"TOPIC CONTINUITY: You are currently discussing {active_topic}. "
-                        f"Stay on this topic unless the student explicitly asks to switch. "
-                        f"Do not introduce new subjects without checking if the student wants to move on."
-                    )
+
+            if active_topic and active_topic != "unknown":
+                context_parts.append(
+                    f"TOPIC CONTINUITY: You are currently discussing {active_topic}. "
+                    f"Stay on this topic unless the student explicitly asks to switch. "
+                    f"Do not introduce new subjects without checking if the student wants to move on."
+                )
     except Exception as e:
         logger.error(f"Working memory load error for {student_id}: {e}")
-    
-    # ═══════════════════════════════════════════════
+
     # 2. OBSERVATIONS (FILTERED BY THERMAL SCORE)
-    # ═══════════════════════════════════════════════
     try:
         memory = memory if 'memory' in locals() else await load_all_memory(student_id)
         observations = memory.get("observations", [])
-        
-        # Filter: Only high-thermal observations (emotionally significant)
-        # AND relevant to current topic
+
         relevant_obs = []
         for obs in observations:
             thermal_score = obs.get("thermal_score", 0)
@@ -1514,44 +1029,35 @@ async def _build_memory_context(student_id: str) -> str:
                     thermal_score = float(thermal_score)
                 except (ValueError, TypeError):
                     thermal_score = 0
-            
-            # Only load observations with thermal_score > 30
+
             if thermal_score > 30:
                 surface_value = obs.get("surface_value", obs.get("content", ""))
                 provenance = obs.get("provenance", "EXTRACTED")
-                
-                # Mark provenance: VERIFIED = no marker, INFERRED/EXTRACTED = "~"
                 marker = ""
                 if provenance in ("INFERRED", "EXTRACTED"):
                     marker = "~"
                 elif provenance == "UNCERTAIN":
                     marker = "?"
-                
                 relevant_obs.append(f"{marker}{surface_value}")
-        
-        # Max 10 observations to prevent context bloat
+
         if relevant_obs:
             context_parts.append("STUDENT OBSERVATIONS:\n" + "\n".join(relevant_obs[:10]))
     except Exception as e:
         logger.error(f"Observation filtering error for {student_id}: {e}")
-    
-    # ═══════════════════════════════════════════════
-    # 3. EPISODIC MEMORY (LAST 3 SESSIONS, WEIGHTED)
-    # ═══════════════════════════════════════════════
+
+    # 3. EPISODIC MEMORY (LAST 3 SESSIONS)
     try:
         memory = memory if 'memory' in locals() else await load_all_memory(student_id)
         episodic = memory.get("episodic_memory", [])
-        
-        # Only load last 3 sessions (not all 10)
         recent_episodic = episodic[-3:] if len(episodic) > 3 else episodic
-        
+
         for session in recent_episodic:
             session_date = session.get("date", "recent")
             topics = session.get("topics", [])
             victories = session.get("victories", [])
             struggles = session.get("struggles", [])
             emotional_arc = session.get("emotional_arc", "")
-            
+
             parts = []
             if topics:
                 parts.append(f"Topics: {', '.join(topics[:3])}")
@@ -1561,22 +1067,18 @@ async def _build_memory_context(student_id: str) -> str:
                 parts.append(f"Struggled with: {', '.join(struggles[:2])}")
             if emotional_arc:
                 parts.append(f"Mood: {emotional_arc}")
-            
+
             if parts:
                 context_parts.append(f"SESSION ({session_date}): {' | '.join(parts)}")
     except Exception as e:
         logger.error(f"Episodic memory load error for {student_id}: {e}")
-    
-    # ═══════════════════════════════════════════════
-    # 4. SEMANTIC MEMORY (VERIFIED FACTS ONLY)
-    # ═══════════════════════════════════════════════
+
+    # 4. SEMANTIC MEMORY
     try:
         memory = memory if 'memory' in locals() else await load_all_memory(student_id)
         semantic = memory.get("semantic_memory", {})
-        
         semantic_lines = []
-        
-        # Identity traits (VERIFIED)
+
         identity = semantic.get("identity_traits", {})
         if identity:
             for key, value in identity.items():
@@ -1586,11 +1088,9 @@ async def _build_memory_context(student_id: str) -> str:
                 else:
                     val = value
                     prov = "EXTRACTED"
-                
                 marker = "" if prov == "VERIFIED" else "~"
                 semantic_lines.append(f"{marker}{key}: {val}")
-        
-        # Learning style (INFERRED — marked with ~)
+
         learning_style = semantic.get("learning_style", {})
         if learning_style:
             for key, value in learning_style.items():
@@ -1599,8 +1099,7 @@ async def _build_memory_context(student_id: str) -> str:
                 else:
                     val = value
                 semantic_lines.append(f"~{key}: {val}")
-        
-        # Career goals (VERIFIED if student stated)
+
         career_goals = semantic.get("career_goals", {})
         if career_goals:
             for key, value in career_goals.items():
@@ -1612,8 +1111,7 @@ async def _build_memory_context(student_id: str) -> str:
                     prov = "EXTRACTED"
                 marker = "" if prov == "VERIFIED" else "~"
                 semantic_lines.append(f"{marker}Goal: {val}")
-        
-        # Mastered topics
+
         mastered = semantic.get("mastered_topics", {})
         if mastered:
             mastered_list = []
@@ -1625,8 +1123,7 @@ async def _build_memory_context(student_id: str) -> str:
                     mastered_list.append(topic)
             if mastered_list:
                 semantic_lines.append(f"Mastered: {', '.join(mastered_list[:5])}")
-        
-        # Struggling topics
+
         struggling = semantic.get("struggling_topics", {})
         if struggling:
             struggling_list = []
@@ -1638,42 +1135,39 @@ async def _build_memory_context(student_id: str) -> str:
                     struggling_list.append(topic)
             if struggling_list:
                 semantic_lines.append(f"Struggling: {', '.join(struggling_list[:5])}")
-        
+
         if semantic_lines:
             context_parts.append("STUDENT PROFILE:\n" + "\n".join(semantic_lines))
     except Exception as e:
         logger.error(f"Semantic memory load error for {student_id}: {e}")
-    
-    # ═══════════════════════════════════════════════
-    # 5. PROCEDURAL MEMORY (HOW TO TEACH THIS STUDENT)
-    # ═══════════════════════════════════════════════
+
+    # 5. PROCEDURAL MEMORY
     try:
         memory = memory if 'memory' in locals() else await load_all_memory(student_id)
         procedural = memory.get("procedural_memory", {})
-        
+
         if procedural:
             proc_lines = ["TEACHING PREFERENCES:"]
-            
             explanation_depth = procedural.get("explanation_depth", "")
             if explanation_depth:
                 proc_lines.append(f"- Explanation style: {explanation_depth}")
-            
+
             joke_frequency = procedural.get("joke_frequency", "")
             if joke_frequency and joke_frequency != "medium":
                 proc_lines.append(f"- Joke frequency: {joke_frequency}")
-            
+
             encouragement_style = procedural.get("encouragement_style", "")
             if encouragement_style and encouragement_style != "general":
                 proc_lines.append(f"- Encouragement: {encouragement_style}")
-            
+
             correction_style = procedural.get("correction_style", "")
             if correction_style and correction_style != "direct":
                 proc_lines.append(f"- Correction style: {correction_style}")
-            
+
             analogy_domains = procedural.get("analogy_domains", [])
             if analogy_domains:
                 proc_lines.append(f"- Best analogies: {', '.join(analogy_domains[:3])}")
-            
+
             trigger_phrases = procedural.get("trigger_phrases", {})
             if trigger_phrases:
                 motivates = trigger_phrases.get("motivates", [])
@@ -1682,15 +1176,13 @@ async def _build_memory_context(student_id: str) -> str:
                     proc_lines.append(f"- Motivates them: {', '.join(motivates[:3])}")
                 if demotivates:
                     proc_lines.append(f"- Demotivates them: {', '.join(demotivates[:3])}")
-            
+
             if len(proc_lines) > 1:
                 context_parts.append("\n".join(proc_lines))
     except Exception as e:
         logger.error(f"Procedural memory load error for {student_id}: {e}")
-    
-    # ═══════════════════════════════════════════════
-    # 6. LEGACY: LAST SESSION SUMMARY (from DB)
-    # ═══════════════════════════════════════════════
+
+    # 6. LEGACY: LAST SESSION SUMMARY
     try:
         last_session = await get_session_summary(student_id)
         if last_session:
@@ -1703,10 +1195,8 @@ async def _build_memory_context(student_id: str) -> str:
                 context_parts.append(session_line)
     except Exception:
         pass
-    
-    # ═══════════════════════════════════════════════
-    # 7. LEGACY: STUDENT MEMORY (from DB)
-    # ═══════════════════════════════════════════════
+
+    # 7. LEGACY: STUDENT MEMORY
     try:
         db_memory = await get_student_memory(student_id)
         if db_memory:
@@ -1724,13 +1214,13 @@ async def _build_memory_context(student_id: str) -> str:
                 context_parts.append(f"Sessions completed: {sessions_count}.")
     except Exception:
         pass
-    
+
     return "MEMORY CONTEXT:\n" + "\n\n".join(context_parts) if context_parts else ""
 
 
-# ═══════════════════════════════════════════════
-# NEW: WORKING MEMORY AUTO-SAVE FUNCTION (P0-C001)
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# WORKING MEMORY AUTO-SAVE
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _save_working_memory_update(
     student_id: str,
@@ -1738,75 +1228,55 @@ async def _save_working_memory_update(
     current_topic: Optional[str],
     text: str
 ) -> None:
-    """
-    Auto-save Working Memory after every AI response.
-    
-    Extracts:
-    - active_topic: What we're currently discussing
-    - stuck_on: What the student is confused about
-    - emotional_state: How the student feels
-    - last_question: What Wax just asked
-    - pace: How fast we're going
-    - cliffhanger: Unfinished problem/concept
-    """
+    """Auto-save Working Memory after every AI response."""
     if student_id.startswith("temp_"):
         return
-    
+
     from brain.siapm_memory import save_working_memory
-    
+
     wm_update = {}
-    
-    # Active topic from current conversation
+
     if current_topic and current_topic != "unknown":
         wm_update["active_topic"] = current_topic
-    
-    # Detect confusion from student message
+
     confusion_signals = ["don't understand", "confused", "stuck", "lost", "don't get", "huh", "wait"]
     if any(signal in text.lower() for signal in confusion_signals):
         wm_update["emotional_state"] = "confused"
-        # Try to extract what they're stuck on
         for signal in confusion_signals:
             if signal in text.lower():
                 idx = text.lower().find(signal)
                 context = text[max(0, idx-30):idx+50]
                 wm_update["stuck_on"] = context.strip()
                 break
-    
-    # Detect frustration
+
     frustration_signals = ["this is hard", "i give up", "too difficult", "impossible", "i can't"]
     if any(signal in text.lower() for signal in frustration_signals):
         wm_update["emotional_state"] = "frustrated"
-    
-    # Detect excitement/engagement
+
     excitement_signals = ["i get it", "that makes sense", "oh wow", "cool", "awesome"]
     if any(signal in text.lower() for signal in excitement_signals):
         wm_update["emotional_state"] = "engaged"
-    
-    # Extract last question from Wax's response
+
     sentences = [s.strip() for s in re.split(r'[.!?]+', response) if s.strip()]
     if sentences and sentences[-1].endswith("?"):
         wm_update["last_question"] = sentences[-1]
-    
-    # Detect pace from response length
+
     if len(sentences) <= 2:
         wm_update["pace"] = "fast"
     elif len(sentences) >= 6:
         wm_update["pace"] = "slow"
     else:
         wm_update["pace"] = "normal"
-    
-    # Detect cliffhanger (unfinished problem)
+
     cliffhanger_signals = ["try this", "solve this", "what about", "how about", "next problem"]
     if any(signal in response.lower() for signal in cliffhanger_signals):
-        # Find the problem/exercise mentioned
         for signal in cliffhanger_signals:
             if signal in response.lower():
                 idx = response.lower().find(signal)
                 cliffhanger = response[idx:idx+100].strip()
                 wm_update["cliffhanger"] = cliffhanger
                 break
-    
-    # Only save if we have something to save
+
     if wm_update:
         try:
             await save_working_memory(student_id, wm_update)
@@ -1815,9 +1285,9 @@ async def _save_working_memory_update(
             logger.error(f"Working memory save failed for {student_id}: {e}")
 
 
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # QUIZ ENGINE
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _load_questions(subject: str) -> List[Dict[str, Any]]:
     """Load quiz questions for a subject asynchronously."""
@@ -1859,18 +1329,16 @@ async def _load_questions(subject: str) -> List[Dict[str, Any]]:
             pass
     return questions
 
+
 def _read_questions_file(json_path: str, subject: str) -> List[Dict[str, Any]]:
     """Read and filter questions from local JSON file."""
     with open(json_path, "r", encoding="utf-8") as f:
         return [q for q in json.load(f) if q.get("subject") == subject]
 
-async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "", subject: str = None, topic: str = None) -> None:
-    """
-    Start a quiz session.
-    
-    NEW: Supports subject and topic from intent router (P0-A002).
-    If AI detected a specific subject/topic, use it. Otherwise fall back to rotation.
-    """
+
+async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str = "",
+                      subject: str = None, topic: str = None) -> None:
+    """Start a quiz session with State Socket integration."""
     student_id = str(student["id"])
     student_subjects = student.get("subjects", [])
     student_track = _infer_track(student_subjects)
@@ -1880,12 +1348,9 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
     else:
         subjects_pool = student_subjects.copy()
 
-    # NEW: Use subject from intent router if AI detected one
     if subject:
-        # Map the subject to our internal format
         db_subject = SUBJECT_MAP.get(subject.lower().replace(" ", "_"), subject.lower())
     else:
-        # Check if student specified a subject in the message (legacy fallback)
         requested_subject = None
         msg_lower = message_text.strip().lower()
         for subject_key, mapped_subject in SUBJECT_MAP.items():
@@ -1893,7 +1358,7 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
             if re.search(r'\b' + re.escape(display) + r'\b', msg_lower):
                 requested_subject = mapped_subject
                 break
-        
+
         if requested_subject:
             db_subject = requested_subject
         else:
@@ -1921,6 +1386,14 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
         await send_telegram_message(chat_id, "Quiz setup failed. Type *quiz* to try again.")
         return
 
+    # MIGRATED: Set state via Socket for quiz mode
+    await set_mode(
+        student_id=student_id,
+        mode="in_quiz",
+        confidence=1.0,
+        metadata={"quiz_subject": db_subject, "question_id": question.get("id")}
+    )
+
     keyboard = build_quiz_keyboard(question)
     if not keyboard:
         await send_telegram_message(chat_id, "This question is missing options. Type *quiz* for another.")
@@ -1928,12 +1401,11 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
 
     display_subject = db_subject.replace("_", " ").title()
     question_body = question.get("question_text", question.get("question", "Question loading..."))
-    
-    # NEW: If topic was detected, mention it in the quiz intro
+
     topic_hint = ""
     if topic:
         topic_hint = f" (Topic: {topic.replace('_', ' ').title()})"
-    
+
     try:
         await send_telegram_message(
             chat_id,
@@ -1945,6 +1417,7 @@ async def _start_quiz(chat_id: int, student: Dict[str, Any], message_text: str =
             redis_client.delete(quiz_key)
         except Exception:
             pass
+
 
 async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_data: str) -> None:
     """Handle quiz button callbacks."""
@@ -1964,8 +1437,9 @@ async def handle_quiz_callback(chat_id: int, callback_query_id: str, callback_da
     if callback_data in ("A", "B", "C", "D"):
         await _handle_quiz_answer(chat_id, student, callback_data)
 
+
 async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str) -> None:
-    """Evaluate a quiz answer."""
+    """Evaluate a quiz answer with State Socket integration."""
     student_id = str(student["id"])
     quiz_key = f"active_quiz:{student_id}"
     name = student.get("name", "Student").split()[0]
@@ -2012,6 +1486,15 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
 
     _log_quiz_answer(student_id, question, is_correct)
     response += "\n\nType *quiz* for another question!"
+
+    # MIGRATED: Clear quiz mode via Socket
+    await set_mode(
+        student_id=student_id,
+        mode="chatting",
+        confidence=1.0,
+        metadata={"reason": "Quiz completed", "was_correct": is_correct}
+    )
+
     try:
         await send_telegram_message(chat_id, response)
     except Exception:
@@ -2022,6 +1505,7 @@ async def _handle_quiz_answer(chat_id: int, student: Dict[str, Any], answer: str
         redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
+
 
 def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool) -> None:
     """Log quiz answer to Redis pipeline."""
@@ -2041,6 +1525,7 @@ def _log_quiz_answer(student_id: str, question: Dict[str, Any], is_correct: bool
     except Exception:
         pass
 
+
 def _validate_question(question: Dict[str, Any]) -> bool:
     """Validate that a question has required fields."""
     body = question.get("question_text") or question.get("question") or ""
@@ -2055,6 +1540,7 @@ def _validate_question(question: Dict[str, Any]) -> bool:
     if correct not in options:
         return False
     return True
+
 
 def _infer_track(subjects: List[str]) -> str:
     """Infer the student's academic track from their subject combination."""
@@ -2074,6 +1560,7 @@ def _infer_track(subjects: List[str]) -> str:
     if "economics" in subject_set:
         return "commercial"
     return "unknown"
+
 
 def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
     """Pick a subject using Redis-backed rotation tracking."""
@@ -2108,6 +1595,7 @@ def _pick_rotated_subject(student_id: str, subjects: List[str]) -> str:
         pass
 
     return chosen
+
 
 async def warmup_question_cache() -> None:
     """Pre-load question caches for common subjects on startup."""
