@@ -2,10 +2,10 @@
 brain/student_mind_mirror.py — Wax Student Mind Mirror
 
 Real-time cognitive and affective state modeling.
-Updates the State Cortex with inferred student mental states after every message.
+UPDATED: Now feeds Relational Intimacy Gradient (PIG) with Tier 2 events.
 
 NO CORE FILE IMPORTS THIS DIRECTLY.
-Only brain/state_cortex.py calls the Mind Mirror via record_message().
+Only brain/state_cortex.py calls the Mind Mirror.
 """
 
 import json
@@ -22,8 +22,8 @@ class StudentMindMirror:
     """
     Models the student's internal cognitive and affective state.
     
-    Think of this as Wax's "theory of mind" — what does Wax believe
-    the student is thinking, feeling, and capable of right now?
+    UPDATED: Now integrates with PIG (Pedagogical Intimacy Gradient)
+    to feed Tier 2 generative agency events and Tier 1 vulnerability events.
     """
     
     # Emotional signal patterns (English + Pidgin + Nigerian context)
@@ -82,7 +82,7 @@ class StudentMindMirror:
         ],
     }
     
-    # Learning Learning signal patterns
+    # Learning signal patterns
     LEARNING_SIGNALS = {
         "breakthrough": [
             "oh i see", "now i understand", "it makes sense now",
@@ -124,14 +124,9 @@ class StudentMindMirror:
         conversation_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Analyze a single message and return mind state updates.
+        Analyze a single message and return mind state updates + PIG events.
         
-        Returns: {
-            "mind_updates": {"frustrated": 0.7, "engaged": 0.3},
-            "learning_signals": {"breakthrough": True, "prerequisite_gap": False},
-            "engagement_metrics": {"message_length": 45, "response_time_sec": 12},
-            "commitment_delta": 0.05,
-        }
+        UPDATED: Now feeds Tier 2 events to PIG for generative agency detection.
         """
         if not content or not content.strip():
             return {
@@ -139,6 +134,7 @@ class StudentMindMirror:
                 "learning_signals": {},
                 "engagement_metrics": {},
                 "commitment_delta": Decimal("0"),
+                "pig_events": [],
             }
         
         content_lower = content.lower().strip()
@@ -153,7 +149,6 @@ class StudentMindMirror:
         mind_updates = {}
         for emotion, detected in emotions.items():
             if detected:
-                # Map emotions to mind states
                 mind_map = {
                     "frustration": "frustrated",
                     "confusion": "confused",
@@ -163,23 +158,101 @@ class StudentMindMirror:
                     "boredom": "bored",
                     "anxiety": "anxious",
                     "motivation": "motivated",
-                    "gratitude": "engaged",  # Gratitude = engagement signal
+                    "gratitude": "engaged",
                 }
                 mind_state = mind_map.get(emotion)
                 if mind_state:
                     mind_updates[mind_state] = Decimal("0.7")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # NEW: Feed events to PIG (Pedagogical Intimacy Gradient)
+        # ═══════════════════════════════════════════════════════════════════════
+        pig_events = []
+        
+        if role == "user":
+            # Tier 2: Generative Agency — Breakthroughs
+            if learning.get("breakthrough"):
+                pig_events.append({
+                    "tier": 2,
+                    "event_type": "breakthrough",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.9"),
+                })
+            
+            # Tier 2: Deep Thinking (pre-breakthrough cognitive labor)
+            if learning.get("deep_thinking"):
+                pig_events.append({
+                    "tier": 2,
+                    "event_type": "deep_thinking",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.8"),
+                })
+            
+            # Tier 1: Vulnerability — Persistent struggle (confusion + persistence)
+            if emotions.get("confusion") and len(content) > 20:
+                # Long confused message = vulnerability (they're trying despite confusion)
+                pig_events.append({
+                    "tier": 1,
+                    "event_type": "persistent_struggle",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.85"),
+                })
+            
+            # Tier 1: Anxiety (exam pressure disclosure)
+            if emotions.get("anxiety"):
+                pig_events.append({
+                    "tier": 1,
+                    "event_type": "emotional_disclosure",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.9"),
+                })
+            
+            # Tier 3: Gratitude with warmth
+            if emotions.get("gratitude") and len(content) > 10:
+                pig_events.append({
+                    "tier": 3,
+                    "event_type": "gratitude_with_name",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.85"),
+                })
+            
+            # Tier 4: Explicit understanding (baseline cognitive)
+            if emotions.get("engagement") and learning.get("breakthrough"):
+                pig_events.append({
+                    "tier": 4,
+                    "event_type": "explicit_understanding",
+                    "text_snippet": content[:100],
+                    "confidence": Decimal("0.7"),
+                })
+        
+        # Send PIG events
+        if pig_events:
+            try:
+                from brain.relational_intimacy import process_message_for_intimacy
+                for event in pig_events:
+                    await process_message_for_intimacy(
+                        student_id=student_id,
+                        role=role,
+                        content=event["text_snippet"],
+                        topic=None,  # Could extract from context
+                    )
+                    logger.debug(f"PIG event sent: tier={event['tier']}, type={event['event_type']}")
+            except Exception as e:
+                logger.error(f"Failed to send PIG events: {e}")
         
         result = {
             "mind_updates": mind_updates,
             "learning_signals": learning,
             "engagement_metrics": engagement,
             "commitment_delta": commitment,
+            "pig_events": pig_events,
         }
         
         logger.debug(
-            f"MindMirror analysis for {student_id}: "
+            f"MindMirror+PIG analysis for {student_id}: "
             f"emotions={list(emotions.keys())}, "
             f"learning={list(learning.keys())}, "
+            f"pig_events={len(pig_events)}, "
             f"commitment_delta={float(commitment):+.3f}"
         )
         
@@ -239,7 +312,7 @@ class StudentMindMirror:
                     )
                     current_time = datetime.now(timezone.utc)
                     response_time = (current_time - assistant_time).total_seconds()
-                    metrics["response_time_sec"] = min(response_time, 3600)  # Cap at 1 hour
+                    metrics["response_time_sec"] = min(response_time, 3600)
                 except Exception:
                     pass
         
@@ -263,12 +336,7 @@ class StudentMindMirror:
         engagement: Dict[str, Any],
         role: str,
     ) -> Decimal:
-        """
-        Calculate how this message changes the student's commitment score.
-        
-        Commitment = likelihood the student will create an account.
-        Positive = more likely. Negative = less likely.
-        """
+        """Calculate how this message changes the student's commitment score."""
         if role != "user":
             return Decimal("0")
         
@@ -284,7 +352,7 @@ class StudentMindMirror:
         if emotions.get("gratitude"):
             delta += Decimal("0.03")
         if learning.get("breakthrough"):
-            delta += Decimal("0.08")  # Biggest positive — they felt value
+            delta += Decimal("0.08")
         if learning.get("deep_thinking"):
             delta += Decimal("0.03")
         
@@ -292,31 +360,30 @@ class StudentMindMirror:
         if emotions.get("frustration"):
             delta -= Decimal("0.06")
         if emotions.get("confusion") and not emotions.get("engagement"):
-            delta -= Decimal("0.03")  # Confused but not engaging = bad
+            delta -= Decimal("0.03")
         if emotions.get("boredom"):
             delta -= Decimal("0.05")
         if emotions.get("anxiety"):
-            delta -= Decimal("0.02")  # Anxiety is complex — might still convert
+            delta -= Decimal("0.02")
         
         # Engagement metrics
         msg_len = engagement.get("message_length", 0)
         if msg_len > 100:
-            delta += Decimal("0.02")  # Long message = investment
+            delta += Decimal("0.02")
         elif msg_len < 10:
-            delta -= Decimal("0.02")  # Very short = disengagement
+            delta -= Decimal("0.02")
         
         questions = engagement.get("question_count", 0)
         if questions > 0:
-            delta += Decimal("0.02") * questions  # Asking questions = engagement
+            delta += Decimal("0.02") * questions
         
         response_time = engagement.get("response_time_sec")
         if response_time:
             if response_time < 30:
-                delta += Decimal("0.02")  # Fast response = engaged
+                delta += Decimal("0.02")
             elif response_time > 300:
-                delta -= Decimal("0.02")  # Slow = maybe distracted
+                delta -= Decimal("0.02")
         
-        # Clamp to reasonable range
         return max(Decimal("-0.2"), min(Decimal("0.2"), delta))
     
     async def get_longitudinal_profile(
@@ -324,14 +391,10 @@ class StudentMindMirror:
         student_id: str,
         session_history: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        Build a longitudinal learning profile from session history.
-        
-        This is used for adaptive difficulty and personalized teaching.
-        """
+        """Build a longitudinal learning profile from session history."""
         if not session_history:
             return {
-                "learning_velocity": 0,  # concepts per session
+                "learning_velocity": 0,
                 "average_engagement": 0.5,
                 "frustration_rate": 0,
                 "breakthrough_rate": 0,
@@ -344,22 +407,18 @@ class StudentMindMirror:
         concepts_mastered = sum(s.get("concepts_mastered", 0) for s in session_history)
         concepts_struggled = sum(s.get("concepts_struggled", 0) for s in session_history)
         
-        # Calculate velocity
         velocity = concepts_mastered / max(total_sessions, 1)
         
-        # Calculate engagement average
         engagement_scores = [
             s.get("engagement_score", 0.5) for s in session_history if "engagement_score" in s
         ]
         avg_engagement = sum(engagement_scores) / max(len(engagement_scores), 1)
         
-        # Calculate frustration rate
         frustration_count = sum(
             1 for s in session_history if s.get("emotional_arc", "").startswith("frustrated")
         )
         frustration_rate = frustration_count / max(total_sessions, 1)
         
-        # Calculate breakthrough rate
         breakthrough_count = sum(
             1 for s in session_history if any(
                 "breakthrough" in str(v).lower() for v in s.get("victories", [])
@@ -367,7 +426,6 @@ class StudentMindMirror:
         )
         breakthrough_rate = breakthrough_count / max(total_sessions, 1)
         
-        # Detect preferred time
         hours = []
         for s in session_history:
             try:
@@ -388,11 +446,9 @@ class StudentMindMirror:
             else:
                 preferred_time = "night"
         
-        # Estimate attention span
         durations = [s.get("duration_minutes", 15) for s in session_history if s.get("duration_minutes")]
         attention_span = sum(durations) / max(len(durations), 1) if durations else 15
         
-        # Detect response pattern
         response_times = []
         for s in session_history:
             rt = s.get("average_response_time_sec")
