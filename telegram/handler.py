@@ -12,6 +12,7 @@ NEW (P1-A):
 - Fetches PIG intimacy score via get_current_intimacy_score() for fast path
 - Thermal-aware phrase fetching via config.constants.get_phrases
 - Session management via database.sessions (ensure/end session)
+- /audit command (admin only)
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -73,6 +74,11 @@ from brain.relational_intimacy import get_current_intimacy_score
 # ═══════════════════════════════════════════════════════════════════════
 from config.constants import SUBJECT_MAP, TRACK_FALLBACKS, get_phrases
 
+# ═══════════════════════════════════════════════════════════════════════
+# Admin configuration
+# ═══════════════════════════════════════════════════════════════════════
+ADMIN_CHAT_IDS = [8510180724]  # Only these can use admin commands
+
 # TTLs and limits
 QUIZ_TTL_SECONDS = 1800
 MAX_QUIZ_HISTORY = 200
@@ -115,6 +121,22 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         pass
     except Exception as e:
         logger.error(f"Safety check error: {e}", exc_info=True)
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ADMIN COMMANDS (checked before student lookup)
+    # ═══════════════════════════════════════════════════════════════════════
+    if text.strip().lower() == "/audit":
+        if chat_id not in ADMIN_CHAT_IDS:
+            await send_telegram_message(chat_id, "Sorry, I don't recognize that command. Try /help for available commands.")
+            return
+        try:
+            from brain.audit_engine import run_audit
+            audit_report = await run_audit()
+            await send_telegram_message(chat_id, audit_report)
+        except Exception as e:
+            logger.error(f"Audit command failed: {e}")
+            await send_telegram_message(chat_id, "Audit command failed. Check logs.")
         return
 
     try:
@@ -232,6 +254,22 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     """
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ADMIN COMMANDS (also check here for registered users)
+    # ═══════════════════════════════════════════════════════════════════════
+    if text.strip().lower() == "/audit":
+        if chat_id not in ADMIN_CHAT_IDS:
+            await send_telegram_message(chat_id, "Sorry, I don't recognize that command. Try /help for available commands.")
+            return
+        try:
+            from brain.audit_engine import run_audit
+            audit_report = await run_audit()
+            await send_telegram_message(chat_id, audit_report)
+        except Exception as e:
+            logger.error(f"Audit command failed: {e}")
+            await send_telegram_message(chat_id, "Audit command failed. Check logs.")
+        return
 
     # ═══════════════════════════════════════════════════════════════════════
     # SESSION MANAGEMENT: Ensure active session (P1-A integration)
