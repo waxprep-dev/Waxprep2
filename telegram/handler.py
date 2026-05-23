@@ -503,6 +503,10 @@ def _generate_debate_closing(stance: str, name: str) -> str:
     return closings.get(stance, f"Good, {name}. You don take a stand. Let's keep building from here.")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# TRIAD STATE MANAGEMENT (Fixed: clean return, no UnboundLocalError)
+# ═══════════════════════════════════════════════════════════════════════
+
 async def _get_active_triad(student_id: str) -> Optional[Dict[str, Any]]:
     """Check if student has an active dialectical triad."""
     try:
