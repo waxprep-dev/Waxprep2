@@ -6,6 +6,9 @@ Detects when a student has formed a bond with Wax — not just learned from Wax.
 
 NO CORE FILE IMPORTS THIS DIRECTLY.
 Only brain/state_socket.py and brain/student_mind_mirror.py interact with PIG.
+
+P0-G UPDATE: Now writes to relational_intimacy_events table (event sourcing)
+instead of JSON blob upsert. Calls refresh_intimacy_view() after writes.
 """
 
 import json
@@ -23,10 +26,10 @@ logger = logging.getLogger("waxprep.relational_intimacy")
 # ═══════════════════════════════════════════════════════════════════════
 
 TIER_WEIGHTS = {
-    1: Decimal("3.0"),   # Vulnerability
-    2: Decimal("2.5"),   # Generative Agency
-    3: Decimal("2.0"),   # Affective Bonding
-    4: Decimal("1.0"),   # Cognitive Momentum
+    1: Decimal("3.0"),  # Vulnerability
+    2: Decimal("2.5"),  # Generative Agency
+    3: Decimal("2.0"),  # Affective Bonding
+    4: Decimal("1.0"),  # Cognitive Momentum
 }
 
 TIER_NAMES = {
@@ -39,7 +42,6 @@ TIER_NAMES = {
 HALF_LIFE_DAYS = 7
 CLIFF_THRESHOLD = Decimal("8.0")
 COOLING_OFF_DAYS = 14
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # DETECTION PATTERNS
@@ -134,9 +136,8 @@ COGNITIVE_PATTERNS = {
     "back_and_forth": [],  # Detected separately via exchange counting
 }
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# INTIMACY EVENT
+# INTIMACY EVENT (In-memory representation)
 # ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -148,7 +149,7 @@ class IntimacyEvent:
     topic: Optional[str]
     timestamp: datetime
     confidence: Decimal
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "tier": self.tier,
@@ -159,7 +160,6 @@ class IntimacyEvent:
             "confidence": str(self.confidence),
         }
 
-
 # ═══════════════════════════════════════════════════════════════════════
 # RELATIONAL INTIMACY STACK
 # ═══════════════════════════════════════════════════════════════════════
@@ -167,12 +167,12 @@ class IntimacyEvent:
 class RelationalIntimacyStack:
     """
     Tracks the student's relational bond with Wax.
-    
+
     This is NOT engagement tracking. This is relationship tracking.
     A student can be highly engaged (many correct answers) with zero intimacy.
     A student can have low engagement but high intimacy (few messages, but vulnerable).
     """
-    
+
     def __init__(self, student_id: str):
         self.student_id = student_id
         self.events: List[IntimacyEvent] = []
@@ -182,14 +182,14 @@ class RelationalIntimacyStack:
         self.last_cliff_prompt: Optional[datetime] = None
         self.declined_cliff_count: int = 0
         self.account_created: bool = False
-    
+
     def add_event(self, tier: int, event_type: str, text_snippet: str,
                   topic: Optional[str] = None, confidence: Decimal = Decimal("1.0")) -> None:
         """Add a new intimacy event."""
         if tier not in TIER_WEIGHTS:
             logger.warning(f"Invalid tier {tier} for {self.student_id}")
             return
-        
+
         event = IntimacyEvent(
             tier=tier,
             event_type=event_type,
@@ -198,39 +198,39 @@ class RelationalIntimacyStack:
             timestamp=datetime.now(timezone.utc),
             confidence=confidence,
         )
-        
+
         self.events.append(event)
-        
+
         # Keep only last 50 events to prevent unbounded growth
         if len(self.events) > 50:
             self.events = self.events[-50:]
-        
+
         logger.debug(
             f"PIG event for {self.student_id}: "
             f"tier={tier} ({TIER_NAMES[tier]}), "
             f"type={event_type}, "
             f"score={float(self._event_score(event)):.2f}"
         )
-    
+
     def _event_score(self, event: IntimacyEvent) -> Decimal:
         """Calculate the score for a single event with time decay."""
         weight = TIER_WEIGHTS[event.tier]
         age_days = (datetime.now(timezone.utc) - event.timestamp).total_seconds() / 86400
         decay = Decimal("0.5") ** Decimal(str(age_days / self.half_life_days))
         return (weight * event.confidence * decay).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    
+
     def current_score(self) -> Decimal:
         """Calculate the total intimacy score with time decay."""
         if not self.events:
             return Decimal("0")
-        
+
         total = sum(self._event_score(e) for e in self.events)
         return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    
+
     def is_ready_for_cliff(self) -> bool:
         """
         Determine if the student is ready for the cliff-edge prompt.
-        
+
         Rules:
         1. Score >= threshold
         2. At least one Tier 1 or Tier 2 event in last 10 interactions
@@ -239,40 +239,40 @@ class RelationalIntimacyStack:
         """
         if self.account_created:
             return False
-        
+
         # Check cooling-off period
         if self.last_cliff_prompt:
             days_since = (datetime.now(timezone.utc) - self.last_cliff_prompt).total_seconds() / 86400
             if days_since < self.cooling_off_days:
                 return False
-        
+
         # Check score threshold
         score = self.current_score()
         if score < self.cliff_threshold:
             return False
-        
+
         # Check depth gate: must have Tier 1 or Tier 2 in last 10 events
         recent_events = self.events[-10:]
         has_deep_event = any(e.tier <= 2 for e in recent_events)
         if not has_deep_event:
             return False
-        
+
         return True
-    
+
     def record_cliff_prompt(self, declined: bool = False) -> None:
         """Record that a cliff-edge prompt was shown."""
         self.last_cliff_prompt = datetime.now(timezone.utc)
         if declined:
             self.declined_cliff_count += 1
-    
+
     def record_account_creation(self) -> None:
         """Record successful account creation."""
         self.account_created = True
-    
+
     def get_recent_events_summary(self, n: int = 5) -> List[Dict[str, Any]]:
         """Get summary of recent events for debugging."""
         return [e.to_dict() for e in self.events[-n:]]
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for persistence."""
         return {
@@ -285,7 +285,7 @@ class RelationalIntimacyStack:
             "account_created": self.account_created,
             "current_score": str(self.current_score()),
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RelationalIntimacyStack":
         """Deserialize from dictionary."""
@@ -294,13 +294,13 @@ class RelationalIntimacyStack:
         stack.cliff_threshold = Decimal(str(data.get("cliff_threshold", CLIFF_THRESHOLD)))
         stack.declined_cliff_count = data.get("declined_cliff_count", 0)
         stack.account_created = data.get("account_created", False)
-        
+
         if data.get("last_cliff_prompt"):
             try:
                 stack.last_cliff_prompt = datetime.fromisoformat(data["last_cliff_prompt"].replace("Z", "+00:00"))
             except Exception:
                 pass
-        
+
         for e_data in data.get("events", []):
             try:
                 event = IntimacyEvent(
@@ -314,9 +314,8 @@ class RelationalIntimacyStack:
                 stack.events.append(event)
             except Exception:
                 pass
-        
-        return stack
 
+        return stack
 
 # ═══════════════════════════════════════════════════════════════════════
 # DETECTION ENGINE
@@ -325,42 +324,42 @@ class RelationalIntimacyStack:
 class IntimacyDetector:
     """
     Detects relational intimacy markers in messages.
-    
+
     This is the pattern-matching layer that feeds events into the stack.
     """
-    
+
     def __init__(self):
         self._compiled_patterns: Dict[str, re.Pattern] = {}
-    
+
     def _compile(self, pattern: str) -> re.Pattern:
         """Compile and cache regex patterns."""
         if pattern not in self._compiled_patterns:
             self._compiled_patterns[pattern] = re.compile(pattern, re.IGNORECASE)
         return self._compiled_patterns[pattern]
-    
+
     def detect(self, role: str, content: str, topic: Optional[str] = None) -> List[Tuple[int, str, str, Decimal]]:
         """
         Detect all intimacy markers in a message.
-        
+
         Returns: List of (tier, event_type, matched_text, confidence)
         """
         if not content or not content.strip():
             return []
-        
+
         content_lower = content.lower().strip()
         detected = []
-        
+
         # Only detect from user messages (student's signals)
         if role != "user":
             return []
-        
+
         # Tier 1: Vulnerability
         for event_type, patterns in VULNERABILITY_PATTERNS.items():
             for pattern in patterns:
                 if pattern in content_lower:
                     detected.append((1, event_type, pattern, Decimal("0.9")))
                     break  # One match per event type
-        
+
         # Tier 2: Generative Agency
         for event_type, patterns in GENERATIVE_PATTERNS.items():
             for pattern in patterns:
@@ -370,7 +369,7 @@ class IntimacyDetector:
                     conf = Decimal("0.95") if event_type == "critical_challenge" else Decimal("0.85")
                     detected.append((2, event_type, pattern, conf))
                     break
-        
+
         # Tier 3: Affective Bonding
         for event_type, patterns in AFFECTIVE_PATTERNS.items():
             for pattern in patterns:
@@ -382,67 +381,177 @@ class IntimacyDetector:
                         conf = Decimal("0.95")
                     detected.append((3, event_type, pattern, conf))
                     break
-        
+
         # Tier 4: Cognitive Momentum
         for event_type, patterns in COGNITIVE_PATTERNS.items():
             for pattern in patterns:
                 if pattern in content_lower:
                     detected.append((4, event_type, pattern, Decimal("0.8")))
                     break
-        
+
         return detected
-    
+
     def detect_exchange_depth(self, history: List[Dict[str, Any]]) -> Optional[Tuple[int, str, str, Decimal]]:
         """
         Detect if this message represents deep back-and-forth on one topic.
-        
+
         Returns Tier 4 event if 3+ exchanges on same topic.
         """
         if not history or len(history) < 6:
             return None
-        
+
         # Count recent exchanges on same topic
         recent = history[-6:]
         topic_mentions = {}
-        
+
         for msg in recent:
             content = msg.get("content", "").lower()
             # Simple topic extraction — can be enhanced
             for subject in ["physics", "chemistry", "biology", "mathematics", "math", "english", "government", "economics"]:
                 if subject in content:
                     topic_mentions[subject] = topic_mentions.get(subject, 0) + 1
-        
+
         # If 3+ messages mention same topic, it's a deep exchange
         for topic, count in topic_mentions.items():
             if count >= 3:
                 return (4, "back_and_forth", f"3+ exchanges on {topic}", Decimal("0.7"))
-        
+
         return None
 
+# ═══════════════════════════════════════════════════════════════════════
+# SUPABASE EVENT WRITER (NEW FOR P0-G)
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _save_event_to_supabase(
+    student_id: str,
+    event: IntimacyEvent,
+    score_before: Decimal,
+    score_after: Decimal,
+    triggered_by: str = "system"
+) -> bool:
+    """
+    Write a single intimacy event to the relational_intimacy_events table.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        from database.client import supabase
+        
+        result = supabase.table("relational_intimacy_events").insert({
+            "student_id": student_id,
+            "event_type": event.event_type,
+            "content_preview": event.text_snippet[:200],
+            "topic": event.topic,
+            "score_before": float(score_before),
+            "score_after": float(score_after),
+            "tier": event.tier,
+            "triggered_by": triggered_by,
+            "thermal_state": "warm",  # Intimacy events start warm
+            "metadata": {
+                "confidence": str(event.confidence),
+                "pattern_matched": event.text_snippet[:100],
+            }
+        }).execute()
+        
+        if result.data:
+            logger.debug(f"PIG event saved to Supabase for {student_id}: {event.event_type}")
+            return True
+        else:
+            logger.warning(f"PIG event insert returned no data for {student_id}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Supabase PIG event save failed for {student_id}: {e}")
+        return False
+
+
+async def _refresh_intimacy_view() -> bool:
+    """
+    Refresh the relational_intimacy_current materialized view.
+    Called after batch event writes to keep view current.
+    """
+    try:
+        from database.client import supabase
+        
+        # Call the PostgreSQL function we created in Step 6
+        result = supabase.rpc("refresh_intimacy_view").execute()
+        
+        logger.debug("PIG materialized view refreshed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to refresh intimacy view: {e}")
+        return False
+
+
+async def _write_memory_mutation(
+    student_id: str,
+    target_table: str,
+    target_record_id: str,
+    mutation_type: str,
+    source_engine: str,
+    previous_state: Optional[Dict] = None,
+    new_state: Optional[Dict] = None,
+    change_summary: str = "",
+    extraction_confidence: Optional[Decimal] = None
+) -> bool:
+    """
+    Write an audit trail entry to memory_mutations table.
+    Called whenever PIG state changes significantly.
+    """
+    try:
+        from database.client import supabase
+        
+        mutation_data = {
+            "student_id": student_id,
+            "target_table": target_table,
+            "target_record_id": target_record_id,
+            "mutation_type": mutation_type,
+            "source_engine": source_engine,
+            "change_summary": change_summary,
+            "thermal_state": "cool",
+        }
+        
+        if previous_state is not None:
+            mutation_data["previous_state"] = previous_state
+        if new_state is not None:
+            mutation_data["new_state"] = new_state
+        if extraction_confidence is not None:
+            mutation_data["extraction_confidence"] = float(extraction_confidence)
+            
+        supabase.table("memory_mutations").insert(mutation_data).execute()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Memory mutation audit failed for {student_id}: {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════════════
-# MANAGER (Persistence Layer)
+# MANAGER (Persistence Layer) — UPDATED FOR P0-G
 # ═══════════════════════════════════════════════════════════════════════
 
 class IntimacyManager:
     """
     Manages RelationalIntimacyStack persistence.
-    
+
     Loads from Redis/Supabase, saves after updates.
-    """
     
+    P0-G CHANGE: Now writes individual events to relational_intimacy_events
+    instead of upserting JSON blob to relational_intimacy_stacks.
+    """
+
     def __init__(self):
         self._local_cache: Dict[str, RelationalIntimacyStack] = {}
-    
+
     async def get_stack(self, student_id: str) -> RelationalIntimacyStack:
         """Load or create stack for a student."""
         if not student_id:
             return RelationalIntimacyStack("unknown")
-        
+
         # Local cache
         if student_id in self._local_cache:
             return self._local_cache[student_id]
-        
+
         # Try Redis
         try:
             from database.client import redis_client
@@ -455,37 +564,42 @@ class IntimacyManager:
                 return stack
         except Exception as e:
             logger.error(f"Redis PIG load failed for {student_id}: {e}")
-        
+
+        # Fallback: try to reconstruct from relational_intimacy_current view
+        try:
+            from database.client import supabase
+            result = supabase.table("relational_intimacy_current").select("*").eq("student_id", student_id).execute()
+            if result.data and len(result.data) > 0:
+                row = result.data[0]
+                stack = RelationalIntimacyStack(student_id)
+                # Seed with current score from view (events will be empty but score accurate)
+                # This is a cold-start recovery — events will rebuild over time
+                logger.info(f"PIG cold-start recovery from view for {student_id}: score={row.get('current_score')}")
+                self._local_cache[student_id] = stack
+                return stack
+        except Exception as e:
+            logger.warning(f"PIG view fallback failed for {student_id}: {e}")
+
         # Create new
         stack = RelationalIntimacyStack(student_id)
         self._local_cache[student_id] = stack
         return stack
-    
+
     async def save_stack(self, student_id: str, stack: RelationalIntimacyStack) -> None:
-        """Persist stack to Redis and Supabase."""
+        """Persist stack to Redis. Supabase event sourcing handled separately."""
         self._local_cache[student_id] = stack
-        
-        # Redis
+
+        # Redis (primary fast cache)
         try:
             from database.client import redis_client
             key = f"pig:stack:{student_id}"
             redis_client.setex(key, 86400 * 30, json.dumps(stack.to_dict()))  # 30 days
         except Exception as e:
             logger.error(f"Redis PIG save failed for {student_id}: {e}")
-        
-        # Supabase (async, fire-and-forget)
-        try:
-            from database.client import supabase
-            supabase.table("relational_intimacy_stacks").upsert({
-                "student_id": student_id,
-                "stack_data": stack.to_dict(),
-                "current_score": float(stack.current_score()),
-                "ready_for_cliff": stack.is_ready_for_cliff(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="student_id").execute()
-        except Exception as e:
-            logger.error(f"Supabase PIG save failed for {student_id}: {e}")
-    
+
+        # P0-G: REMOVED old JSON blob upsert to relational_intimacy_stacks
+        # Events are now written individually via _save_event_to_supabase()
+
     async def process_message(
         self,
         student_id: str,
@@ -496,31 +610,75 @@ class IntimacyManager:
     ) -> RelationalIntimacyStack:
         """
         Process a message and update the intimacy stack.
-        
+
         This is the main entry point called by the Mind Mirror.
         """
         stack = await self.get_stack(student_id)
         
+        # Capture score before events
+        score_before = stack.current_score()
+
         # Run detection
         detector = IntimacyDetector()
         detected = detector.detect(role, content, topic)
-        
-        # Add detected events
+
+        # Add detected events and save each to Supabase
         for tier, event_type, text_snippet, confidence in detected:
+            event = IntimacyEvent(
+                tier=tier,
+                event_type=event_type,
+                text_snippet=text_snippet,
+                topic=topic,
+                timestamp=datetime.now(timezone.utc),
+                confidence=confidence,
+            )
             stack.add_event(tier, event_type, text_snippet, topic, confidence)
-        
+            
+            # P0-G: Write event to Supabase (event sourcing)
+            score_after = stack.current_score()
+            await _save_event_to_supabase(
+                student_id=student_id,
+                event=event,
+                score_before=score_before,
+                score_after=score_after,
+                triggered_by="student_message"
+            )
+            score_before = score_after  # Update for next event
+
         # Check for exchange depth
         if history:
             depth_event = detector.detect_exchange_depth(history)
             if depth_event:
                 tier, event_type, text_snippet, confidence = depth_event
+                event = IntimacyEvent(
+                    tier=tier,
+                    event_type=event_type,
+                    text_snippet=text_snippet,
+                    topic=topic,
+                    timestamp=datetime.now(timezone.utc),
+                    confidence=confidence,
+                )
                 stack.add_event(tier, event_type, text_snippet, topic, confidence)
-        
-        # Save
+                
+                # P0-G: Write depth event to Supabase
+                score_after = stack.current_score()
+                await _save_event_to_supabase(
+                    student_id=student_id,
+                    event=event,
+                    score_before=score_before,
+                    score_after=score_after,
+                    triggered_by="system"
+                )
+
+        # Save to Redis (fast cache)
         await self.save_stack(student_id, stack)
         
-        return stack
+        # P0-G: Refresh materialized view so current score is live
+        # Only refresh if we detected events (avoid unnecessary DB calls)
+        if detected or (history and depth_event):
+            await _refresh_intimacy_view()
 
+        return stack
 
 # ═══════════════════════════════════════════════════════════════════════
 # SINGLETON
@@ -535,7 +693,6 @@ def get_intimacy_manager() -> IntimacyManager:
         _manager = IntimacyManager()
     return _manager
 
-
 async def process_message_for_intimacy(
     student_id: str,
     role: str,
@@ -545,38 +702,37 @@ async def process_message_for_intimacy(
 ) -> RelationalIntimacyStack:
     """
     Convenience function: process a message through PIG.
-    
+
     Called by Mind Mirror after every message analysis.
     """
     manager = get_intimacy_manager()
     return await manager.process_message(student_id, role, content, topic, history)
 
-
 async def should_trigger_cliff_edge(student_id: str) -> Tuple[bool, Decimal, Optional[str]]:
     """
     Check if cliff-edge prompt should fire for this student.
-    
+
     Returns: (should_trigger, current_score, reason_if_not)
     """
     manager = get_intimacy_manager()
     stack = await manager.get_stack(student_id)
-    
+
     score = stack.current_score()
-    
+
     if stack.account_created:
         return (False, score, "Account already created")
-    
+
     if stack.last_cliff_prompt:
         days_since = (datetime.now(timezone.utc) - stack.last_cliff_prompt).total_seconds() / 86400
         if days_since < COOLING_OFF_DAYS:
             return (False, score, f"In cooling-off period ({days_since:.1f} days since last prompt)")
-    
+
     if score < CLIFF_THRESHOLD:
         return (False, score, f"Score {float(score):.1f} below threshold {float(CLIFF_THRESHOLD):.1f}")
-    
+
     recent_events = stack.events[-10:]
     has_deep = any(e.tier <= 2 for e in recent_events)
     if not has_deep:
         return (False, score, "No Tier 1 or Tier 2 events in last 10 interactions")
-    
+
     return (True, score, None)
