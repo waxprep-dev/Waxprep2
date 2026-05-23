@@ -1,3 +1,7 @@
+# Changes made:
+# - Replaced circular import `from telegram.handler import SUBJECT_MAP` with `from config.constants import SUBJECT_MAP`
+# - All other code remains exactly as provided
+
 """
 ai/output_enforcer.py — WaxPrep Output Enforcement (P0-B001)
 
@@ -224,7 +228,7 @@ def _detect_topic_drift(response: str, current_topic: str, conversation_history:
     topic_mentioned = current_topic.lower().replace("_", " ") in response_lower
     
     # Check for other subjects
-    from telegram.handler import SUBJECT_MAP
+    from config.constants import SUBJECT_MAP
     other_subjects_mentioned = 0
     for subject in SUBJECT_MAP:
         if subject == current_topic:
