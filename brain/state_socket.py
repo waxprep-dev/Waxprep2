@@ -3,8 +3,8 @@ brain/state_socket.py — Wax State Socket (The Sacred Wall)
 
 THE ONLY STATE INTERFACE YOUR EXISTING CODE TOUCHES.
 
-This file provides a stable API for all state operations.
 NOW WIRED TO: brain/state_cortex.py (4D Living State Architecture)
+AND: brain/relational_intimacy.py (PIG - Pedagogical Intimacy Gradient)
 
 RULES:
 - NEVER change the function signatures below. They are sacred.
@@ -24,8 +24,8 @@ logger = logging.getLogger("waxprep.state_socket")
 # CORTEX INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════
 
-# Lazy import to avoid circular dependencies
 _cortex = None
+_intimacy_manager = None
 
 def _get_cortex():
     """Lazy singleton for StateCortex."""
@@ -38,6 +38,18 @@ def _get_cortex():
             logger.error(f"Failed to initialize StateCortex: {e}")
             _cortex = None
     return _cortex
+
+def _get_intimacy_manager():
+    """Lazy singleton for IntimacyManager."""
+    global _intimacy_manager
+    if _intimacy_manager is None:
+        try:
+            from brain.relational_intimacy import get_intimacy_manager
+            _intimacy_manager = get_intimacy_manager()
+        except Exception as e:
+            logger.error(f"Failed to initialize IntimacyManager: {e}")
+            _intimacy_manager = None
+    return _intimacy_manager
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -173,7 +185,6 @@ async def get_student_mind(student_id: str) -> Dict[str, float]:
     except Exception as e:
         logger.error(f"Cortex get_student_mind failed for {student_id}: {e}")
     
-    # Fallback
     return {
         "confidence": 0.5, "confusion": 0.0, "frustration": 0.0,
         "engagement": 0.5, "commitment": 0.0,
@@ -189,6 +200,7 @@ async def record_message(student_id: str, role: str, content: str) -> None:
     if not student_id:
         return
     
+    # Record in Cortex (which triggers Mind Mirror, which triggers PIG)
     try:
         cortex = _get_cortex()
         if cortex:
@@ -269,21 +281,43 @@ async def on_crash_recovery(student_id: str, history: list) -> Dict[str, Any]:
 
 async def should_trigger_onboarding(student_id: str) -> Tuple[bool, float]:
     """
-    Return (should_trigger, commitment_score) for natural account creation.
+    Return (should_trigger, intimacy_score) for natural account creation.
     
     SACRED: Always returns (bool, float). Never crashes.
-    DISABLED: Waiting for friend's research on natural conversion triggers.
-    """
-    # DISABLED: Waiting for research
-    # When enabled:
-    # try:
-    #     cortex = _get_cortex()
-    #     if cortex:
-    #         commitment = await cortex.get_commitment_score(student_id)
-    #         return (commitment > Decimal("0.6"), float(commitment))
-    # except Exception:
-    #     pass
     
+    NOW ENABLED: Uses PIG (Pedagogical Intimacy Gradient) cliff-edge logic.
+    - Triggers when relational intimacy score >= 8.0
+    - Requires at least 1 Tier 1 (vulnerability) or Tier 2 (generative) event
+    - Respects 14-day cooling-off period after decline
+    - Never triggers if account already created
+    """
+    if not student_id:
+        return (False, 0.0)
+    
+    # Skip for temp students who haven't shown engagement
+    if student_id.startswith("temp_"):
+        # Still check PIG — temp students can have intimacy too
+        pass
+    
+    try:
+        from brain.relational_intimacy import should_trigger_cliff_edge
+        
+        should_trigger, score, reason = await should_trigger_cliff_edge(student_id)
+        
+        if should_trigger:
+            logger.info(f"PIG cliff-edge triggered for {student_id} (score: {float(score):.1f})")
+            return (True, float(score))
+        
+        # Log why not triggered (for debugging)
+        if reason:
+            logger.debug(f"PIG cliff-edge NOT triggered for {student_id}: {reason}")
+        
+        return (False, float(score))
+        
+    except Exception as e:
+        logger.error(f"PIG onboarding check failed for {student_id}: {e}")
+    
+    # Ultimate fallback: disabled
     return (False, 0.0)
 
 
@@ -297,6 +331,24 @@ async def get_full_state(student_id: str) -> Dict[str, Any]:
         cortex = _get_cortex()
         if cortex:
             vector = await cortex.get_vector(student_id)
+            
+            # Get PIG data if available
+            pig_data = {}
+            try:
+                from brain.relational_intimacy import get_intimacy_manager
+                manager = get_intimacy_manager()
+                stack = await manager.get_stack(student_id)
+                pig_data = {
+                    "intimacy_score": float(stack.current_score()),
+                    "ready_for_cliff": stack.is_ready_for_cliff(),
+                    "tier_1_count": len([e for e in stack.events if e.tier == 1]),
+                    "tier_2_count": len([e for e in stack.events if e.tier == 2]),
+                    "tier_3_count": len([e for e in stack.events if e.tier == 3]),
+                    "tier_4_count": len([e for e in stack.events if e.tier == 4]),
+                }
+            except Exception:
+                pass
+            
             return {
                 "student_id": student_id,
                 "mode": vector.dominant_mode()[0],
@@ -305,6 +357,7 @@ async def get_full_state(student_id: str) -> Dict[str, Any]:
                 "superposition": vector.is_in_superposition(),
                 "topology": vector.conversation_topology,
                 "env_context": vector.env_context,
+                "pig": pig_data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "version": f"cortex_v{vector.version}",
             }
