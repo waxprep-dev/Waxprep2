@@ -108,7 +108,7 @@ def _is_cacheable(message: str, is_dialectical: bool = False) -> bool:
     # NEVER cache dialectical responses — they are context-dependent
     if is_dialectical:
         return False
-        
+
     msg_lower = message.lower().strip()
     skip_patterns = [
         "hi", "hello", "hey", "good morning", "good evening",
@@ -157,7 +157,7 @@ async def _cache_response(message: str, response: str, class_level: str = "SS3",
     # Never cache dialectical responses
     if is_dialectical:
         return
-        
+
     try:
         from database.client import redis_client
         cache_key = _build_cache_key(message, class_level, is_practice, is_dialectical)
