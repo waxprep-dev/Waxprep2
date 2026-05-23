@@ -11,6 +11,7 @@ NEW (P1-A):
 - Account creation intent now flows through Intent Router, not hard-coded keywords
 - Fetches PIG intimacy score via get_current_intimacy_score() for fast path
 - Thermal-aware phrase fetching via config.constants.get_phrases
+- Session management via database.sessions (ensure/end session)
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -28,6 +29,11 @@ from decimal import Decimal
 
 from telegram.sender import send_telegram_message, build_quiz_keyboard, answer_callback_query
 from database.client import redis_client
+
+# ═══════════════════════════════════════════════════════════════════════
+# Session management (P1-A integration)
+# ═══════════════════════════════════════════════════════════════════════
+from database.sessions import ensure_active_session, end_session, add_topic_to_session
 
 # ═══════════════════════════════════════════════════════════════════════
 # AI-First Intent Router (P0-A001 + P1-A)
@@ -227,6 +233,11 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     student_id = str(student["id"])
     name = student.get("name", "Student").split()[0]
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # SESSION MANAGEMENT: Ensure active session (P1-A integration)
+    # ═══════════════════════════════════════════════════════════════════════
+    session_id = await ensure_active_session(student_id)
+
     # Get conversation history for context
     try:
         from database.conversations import get_history
@@ -273,7 +284,8 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
 
         await _handle_ai_conversation(
             chat_id, student, text, student_id, name,
-            intent_hint=hint, suggested_action=action
+            intent_hint=hint, suggested_action=action,
+            session_id=session_id  # Pass session_id
         )
         return
 
@@ -292,7 +304,7 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         return
 
     if action == "end_session":
-        await _handle_session_end(chat_id, student, text, student_id, name, text.lower())
+        await _handle_session_end(chat_id, student, text, student_id, name, text.lower(), session_id=session_id)
         return
 
     if action == "defer":
@@ -302,16 +314,17 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     if action == "emotional_support":
         await _handle_ai_conversation(
             chat_id, student, text, student_id, name,
-            intent_hint="The student needs emotional support. Be empathetic, validate their feelings, then gently guide back to actionable steps."
+            intent_hint="The student needs emotional support. Be empathetic, validate their feelings, then gently guide back to actionable steps.",
+            session_id=session_id
         )
         return
 
     if action == "greeting":
-        await _handle_ai_conversation(chat_id, student, text, student_id, name)
+        await _handle_ai_conversation(chat_id, student, text, student_id, name, session_id=session_id)
         return
 
     # DEFAULT: TEACH
-    await _handle_ai_conversation(chat_id, student, text, student_id, name)
+    await _handle_ai_conversation(chat_id, student, text, student_id, name, session_id=session_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -448,14 +461,15 @@ async def _clear_active_triad(student_id: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# SESSION END HANDLER (MIGRATED to State Socket)
+# SESSION END HANDLER (MIGRATED to State Socket, session-aware)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_session_end(
     chat_id: int, student: dict, text: str,
-    student_id: str, name: str, msg_lower: str
+    student_id: str, name: str, msg_lower: str,
+    session_id: Optional[str] = None  # NEW: session_id parameter
 ) -> None:
-    """Handle natural session endings with State Socket."""
+    """Handle natural session endings with State Socket and database session."""
     from ai.brain import think
     from database.conversations import get_history, save_message, save_session_summary
 
@@ -531,6 +545,29 @@ async def _handle_session_end(
             pass
         except Exception as e:
             logger.error(f"Session-end extraction trigger failed: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PROPERLY END DATABASE SESSION (P1-A)
+    # ═══════════════════════════════════════════════════════════════════════
+    topics_covered = [recent_subject] if recent_subject else []
+    end_emotion = _detect_end_emotion(text)
+    await end_session(
+        student_id=student_id,
+        session_id=session_id,
+        ended_by="student",
+        topics_covered=topics_covered,
+        emotional_arc=f"ended_{end_emotion}",
+    )
+
+
+def _detect_end_emotion(text: str) -> str:
+    """Simple heuristic to detect emotion at session end."""
+    text_lower = text.lower()
+    if any(w in text_lower for w in ["tired", "sleep", "goodnight", "good night", "i'm done", "i am done"]):
+        return "tired"
+    if any(w in text_lower for w in ["bye", "goodbye", "see you", "later"]):
+        return "neutral"
+    return "neutral"
 
 
 def _extract_topic_from_history(conversation_history: List[Dict]) -> str:
@@ -616,7 +653,8 @@ async def _handle_ai_conversation(
     student_id: str,
     name: str,
     intent_hint: str = "",
-    suggested_action: str = ""
+    suggested_action: str = "",
+    session_id: Optional[str] = None  # NEW: session_id parameter
 ) -> None:
     """
     Process a student message through the AI brain with State Socket integration
