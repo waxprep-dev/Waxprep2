@@ -336,3 +336,56 @@ Student: {name} | Class: {class_level} | State: {state}
 {safe_context}
 """
     return lite_prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ONBOARDING & CONVERSION PERSONA (PIG-Triggered)
+# ═══════════════════════════════════════════════════════════════════════
+
+# These prompts are NOT injected automatically. They are selected by the
+# AI based on PIG signals and state context. They must feel organic.
+
+CLIFF_EDGE_PROMPTS = {
+    "mid_session": [
+        "You've just solved {topic} problems in a row — that's solid work. I don't keep notebooks for guests, so if you leave now, this progress stays here. Want me to start a notebook for you? It takes 30 seconds.",
+        "You're getting this 🔥. I want to keep track of these wins, but I only keep notebooks for my study-circle students. Want me to start yours?",
+        "That explanation was fire — you really get {topic}. I don't want you to lose this momentum. Should I start your study notebook?",
+    ],
+    "after_breakthrough": [
+        "See? You DO get it. This is the kind of breakthrough I want to remember for you. Want me to start keeping your notes?",
+        "You just connected the dots yourself — that's the real learning. Let me keep track of these moments for you. Study notebook?",
+    ],
+    "after_vulnerability": [
+        "I hear you. Exam stress is real, but you know what? We've already turned some of that fear into understanding. Want me to keep your notebook safe so we can keep building?",
+        "You told me you're scared for WAEC. That's courage — admitting it. Let me keep your study notes so we can turn that fear into confidence, one topic at a time.",
+    ],
+}
+
+GENTLE_GHOST_PROMPTS = {
+    "returning_temp": [
+        "I see you're back. I keep detailed notebooks for my study-circle students, but I haven't started one for you yet. Should I?",
+        "Welcome back! I don't have your notebook yet — our last chat stayed in this window. Want me to start one so I can pick up where we left off?",
+    ],
+    "returning_after_gap": [
+        "Hey! Good to see you again. I don't have your study notes yet, so I'll need a quick refresher. Want me to start your notebook? Then I can remember everything about how you learn.",
+    ],
+}
+
+STUDY_CIRCLE_FRAMING = {
+    "account_created": [
+        "Your study circle is live. PIN set. I'll be your first study partner — later, you can add friends. For now, let's keep building.",
+        "Notebook started. You're now a study-circle founder 🔥. Let's keep turning those weak areas into strengths.",
+    ],
+    "data_collection": {
+        "name": "I want to make sure I explain this at the right level. What should I call you?",
+        "class": "Perfect. What class are you in? I'll note that in your teaching profile.",
+        "subjects": "What topics are you weakest in? I can track those and prioritize them.",
+        "pin": "One last thing — if you ever switch phones, I can keep your notebook safe with a 4-digit PIN. What should it be?",
+    },
+}
+
+NOTEBOOK_METAPHOR_CONSISTENCY = {
+    "guest_limitation": "I don't keep notebooks for guests — our chats stay in this conversation window.",
+    "study_circle_benefit": "Study-circle students get progress tracking, spaced repetition, and 'quiz me on what we did last time.'",
+    "founder_status": "Study-circle founders often become the go-to person when friends need help. Want to set yours up?",
+}
