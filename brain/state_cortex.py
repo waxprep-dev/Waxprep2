@@ -1,7 +1,7 @@
 # Changes made:
-# - Replaced reconstruct_from_history method to use the State Archaeologist
-#   (brain.state_archaeologist) instead of basic heuristic. Falls back to
-#   default with "recovering" topology if confidence too low or error.
+# - Replaced record_message method to wire in Mind Mirror analysis (via brain.student_mind_mirror)
+#   with fallback to _simple_mind_heuristic if Mind Mirror fails.
+# - Also kept the earlier fix: reconstruct_from_history now uses the State Archaeologist.
 
 """
 brain/state_cortex.py — Wax State Cortex
@@ -393,49 +393,63 @@ class StateCortex:
         content: str,
     ) -> StateVector:
         """
-        Process a message and update the state vector accordingly.
-        This is where the mind mirror gets its data.
+        Process a message and update the state vector with Mind Mirror analysis.
         """
         vector = await self.get_vector(student_id)
         
-        # Simple heuristic updates (will be enhanced by StudentMindMirror later)
-        mind_updates = {}
-        mode_updates = {}
+        # Get conversation history for context
+        conversation_history = []
+        try:
+            from database.conversations import get_history
+            conversation_history = await get_history(student_id)
+        except Exception:
+            pass
         
-        content_lower = content.lower()
-        
-        # Detect confusion
-        confusion_signals = ["don't understand", "confused", "stuck", "lost", "don't get", "huh", "wait", "how"]
-        if any(s in content_lower for s in confusion_signals):
-            mind_updates["confused"] = Decimal("0.7")
-            # If in quiz, maintain quiz mode but add emotional support superposition
-            if vector.dominant_mode()[0] == "in_quiz":
-                mode_updates["in_emotional_support"] = Decimal("0.3")
-        
-        # Detect frustration
-        frustration_signals = ["this is hard", "i give up", "too difficult", "impossible", "i can't", "annoying"]
-        if any(s in content_lower for s in frustration_signals):
-            mind_updates["frustrated"] = Decimal("0.8")
-            mode_updates["in_emotional_support"] = Decimal("0.4")
-        
-        # Detect engagement
-        engagement_signals = ["i get it", "that makes sense", "oh wow", "cool", "awesome", "interesting", "tell me more"]
-        if any(s in content_lower for s in engagement_signals):
-            mind_updates["engaged"] = Decimal("0.7")
-        
-        # Detect curiosity
-        curiosity_signals = ["what if", "why", "how come", "what about", "can you explain"]
-        if any(s in content_lower for s in curiosity_signals):
-            mind_updates["curious"] = Decimal("0.6")
-        
-        # Detect confidence
-        confidence_signals = ["i know", "easy", "simple", "i can do this", "got it"]
-        if any(s in content_lower for s in confidence_signals):
-            mind_updates["confident"] = Decimal("0.6")
+        # Run Mind Mirror analysis
+        try:
+            from brain.student_mind_mirror import get_mind_mirror
+            mind_mirror = get_mind_mirror()
+            analysis = await mind_mirror.analyze_message(
+                student_id=student_id,
+                role=role,
+                content=content,
+                conversation_history=conversation_history,
+            )
+            
+            mind_updates = analysis.get("mind_updates", {})
+            commitment_delta = analysis.get("commitment_delta", Decimal("0"))
+            
+            # Apply mind updates to vector
+            if mind_updates:
+                vector = await self.update_vector(
+                    student_id=student_id,
+                    mind_updates=mind_updates,
+                )
+            
+            # Track commitment score separately (for account creation)
+            if commitment_delta != Decimal("0"):
+                current_commitment = Decimal(str(vector.env_context.get("commitment_score", "0")))
+                new_commitment = max(Decimal("0"), min(Decimal("1"), current_commitment + commitment_delta))
+                vector.env_context["commitment_score"] = str(new_commitment.quantize(Decimal("0.001")))
+                vector = await self.update_vector(
+                    student_id=student_id,
+                    env_updates={"commitment_score": str(new_commitment)},
+                )
+                
+        except Exception as e:
+            logger.error(f"Mind Mirror analysis failed for {student_id}: {e}")
+            # Fallback to simple heuristic
+            mind_updates = self._simple_mind_heuristic(content)
+            if mind_updates:
+                vector = await self.update_vector(
+                    student_id=student_id,
+                    mind_updates=mind_updates,
+                )
         
         # Update topology based on message patterns
         topology = None
         if role == "user":
+            content_lower = content.lower()
             if any(s in content_lower for s in ["bye", "goodnight", "done", "later"]):
                 topology = "closing"
             elif vector.conversation_topology == "opening" and len(content) > 10:
@@ -444,23 +458,45 @@ class StateCortex:
             if "?" in content:
                 topology = "deepening"
         
-        # Apply updates
-        if mind_updates or mode_updates or topology:
+        if topology:
             vector = await self.update_vector(
                 student_id=student_id,
-                mode_updates=mode_updates or None,
-                mind_updates=mind_updates or None,
                 topology=topology,
             )
         
         # Increment message count for auto-snapshot
         self._message_counts[student_id] = self._message_counts.get(student_id, 0) + 1
-        
-        # Auto-snapshot every 5 messages
         if self._message_counts[student_id] % 5 == 0:
             await self._snapshot_to_supabase(student_id, vector)
         
         return vector
+    
+    def _simple_mind_heuristic(self, content: str) -> Dict[str, Decimal]:
+        """Fallback heuristic if Mind Mirror fails."""
+        content_lower = content.lower()
+        updates = {}
+        
+        confusion_signals = ["don't understand", "confused", "stuck", "lost", "don't get", "huh", "wait", "how"]
+        if any(s in content_lower for s in confusion_signals):
+            updates["confused"] = Decimal("0.7")
+        
+        frustration_signals = ["this is hard", "i give up", "too difficult", "impossible", "i can't", "annoying"]
+        if any(s in content_lower for s in frustration_signals):
+            updates["frustrated"] = Decimal("0.8")
+        
+        excitement_signals = ["i get it", "that makes sense", "oh wow", "cool", "awesome"]
+        if any(s in content_lower for s in excitement_signals):
+            updates["engaged"] = Decimal("0.7")
+        
+        curiosity_signals = ["what if", "why", "how come", "what about", "can you explain"]
+        if any(s in content_lower for s in curiosity_signals):
+            updates["curious"] = Decimal("0.6")
+        
+        confidence_signals = ["i know", "easy", "simple", "i can do this", "got it"]
+        if any(s in content_lower for s in confidence_signals):
+            updates["confident"] = Decimal("0.6")
+        
+        return updates
     
     async def get_context_string(self, student_id: str) -> str:
         """
