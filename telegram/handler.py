@@ -9,6 +9,7 @@ NEW (P1-A):
 - Removed ALL keyword fallback lists (Intent Router is single source of truth)
 - Imported _default_intent from ai.intent_router instead of duplicating
 - Account creation intent now flows through Intent Router, not hard-coded keywords
+- Fetches PIG intimacy score via get_current_intimacy_score() for fast path
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -54,6 +55,11 @@ from brain.state_socket import (
     record_message,
     on_crash_recovery,
 )
+
+# ═══════════════════════════════════════════════════════════════════════
+# PIG Intimacy Score Fast Path (P0-G + P1-A)
+# ═══════════════════════════════════════════════════════════════════════
+from brain.relational_intimacy import get_current_intimacy_score
 
 # ── Subject name mapping ──────────────────────
 SUBJECT_MAP: Dict[str, str] = {
@@ -316,17 +322,10 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
     # STEP 1: AI INTENT CLASSIFICATION (ALWAYS FIRST)
     # ═══════════════════════════════════════════════════════════════════════
     try:
-        # Get PIG intimacy score for dissonance threshold gating
-        intimacy_score = 0.0
-        try:
-            from brain.relational_intimacy import get_intimacy_manager
-            manager = get_intimacy_manager()
-            stack = await manager.get_stack(student_id)
-            intimacy_score = float(stack.current_score())
-        except Exception:
-            pass
+        # Fetch PIG intimacy score using fast path (P0-G + P1-A)
+        intimacy_score = await get_current_intimacy_score(student_id)
 
-        intent = await classify_intent(text, conversation_history, intimacy_score=intimacy_score)
+        intent = await classify_intent(text, conversation_history, intimacy_score=float(intimacy_score))
         logger.info(f"Intent classified for {student_id}: {intent['action']} (confidence: {intent['confidence']:.2f})")
     except Exception as e:
         logger.error(f"Intent classification failed: {e}")
