@@ -11,6 +11,7 @@ Exposes:
   - orchestrate_triad(): Manages the triangular debate state
 
 P0-G UPDATE: Integrates with thermal memory, PIG intimacy, and intent router.
+P1-A UPDATE: PIG intimacy gating — full Schism vs muted Schism based on relationship depth.
 """
 
 import json
@@ -314,6 +315,31 @@ def weave_rupture(
     return body
 
 
+def _weave_muted_schism(
+    topic: str,
+    socratic_position: str,
+    empiric_position: str,
+    contradiction: Optional[DissonanceResult] = None,
+) -> str:
+    """
+    Build a gentler Rupture Interface for low-intimacy students.
+    
+    Instead of a full triadic debate, present both sides and ask student to pick.
+    Less confrontational, more inviting.
+    """
+    header = "🔀 Two Ways to See This"
+
+    body = f"""{header}
+
+**The school way:** {socratic_position}
+
+**The home way:** {empiric_position}
+
+Which one feel closer to how you see am? Or you fit mix both?"""
+
+    return body
+
+
 def _socratic_responds_to_student(topic: str, socratic_position: str, student_position: str) -> str:
     """Generate Socratic's response to the student's position."""
     # This will be replaced by actual LLM call in the engine
@@ -426,52 +452,79 @@ async def process_for_dialectical(
 ) -> Optional[Dict[str, Any]]:
     """
     Main entry point for the Dialectical Engine.
-    
+
     Called by the Intent Router on every student message.
-    
+
     Returns None if no dissonance detected.
     Returns dict with rupture_interface and triad_state if triggered.
+    
+    PIG GATING:
+    - intimacy >= 4.0: Full Schism (triadic, both voices respond to student)
+    - intimacy < 4.0: Muted Schism (dyadic, one voice asks, other answers, student picks)
     """
     # Step 1: Detect dissonance
     dissonance = detect_dissonance(message, context, intimacy_score)
-    
+
     if not dissonance.triggered:
         return None
-    
-    # Step 2: Initialize triad
+
+    # Step 2: Determine Schism mode based on intimacy
+    is_full_schism = intimacy_score >= INTIMACY_GATE
+    schism_mode = "full" if is_full_schism else "muted"
+
+    # Step 3: Initialize triad (or dyad for muted)
     triad = TriadState(
         student_id=student_id,
         topic=topic,
         dissonance_result=dissonance,
     )
-    
-    # Step 3: Generate positions from contradiction
+
+    # Step 4: Generate positions from contradiction
     if len(dissonance.extracted_positions) >= 2:
         triad.socratic_position = dissonance.extracted_positions[0]
         triad.empiric_position = dissonance.extracted_positions[1]
     else:
-        # Fallback: use topic as position
         triad.socratic_position = f"The formal view on {topic}"
         triad.empiric_position = f"The intuitive view on {topic}"
-    
-    # Step 4: Weave rupture
-    rupture = weave_rupture(
-        topic=topic,
-        socratic_position=triad.socratic_position,
-        empiric_position=triad.empiric_position,
-        contradiction=dissonance,
-    )
-    
-    # Step 5: Determine first voice
-    next_voice, prompt_context = orchestrate_triad(triad)
-    
+
+    # Step 5: Build rupture interface based on Schism mode
+    if is_full_schism:
+        # Full Schism: Triadic debate, student is third voice
+        rupture = weave_rupture(
+            topic=topic,
+            socratic_position=triad.socratic_position,
+            empiric_position=triad.empiric_position,
+            contradiction=dissonance,
+        )
+        next_voice, prompt_context = orchestrate_triad(triad)
+    else:
+        # Muted Schism: Dyadic presentation, student picks a side
+        rupture = _weave_muted_schism(
+            topic=topic,
+            socratic_position=triad.socratic_position,
+            empiric_position=triad.empiric_position,
+            contradiction=dissonance,
+        )
+        next_voice = "both"  # Both voices present, student observes then picks
+        prompt_context = f"""
+Topic: {topic}
+You are presenting a contradiction to a new student. Be gentle. Don't overwhelm.
+Wax-Socratic states the formal position clearly.
+Wax-Empiric responds with the intuitive position in accessible language.
+The student will pick which side makes more sense to them.
+Keep it short. One paragraph each voice. End with a simple question.
+"""
+
+    # Step 6: Return result
     return {
         "action": "dialectical_midwifery",
+        "schism_mode": schism_mode,
         "rupture_interface": rupture,
         "triad_state": triad.to_dict(),
         "next_voice": next_voice,
         "prompt_context": prompt_context,
         "dissonance": dissonance.to_dict(),
+        "intimacy_gated": not is_full_schism,  # True if muted due to low intimacy
     }
 
 
