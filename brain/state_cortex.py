@@ -1,3 +1,8 @@
+# Changes made:
+# - Replaced reconstruct_from_history method to use the State Archaeologist
+#   (brain.state_archaeologist) instead of basic heuristic. Falls back to
+#   default with "recovering" topology if confidence too low or error.
+
 """
 brain/state_cortex.py — Wax State Cortex
 The 4-Dimensional Living State Architecture.
@@ -543,71 +548,40 @@ class StateCortex:
         message_history: List[Dict[str, Any]],
     ) -> StateVector:
         """
-        Archaeological reconstruction: rebuild state from message history.
-        Called by the Archaeologist after crashes or long gaps.
+        Archaeological reconstruction using the State Archaeologist.
+        Called after crashes or long gaps.
         """
-        logger.info(f"Reconstructing state for {student_id} from {len(message_history)} messages")
+        logger.info(f"Initiating archaeological reconstruction for {student_id}")
         
-        # Start with default
-        vector = StateVector.default()
-        vector.conversation_topology = "recovering"
-        
-        if not message_history:
+        try:
+            from brain.state_archaeologist import get_archaeologist
+            archaeologist = get_archaeologist()
+            vector, confidence = await archaeologist.excavate(
+                student_id=student_id,
+                message_history=message_history,
+                max_messages=30,
+            )
+            
+            # If confidence is too low, fall back to default with recovery marker
+            if confidence < Decimal("0.3"):
+                logger.warning(f"Low reconstruction confidence ({float(confidence):.0%}) for {student_id}, using default")
+                vector = StateVector.default()
+                vector.conversation_topology = "recovering"
+            
+            # Persist reconstructed state
+            self._local_cache[student_id] = vector
+            await self._persist_vector(student_id, vector)
+            await self._snapshot_to_supabase(student_id, vector)
+            
             return vector
-        
-        # Analyze message patterns
-        wax_modes = {}
-        mind_states = {}
-        
-        for msg in message_history[-20:]:  # Last 20 messages
-            role = msg.get("role", "")
-            content = msg.get("content", "").lower()
             
-            if role == "assistant":
-                # Infer Wax mode from assistant messages
-                if any(w in content for w in ["quiz", "question", "options", "correct"]):
-                    wax_modes["in_quiz"] = wax_modes.get("in_quiz", Decimal("0")) + Decimal("0.2")
-                elif any(w in content for w in ["let me explain", "think of it", "imagine"]):
-                    wax_modes["teaching"] = wax_modes.get("teaching", Decimal("0")) + Decimal("0.2")
-                elif any(w in content for w in ["i hear you", "that must be hard", "don't worry"]):
-                    wax_modes["in_emotional_support"] = wax_modes.get("in_emotional_support", Decimal("0")) + Decimal("0.3")
-                elif "?" in content:
-                    wax_modes["awaiting_response"] = wax_modes.get("awaiting_response", Decimal("0")) + Decimal("0.15")
-            
-            elif role == "user":
-                # Infer student mind from user messages
-                if any(s in content for s in ["don't understand", "confused", "stuck"]):
-                    mind_states["confused"] = mind_states.get("confused", Decimal("0")) + Decimal("0.3")
-                elif any(s in content for s in ["this is hard", "i give up", "too difficult"]):
-                    mind_states["frustrated"] = mind_states.get("frustrated", Decimal("0")) + Decimal("0.3")
-                elif any(s in content for s in ["i get it", "that makes sense", "cool"]):
-                    mind_states["engaged"] = mind_states.get("engaged", Decimal("0")) + Decimal("0.3")
-                elif any(s in content for s in ["what if", "why", "how come"]):
-                    mind_states["curious"] = mind_states.get("curious", Decimal("0")) + Decimal("0.2")
-                elif any(s in content for s in ["i know", "easy", "simple"]):
-                    mind_states["confident"] = mind_states.get("confident", Decimal("0")) + Decimal("0.2")
-        
-        # Apply inferred states
-        if wax_modes:
-            vector.wax_mode = vector._normalize(wax_modes)
-        if mind_states:
-            vector.student_mind = vector._normalize(mind_states)
-        
-        # Determine topology
-        last_msg = message_history[-1] if message_history else None
-        if last_msg and last_msg.get("role") == "assistant" and "?" in last_msg.get("content", ""):
-            vector.conversation_topology = "deepening"
-        elif last_msg and last_msg.get("role") == "user":
-            vector.conversation_topology = "branching"
-        
-        vector.last_updated = datetime.now(timezone.utc)
-        
-        # Persist reconstructed state
-        self._local_cache[student_id] = vector
-        await self._persist_vector(student_id, vector)
-        await self._snapshot_to_supabase(student_id, vector)
-        
-        return vector
+        except Exception as e:
+            logger.error(f"Archaeologist failed for {student_id}: {e}")
+            # Ultimate fallback
+            vector = StateVector.default()
+            vector.conversation_topology = "recovering"
+            self._local_cache[student_id] = vector
+            return vector
     
     async def _persist_vector(self, student_id: str, vector: StateVector) -> None:
         """Persist vector to Redis."""
