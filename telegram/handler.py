@@ -315,6 +315,20 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         conversation_history = []
 
     # ═══════════════════════════════════════════════════════════════════════
+    # STEP 0: Check for explicit account creation intent (natural language)
+    # ═══════════════════════════════════════════════════════════════════════
+    msg_lower = text.lower().strip()
+    account_intents = [
+        "remember me", "start my notebook", "study circle",
+        "create account", "sign up", "register", "join",
+        "yes start", "yes notebook", "yes circle",
+        "i want to join", "make we start", "start am",
+    ]
+    if any(intent in msg_lower for intent in account_intents):
+        await _start_invisible_onboarding(chat_id, student, student_id, name)
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════
     # STEP 1: AI INTENT CLASSIFICATION (ALWAYS FIRST)
     # ═══════════════════════════════════════════════════════════════════════
     try:
@@ -570,7 +584,7 @@ async def _handle_deferral(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# AI CONVERSATION HANDLER (MIGRATED to State Socket)
+# AI CONVERSATION HANDLER (MIGRATED to State Socket, PIG-Triggered Onboarding)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -583,7 +597,8 @@ async def _handle_ai_conversation(
     suggested_action: str = ""
 ) -> None:
     """
-    Process a student message through the AI brain with State Socket integration.
+    Process a student message through the AI brain with State Socket integration
+    and PIG-triggered onboarding for temp students.
     """
     from ai.brain import think
     from database.conversations import get_history, save_message
@@ -666,10 +681,7 @@ async def _handle_ai_conversation(
         else:
             context_str = _strip_wake_context(context_str)
 
-    # DISABLED: Account creation flow
-    # if is_temp:
-    #     ... (account creation logic removed)
-
+    # DISABLED: Account creation flow (old hard-coded logic removed)
     # Progressive observation extraction
     if not is_temp:
         try:
@@ -735,6 +747,50 @@ async def _handle_ai_conversation(
     except Exception as e:
         logger.error(f"Output safety check error: {e}")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # PIG-TRIGGERED ONBOARDING: Natural Conversion (Ubuntu/Study-Circle)
+    # ═══════════════════════════════════════════════════════════════════════
+    if is_temp and not student.get("onboarding_complete"):
+        try:
+            from brain.state_socket import should_trigger_onboarding
+            should_trigger, intimacy_score = await should_trigger_onboarding(student_id)
+
+            if should_trigger:
+                import random
+                from ai.prompts import CLIFF_EDGE_PROMPTS
+
+                # Determine which prompt set to use based on recent context
+                last_user_msg = None
+                for msg in reversed(conversation_history[-5:]):
+                    if msg.get("role") == "user":
+                        last_user_msg = msg.get("content", "").lower()
+                        break
+
+                if last_user_msg and any(w in last_user_msg for w in ["scared", "worried", "stressed", "fail", "anxious"]):
+                    prompt_list = CLIFF_EDGE_PROMPTS["after_vulnerability"]
+                elif last_user_msg and any(w in last_user_msg for w in ["oh i see", "now i understand", "i get it now", "e don clear"]):
+                    prompt_list = CLIFF_EDGE_PROMPTS["after_breakthrough"]
+                else:
+                    prompt_list = CLIFF_EDGE_PROMPTS["mid_session"]
+
+                topic_display = (recent_subject or "this topic").replace("_", " ").title()
+                onboarding_prompt = random.choice(prompt_list).format(topic=topic_display)
+                response += "\n\n" + onboarding_prompt
+
+                try:
+                    from brain.relational_intimacy import get_intimacy_manager
+                    manager = get_intimacy_manager()
+                    stack = await manager.get_stack(student_id)
+                    stack.record_cliff_prompt(declined=False)
+                    await manager.save_stack(student_id, stack)
+                except Exception:
+                    pass
+
+                logger.info(f"PIG cliff-edge shown to {student_id} (score: {intimacy_score:.1f})")
+
+        except Exception as e:
+            logger.error(f"Onboarding trigger check failed: {e}")
+
     try:
         await save_message(student_id, "assistant", response)
     except Exception:
@@ -776,6 +832,70 @@ async def _handle_ai_conversation(
         redis_client.setex(timestamp_key, 86400, datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# INVISIBLE ONBOARDING STATE MACHINE (PIG-Triggered)
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _start_invisible_onboarding(chat_id: int, student: dict, student_id: str, name: str) -> None:
+    """
+    Start the invisible onboarding state machine.
+    
+    This is NOT a form. It is a conversation where Wax "gets to know" the student.
+    Each piece of data is collected across sessions, framed as teaching preparation.
+    """
+    from ai.prompts import STUDY_CIRCLE_FRAMING, GENTLE_GHOST_PROMPTS
+    from brain.state_socket import get_full_state, set_mode
+    
+    try:
+        state_data = await get_full_state(student_id)
+        conversion_phase = state_data.get("conversion_phase", "anonymous")
+    except Exception:
+        conversion_phase = "anonymous"
+
+    if conversion_phase == "anonymous":
+        prompt = STUDY_CIRCLE_FRAMING["data_collection"]["name"]
+        await set_mode(student_id, "onboarding", confidence=1.0, metadata={
+            "conversion_phase": "awaiting_name",
+            "onboarding_started": datetime.now(timezone.utc).isoformat(),
+        })
+        await send_telegram_message(chat_id, prompt)
+        return
+
+    if conversion_phase == "named":
+        prompt = STUDY_CIRCLE_FRAMING["data_collection"]["class"]
+        await set_mode(student_id, "onboarding", confidence=1.0, metadata={
+            "conversion_phase": "awaiting_class",
+        })
+        await send_telegram_message(chat_id, prompt)
+        return
+
+    if conversion_phase == "classified":
+        prompt = STUDY_CIRCLE_FRAMING["data_collection"]["subjects"]
+        await set_mode(student_id, "onboarding", confidence=1.0, metadata={
+            "conversion_phase": "awaiting_subjects",
+        })
+        await send_telegram_message(chat_id, prompt)
+        return
+
+    if conversion_phase == "subjected":
+        prompt = STUDY_CIRCLE_FRAMING["data_collection"]["pin"]
+        await set_mode(student_id, "onboarding", confidence=1.0, metadata={
+            "conversion_phase": "awaiting_pin",
+        })
+        await send_telegram_message(chat_id, prompt)
+        return
+
+    if conversion_phase == "authenticated":
+        from ai.prompts import STUDY_CIRCLE_FRAMING
+        completion_msg = random.choice(STUDY_CIRCLE_FRAMING["account_created"])
+        await set_mode(student_id, "active", confidence=1.0, metadata={
+            "conversion_phase": "complete",
+            "account_created": True,
+        })
+        await send_telegram_message(chat_id, completion_msg)
+        return
 
 
 # ═══════════════════════════════════════════════════════════════════════
