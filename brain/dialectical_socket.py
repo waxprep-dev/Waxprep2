@@ -71,6 +71,7 @@ DISSONANCE_PATTERNS = {
             r"you\s+said\s+.+\s+but\s+(my\s+teacher|in\s+school)",
             r"we\s+learned\s+.+\s+in\s+class\s+but\s+you",
             r"the\s+textbook\s+says\s+.+\s+but\s+you\s+said",
+            r"(my\s+teacher|in\s+school|the\s+textbook)\s+said\s+.+\s+but\s+you\s+said",  # ← ADDED: catches "teacher said X but you said Y"
         ],
         "base_score": Decimal("0.91"),
     },
