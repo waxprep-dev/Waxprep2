@@ -14,6 +14,7 @@ NEW (P1-A):
 - Session management via database.sessions (ensure/end session)
 - /audit command (admin only)
 - Ghost Thread Protocol (P1-B) — temporal dialectics
+- Circadian Teaching Cortex (P1-D) — bio-state detection before intent routing
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -347,6 +348,19 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         conversation_history = await get_history(student_id)
     except Exception:
         conversation_history = []
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CIRCADIAN STATE DETECTION (P1-D replacement — Circadian Teaching Cortex)
+    # ═══════════════════════════════════════════════════════════════════════
+    try:
+        from brain.circadian_socket import get_circadian_state, record_message_for_learning
+        bio_state = await get_circadian_state(student_id)
+        # Record this message for rhythm learning
+        await record_message_for_learning(student_id)
+        logger.info(f"Circadian state for {student_id}: {bio_state}")
+    except Exception as e:
+        logger.error(f"Circadian detection failed: {e}")
+        bio_state = "evening_deep"  # Default to safe state
 
     # ═══════════════════════════════════════════════════════════════════════
     # CHECK: Is this a reply to a Ghost Thread? (P1-B)
