@@ -1,16 +1,17 @@
-# Changes made:
-# - Fixed Decimal serialization bug in record_adjudication(): changed "confidence": Decimal("0.92") to "confidence": float(Decimal("0.92"))
-#   to allow json.dumps() to serialize the fact_value correctly.
-
 """
 brain/dialectical_ledger.py — Dialectical Ledger
 
 Persists student adjudications from dialectical debates.
 Writes to:
-  - student_facts (semantic memory, fast retrieval)
-  - memory_mutations (audit trail, event sourcing)
+ - student_facts (semantic memory, fast retrieval)
+ - memory_mutations (audit trail, event sourcing)
 
 Generates ASCII Wisdom Graph after every 3rd debate.
+
+CHANGELOG:
+- 2026-05-24: Fixed Decimal serialization (float(Decimal("0.92")))
+- 2026-05-24: Made memory_mutations insert resilient to schema drift
+  (catches missing column errors, falls back to minimal insert, logs schema)
 """
 
 import json
@@ -31,6 +32,131 @@ DEBATE_COUNTER_KEY = "dialectical_debate_count:{student_id}"
 STANCE_TYPES = ["formal_leaning", "vernacular_leaning", "synthetic", "confused", "rejecting", "undetermined"]
 WISDOM_GRAPH_THRESHOLD = 3  # Generate graph after every N debates
 
+# Resilient insert: columns we KNOW exist vs columns we HOPE exist
+# Based on handoff architecture. If schema drifted, we adapt.
+MUTATION_REQUIRED_COLUMNS = ["student_id", "mutation_type", "created_at"]
+MUTATION_OPTIONAL_COLUMNS = [
+    "table_name", "record_id", "old_value", "new_value",
+    "reason", "source", "thermal_state"
+]
+
+# ═══════════════════════════════════════════════════════════════════════
+# SCHEMA RESILIENCE HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _discover_mutation_columns() -> List[str]:
+    """
+    Discover actual columns in memory_mutations table.
+    This handles schema drift without breaking production.
+    """
+    try:
+        result = (
+            supabase.table("memory_mutations")
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+        if result.data and len(result.data) > 0:
+            return list(result.data[0].keys())
+        # Table exists but empty — return empty, will use minimal insert
+        return []
+    except Exception as e:
+        logger.warning(f"Could not discover memory_mutations columns: {e}")
+        return []
+
+
+async def _insert_mutation_resilient(
+    student_id: str,
+    mutation_type: str,
+    table_name: str,
+    record_id: Optional[str],
+    old_value: Optional[str],
+    new_value: Optional[str],
+    reason: str,
+    source: str,
+    thermal_state: str = "cool",
+) -> bool:
+    """
+    Insert into memory_mutations with schema drift resilience.
+
+    Strategy:
+    1. Try full insert with all expected columns
+    2. If column mismatch, catch error, discover actual columns, retry with subset
+    3. If still failing, log schema and skip (don't block main flow)
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Build full payload
+    full_payload = {
+        "student_id": student_id,
+        "mutation_type": mutation_type,
+        "table_name": table_name,
+        "record_id": record_id,
+        "old_value": old_value,
+        "new_value": new_value,
+        "reason": reason,
+        "source": source,
+        "thermal_state": thermal_state,
+        "created_at": now,
+    }
+
+    # Remove None values (cleaner insert)
+    full_payload = {k: v for k, v in full_payload.items() if v is not None}
+
+    try:
+        result = (
+            supabase.table("memory_mutations")
+            .insert(full_payload)
+            .execute()
+        )
+        return bool(result.data)
+
+    except Exception as e:
+        error_str = str(e).lower()
+
+        # Check if it's a column mismatch error
+        if "column" in error_str and ("does not exist" in error_str or "could not find" in error_str):
+            logger.warning(f"memory_mutations schema drift detected: {e}")
+
+            # Discover actual columns
+            actual_columns = await _discover_mutation_columns()
+
+            if actual_columns:
+                # Build minimal payload with only existing columns
+                minimal_payload = {
+                    "student_id": student_id,
+                    "mutation_type": mutation_type,
+                    "created_at": now,
+                }
+
+                # Add any optional columns that actually exist
+                for col in MUTATION_OPTIONAL_COLUMNS:
+                    if col in actual_columns and col in full_payload:
+                        minimal_payload[col] = full_payload[col]
+
+                # Try again with minimal payload
+                try:
+                    result = (
+                        supabase.table("memory_mutations")
+                        .insert(minimal_payload)
+                        .execute()
+                    )
+                    logger.info(f"Resilient insert succeeded with columns: {list(minimal_payload.keys())}")
+                    return bool(result.data)
+                except Exception as e2:
+                    logger.error(f"Resilient insert also failed: {e2}")
+                    logger.error(f"ACTUAL SCHEMA: {actual_columns}")
+                    return False
+            else:
+                # Could not discover columns — log and skip
+                logger.error(f"memory_mutations insert failed and schema discovery failed. "
+                           f"Original error: {e}")
+                return False
+        else:
+            # Some other error (permissions, connection, etc)
+            logger.error(f"memory_mutations insert failed (non-schema error): {e}")
+            return False
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # CORE FUNCTIONS
@@ -50,7 +176,7 @@ async def record_adjudication(
     Record a student's epistemic stance after a dialectical debate.
 
     Writes to student_facts (semantic) and memory_mutations (audit).
-    Returns True if both writes succeed.
+    Returns True if student_facts write succeeds (mutations is best-effort).
     """
     if stance not in STANCE_TYPES:
         logger.warning(f"Unknown stance '{stance}' for student {student_id}, defaulting to 'undetermined'")
@@ -88,31 +214,28 @@ async def record_adjudication(
             .execute()
         )
         fact_success = bool(fact_result.data)
+        fact_id = fact_result.data[0]["id"] if fact_success else None
     except Exception as e:
         logger.error(f"Failed to write adjudication to student_facts: {e}")
         fact_success = False
+        fact_id = None
 
-    # ── 2. Write to memory_mutations (audit trail) ──
-    try:
-        mutation_result = (
-            supabase.table("memory_mutations")
-            .insert({
-                "student_id": student_id,
-                "mutation_type": "dialectical_adjudication",
-                "table_name": "student_facts",
-                "record_id": fact_result.data[0]["id"] if fact_success else None,
-                "old_value": None,
-                "new_value": fact_value,
-                "reason": f"Student took stance '{stance}' on topic '{topic}' after {round_count} rounds",
-                "source": "dialectical_ledger",
-                "thermal_state": "warm",  # Recently relevant
-            })
-            .execute()
-        )
-        mutation_success = bool(mutation_result.data)
-    except Exception as e:
-        logger.error(f"Failed to write adjudication to memory_mutations: {e}")
-        mutation_success = False
+    # ── 2. Write to memory_mutations (audit trail) — RESILIENT ──
+    mutation_success = await _insert_mutation_resilient(
+        student_id=student_id,
+        mutation_type="dialectical_adjudication",
+        table_name="student_facts",
+        record_id=fact_id,
+        old_value=None,
+        new_value=fact_value,
+        reason=f"Student took stance '{stance}' on topic '{topic}' after {round_count} rounds",
+        source="dialectical_ledger",
+        thermal_state="warm",  # Recently relevant
+    )
+
+    if not mutation_success:
+        # Non-blocking: log but don't fail the whole operation
+        logger.warning(f"Audit trail write failed for student {student_id}, but adjudication was saved.")
 
     # ── 3. Increment debate counter in Redis ──
     counter_key = DEBATE_COUNTER_KEY.format(student_id=student_id)
@@ -127,7 +250,7 @@ async def record_adjudication(
     if new_count >= WISDOM_GRAPH_THRESHOLD and new_count % WISDOM_GRAPH_THRESHOLD == 0:
         await _generate_and_store_wisdom_graph(student_id)
 
-    return fact_success and mutation_success
+    return fact_success
 
 
 async def get_debate_history(student_id: str, limit: int = 10) -> List[Dict[str, Any]]:
