@@ -182,6 +182,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Include routers ──────────────────────────
+from api.debug import router as debug_router
+app.include_router(debug_router)
+
 
 # ═══════════════════════════════════════════════
 # MIDDLEWARE — Request ID & Logging
