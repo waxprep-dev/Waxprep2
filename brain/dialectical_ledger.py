@@ -1,3 +1,7 @@
+# Changes made:
+# - Fixed Decimal serialization bug in record_adjudication(): changed "confidence": Decimal("0.92") to "confidence": float(Decimal("0.92"))
+#   to allow json.dumps() to serialize the fact_value correctly.
+
 """
 brain/dialectical_ledger.py — Dialectical Ledger
 
@@ -76,7 +80,7 @@ async def record_adjudication(
                 "fact_value": fact_value,
                 "provenance": "DEMONSTRATED",
                 "source": "dialectical_engine",
-                "confidence": Decimal("0.92"),
+                "confidence": float(Decimal("0.92")),  # Fixed: Decimal → float for JSON serialization
                 "first_observed_at": now,
                 "last_confirmed_at": now,
                 "confirmation_count": 1,
@@ -222,7 +226,7 @@ Keep debating — the graph updates every 3 debates."""
                 "fact_value": graph,
                 "provenance": "DERIVED",
                 "source": "dialectical_ledger",
-                "confidence": Decimal("0.85"),
+                "confidence": float(Decimal("0.85")),  # Also fixed for consistency
                 "first_observed_at": now,
                 "last_confirmed_at": now,
                 "confirmation_count": 1,
