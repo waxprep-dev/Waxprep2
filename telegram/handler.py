@@ -13,6 +13,7 @@ NEW (P1-A):
 - Thermal-aware phrase fetching via config.constants.get_phrases
 - Session management via database.sessions (ensure/end session)
 - /audit command (admin only)
+- Ghost Thread Protocol (P1-B) — temporal dialectics
 
 Core files never touch engines directly. They touch Sockets.
 """
@@ -52,6 +53,21 @@ except ImportError:
     _dialectical_available = False
     logger = logging.getLogger("waxprep.handler")
     logger.warning("Dialectical socket not available — dialectical debates disabled")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Ghost Thread Protocol (P1-B)
+# ═══════════════════════════════════════════════════════════════════════
+try:
+    from brain.ghost_thread_socket import (
+        spawn_ghost_thread,
+        on_student_message,
+        process_due_ghosts,
+        get_student_ghost_history,
+    )
+    _ghost_available = True
+except ImportError:
+    _ghost_available = False
+    logger.warning("Ghost Thread socket not available — temporal dialectics disabled")
 
 # ═══════════════════════════════════════════════════════════════════════
 # MIGRATED: State Socket replaces direct state.py (P0-F Socket Pattern)
@@ -137,6 +153,34 @@ async def process_telegram_message(chat_id: int, text: str) -> None:
         except Exception as e:
             logger.error(f"Audit command failed: {e}")
             await send_telegram_message(chat_id, "Audit command failed. Check logs.")
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ADMIN COMMAND: /ghost — Manual ghost thread trigger (admin only)
+    # ═══════════════════════════════════════════════════════════════════════
+    if text.strip().lower() == "/ghost":
+        if chat_id not in ADMIN_CHAT_IDS:
+            await send_telegram_message(chat_id, "Sorry, I don't recognize that command.")
+            return
+        if not _ghost_available:
+            await send_telegram_message(chat_id, "Ghost Thread Protocol not available.")
+            return
+        
+        # Spawn a ghost thread for this admin (for testing)
+        try:
+            from database.students import get_student_by_platform_id
+            admin_student = await get_student_by_platform_id("telegram", str(chat_id))
+            if admin_student:
+                ghost_id = await spawn_ghost_thread(str(admin_student["id"]))
+                if ghost_id:
+                    await send_telegram_message(chat_id, f"👻 Ghost thread spawned: {ghost_id}\nCheck back in ~24 hours.")
+                else:
+                    await send_telegram_message(chat_id, "No suitable anchor found. Have a conversation with dissonance first.")
+            else:
+                await send_telegram_message(chat_id, "You need to be registered to test ghost threads.")
+        except Exception as e:
+            logger.error(f"/ghost command failed: {e}")
+            await send_telegram_message(chat_id, f"Ghost spawn failed: {e}")
         return
 
     try:
@@ -272,6 +316,27 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         return
 
     # ═══════════════════════════════════════════════════════════════════════
+    # ADMIN COMMAND: /ghost (registered users)
+    # ═══════════════════════════════════════════════════════════════════════
+    if text.strip().lower() == "/ghost":
+        if chat_id not in ADMIN_CHAT_IDS:
+            await send_telegram_message(chat_id, "Sorry, I don't recognize that command.")
+            return
+        if not _ghost_available:
+            await send_telegram_message(chat_id, "Ghost Thread Protocol not available.")
+            return
+        try:
+            ghost_id = await spawn_ghost_thread(student_id)
+            if ghost_id:
+                await send_telegram_message(chat_id, f"👻 Ghost thread spawned: {ghost_id}\nCheck back in ~24 hours.")
+            else:
+                await send_telegram_message(chat_id, "No suitable anchor found in your recent conversations.")
+        except Exception as e:
+            logger.error(f"/ghost command failed: {e}")
+            await send_telegram_message(chat_id, f"Ghost spawn failed: {e}")
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════
     # SESSION MANAGEMENT: Ensure active session (P1-A integration)
     # ═══════════════════════════════════════════════════════════════════════
     session_id = await ensure_active_session(student_id)
@@ -282,6 +347,22 @@ async def _handle_registered_student(chat_id: int, student: Dict[str, Any], text
         conversation_history = await get_history(student_id)
     except Exception:
         conversation_history = []
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CHECK: Is this a reply to a Ghost Thread? (P1-B)
+    # ═══════════════════════════════════════════════════════════════════════
+    if _ghost_available:
+        try:
+            ghost_result = await on_student_message(student_id, text, conversation_history)
+            if ghost_result and ghost_result.get("status") == "resurrected":
+                # This is a ghost reply — handle resurrection
+                resurrection_response = ghost_result.get("response", "")
+                if resurrection_response:
+                    await send_telegram_message(chat_id, resurrection_response)
+                    logger.info(f"Ghost resurrection handled for {student_id}: {ghost_result.get('classification')}")
+                return  # Don't process as normal message
+        except Exception as e:
+            logger.error(f"Ghost reply check failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # CHECK: Is there an active dialectical triad?
@@ -681,7 +762,7 @@ async def _handle_deferral(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# AI CONVERSATION HANDLER (MIGRATED to State Socket, PIG-Triggered Onboarding)
+# AI CONVERSATION HANDLER (MIGRATED to State Socket, PIG-Triggered Onboarding, Ghost Threads)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def _handle_ai_conversation(
@@ -906,6 +987,31 @@ async def _handle_ai_conversation(
         )
     except Exception as e:
         logger.error(f"Working memory auto-save failed: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # GHOST THREAD SPAWN: Check if this response should haunt later (P1-B)
+    # ═══════════════════════════════════════════════════════════════════════
+    if _ghost_available and not student_id.startswith("temp_"):
+        try:
+            # Only spawn ghosts after teaching interactions (not quizzes, not greetings)
+            if current_mode in ("teaching", "chatting") and len(conversation_history) > 3:
+                # Check if conversation has high thermal potential
+                last_user_msg = None
+                for msg in reversed(conversation_history[-5:]):
+                    if msg.get("role") == "user":
+                        last_user_msg = msg.get("content", "")
+                        break
+                
+                if last_user_msg:
+                    # Quick thermal check before spawning
+                    from brain.ghost_thread_socket import _infer_thermal_score
+                    thermal = _infer_thermal_score(last_user_msg, {})
+                    if thermal >= 60:
+                        # Spawn asynchronously — don't block response
+                        asyncio.ensure_future(spawn_ghost_thread(student_id))
+                        logger.info(f"Ghost thread spawn triggered for {student_id} (thermal: {thermal})")
+        except Exception as e:
+            logger.error(f"Ghost spawn trigger failed: {e}")
 
     # MIGRATED: Record message in State Socket for future mind mirror
     try:
